@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useChat } from "@ai-sdk/react";
+import { MessageContent } from "@/components/message";
 
 export const Route = createFileRoute("/corpus")({
   component: Corpus,
@@ -19,17 +20,24 @@ function Corpus() {
             Ask anything. v1 is plain LLM passthrough — corpus retrieval comes next.
           </p>
         )}
-        {messages.map((m) => (
-          <div
-            key={m.id}
-            className="rounded-md p-3 border border-[var(--border)]"
-          >
-            <div className="text-xs text-[var(--muted-foreground)] mb-1 capitalize">
-              {m.role}
+        {messages.map((m, idx) => {
+          const isTailAssistant =
+            m.role === "assistant" && idx === messages.length - 1;
+          return (
+            <div
+              key={m.id}
+              className="rounded-md p-3 border border-[var(--border)]"
+            >
+              <div className="text-xs text-[var(--muted-foreground)] mb-1 capitalize">
+                {m.role}
+              </div>
+              <MessageContent
+                content={m.content}
+                isStreaming={isLoading && isTailAssistant}
+              />
             </div>
-            <div className="whitespace-pre-wrap text-sm">{m.content}</div>
-          </div>
-        ))}
+          );
+        })}
         {error && (
           <div className="rounded-md p-3 border border-red-500/50 text-sm text-red-500">
             {error.message}
