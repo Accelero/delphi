@@ -1,0 +1,52 @@
+[package]
+name = "delphi"
+version = "0.0.1"
+edition = "2021"
+description = "Delphi: research-tool backend (axum + storage + agents)."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "delphi"
+path = "src/main.rs"
+
+[dependencies]
+# storage
+surrealdb = { version = "2", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
+
+# http server
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "fs", "cors"] }
+
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+
+# logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# errors
+thiserror = "1"
+anyhow = "1"
+
+# LLM agent framework (provider-agnostic)
+rig-core = { version = "0.35", features = ["all"] }
+
+# (added later when wired up)
+# rmcp = "0.2"
+# fastembed = "4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

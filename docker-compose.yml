@@ -1,0 +1,87 @@
+name: delphi
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2.1.4
+    container_name: delphi-surrealdb
+    user: "0:0"
+    command:
+      - start
+      - --user=root
+      - --pass=root
+      - --bind=0.0.0.0:8000
+      - --log=info
+      - rocksdb:/data/db
+    ports:
+      - "8000:8000"
+    volumes:
+      - surreal_data:/data/db
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://0.0.0.0:8000"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  backend:
+    build:
+      context: ./backend
+    image: delphi-backend:dev
+    container_name: delphi-backend
+    command: ["serve"]
+    environment:
+      STORAGE_BACKEND: surreal
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_USER: root
+      SURREAL_PASS: root
+      SURREAL_NS: delphi
+      SURREAL_DB: main
+      BIND_ADDR: 0.0.0.0:8081
+      RUST_LOG: info,delphi=debug
+      # LLM (read at startup by rig via env)
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+    ports:
+      - "8081:8081"
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+  # One-shot CLI for admin tasks. Invoked via `docker compose run --rm admin <subcommand>`.
+  admin:
+    image: delphi-backend:dev
+    profiles: ["tools"]
+    environment:
+      STORAGE_BACKEND: surreal
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_USER: root
+      SURREAL_PASS: root
+      SURREAL_NS: delphi
+      SURREAL_DB: main
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/delphi", "admin"]
+
+  # Vite dev server with HMR. Mounts ./frontend so edits are live.
+  frontend:
+    image: oven/bun:1.1
+    container_name: delphi-frontend
+    working_dir: /app
+    command: ["sh", "-c", "if [ ! -x node_modules/.bin/vite ]; then bun install; fi; exec bun run dev"]
+    environment:
+      BACKEND_URL: http://backend:8081
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  surreal_data:
+  frontend_node_modules:

@@ -1,0 +1,7 @@
+node_modules
+dist
+.env.local
+.env.*.local
+*.tsbuildinfo
+src/routeTree.gen.ts
+.vite

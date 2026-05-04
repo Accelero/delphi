@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+/* Tailwind v4: opt into class-based dark variant so `.dark` on <html> wins
+   over the OS preference when the user explicitly picks light/dark. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* shadcn/ui design tokens — placeholder set; refine when adding components. */
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --border: oklch(0.922 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --primary: oklch(0.985 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --border: oklch(0.269 0 0);
+}
+
+html, body, #root { height: 100%; }

@@ -1,0 +1,13 @@
+.env
+.idea/
+.vscode/
+
+# rust
+target/
+**/*.rs.bk
+
+# node / frontend
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
