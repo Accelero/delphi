@@ -18,6 +18,9 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     port: 5173,
+    // Docker bind mounts on Linux silently lose inotify events for some
+    // files; polling is reliable at the cost of a tiny CPU baseline.
+    watch: { usePolling: true, interval: 300 },
     proxy: {
       "/api": { target: BACKEND, changeOrigin: true },
       "/v1": { target: BACKEND, changeOrigin: true },
