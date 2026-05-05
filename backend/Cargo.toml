@@ -42,9 +42,27 @@ anyhow = "1"
 # LLM agent framework (provider-agnostic)
 rig-core = { version = "0.35", features = ["all"] }
 
+# auth (BFF: backend owns OIDC tokens; browser sees only HTTP-only session cookie)
+axum-oidc       = "0.6"
+tower-sessions  = { version = "0.14", default-features = false, features = ["axum-core", "signed"] }
+tower-sessions-core = "0.14"
+openidconnect   = "3"
+jsonwebtoken    = "9"
+rand            = "0.8"
+base64          = "0.22"
+url             = "2"
+time            = "0.3"
+
 # (added later when wired up)
 # rmcp = "0.2"
 # fastembed = "4"
+
+[features]
+default  = []
+# Compiles in AuthMode::Dev + the dev-injection middleware module.
+# Production builds MUST omit this flag — release binaries built with
+# default features literally do not contain the bypass code.
+dev-auth = []
 
 [profile.release]
 lto = "thin"

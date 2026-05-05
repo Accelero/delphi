@@ -1,5 +1,6 @@
 .PHONY: help up down nuke logs ps build init status wipe surql shell \
-        backend-build backend-test backend-run frontend-install frontend-dev frontend-build
+        backend-build backend-test backend-run backend-run-dev \
+        frontend-install frontend-dev frontend-build
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -44,7 +45,7 @@ shell: ## Drop into a shell in the surrealdb container
 	docker compose exec surrealdb sh
 
 # ----- local backend (no docker) -------------------------------------------
-backend-build: ## cargo build (release)
+backend-build: ## cargo build (release; production-shaped — NO dev-auth)
 	cd backend && cargo build --release
 
 backend-test: ## cargo test
@@ -52,6 +53,10 @@ backend-test: ## cargo test
 
 backend-run: ## cargo run delphi serve (against compose surrealdb on localhost:8000)
 	cd backend && SURREAL_URL=ws://localhost:8000/rpc cargo run --release -- serve
+
+backend-run-dev: ## cargo run with dev-auth feature (auto-injected identity)
+	cd backend && SURREAL_URL=ws://localhost:8000/rpc AUTH_MODE=dev \
+	  cargo run --features dev-auth -- serve
 
 # ----- local frontend (no docker) ------------------------------------------
 frontend-install: ## bun install

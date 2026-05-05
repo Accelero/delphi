@@ -37,6 +37,13 @@ impl SurrealStorage {
         db.use_ns(namespace).use_db(database).await?;
         Ok(Self { db })
     }
+
+    /// Borrow the underlying Surreal client. The session store and auth
+    /// bootstrap modules need it so they can run their own queries against
+    /// the same multiplexed WS connection rather than opening a second one.
+    pub fn db(&self) -> &Surreal<Client> {
+        &self.db
+    }
 }
 
 #[derive(Debug, Deserialize)]

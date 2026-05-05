@@ -9,11 +9,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
  && rm -rf /var/lib/apt/lists/*
 
+# `BACKEND_FEATURES` selects cargo features at build time. Default is empty
+# (production-shaped build with NO dev-auth). The dev compose passes
+# `dev-auth` so local dev gets the dev-mode auth bypass.
+ARG BACKEND_FEATURES=""
+
 COPY Cargo.toml ./
 COPY src ./src
 COPY schema.surql ./schema.surql
 
-RUN cargo build --release --bin delphi
+RUN cargo build --release --bin delphi ${BACKEND_FEATURES:+--features ${BACKEND_FEATURES}}
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \

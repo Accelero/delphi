@@ -13,6 +13,7 @@ use serde::Deserialize;
 use tracing::{error, info};
 
 use crate::api::stream as proto;
+use crate::auth::AuthContext;
 use crate::llm::{LlmDelta, LlmMessage, Role};
 use crate::state::AppState;
 
@@ -77,13 +78,19 @@ impl ChatRequestMessage {
 
 pub async fn chat(
     State(state): State<AppState>,
+    auth: AuthContext,
     Json(req): Json<ChatRequest>,
 ) -> Response {
     let messages: Vec<LlmMessage> = req.messages.iter().filter_map(|m| m.to_llm()).collect();
     if messages.is_empty() {
         return (StatusCode::BAD_REQUEST, "no messages").into_response();
     }
-    info!(count = messages.len(), "chat request received");
+    info!(
+        user_id = %auth.user_id,
+        tenant_id = %auth.tenant_id,
+        count = messages.len(),
+        "chat request received"
+    );
 
     let llm = state.llm.clone();
     let upstream = match llm.stream_chat(messages).await {

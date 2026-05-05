@@ -25,6 +25,12 @@ services:
   backend:
     build:
       context: ./backend
+      args:
+        # Compose default = `dev-auth` so local dev mounts the bypass.
+        # CI/prod builds set BACKEND_FEATURES="" (or omit env) to compile
+        # WITHOUT the dev-auth feature → release binaries don't contain
+        # the bypass code.
+        BACKEND_FEATURES: ${BACKEND_FEATURES-dev-auth}
     image: delphi-backend:dev
     container_name: delphi-backend
     command: ["serve"]
@@ -37,6 +43,24 @@ services:
       SURREAL_DB: main
       BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
+      # auth — see docs/architecture/dev-environment.md
+      AUTH_MODE: ${AUTH_MODE:-dev}
+      RUST_ENV: ${RUST_ENV:-development}
+      SESSION_KEY: ${SESSION_KEY:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-false}
+      # OIDC — required when AUTH_MODE=oidc
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_APPLICATION_BASE_URL: ${OIDC_APPLICATION_BASE_URL:-http://localhost:8081}
+      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
+      OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-org_id}
+      OIDC_DEFAULT_TENANT_SLUG: ${OIDC_DEFAULT_TENANT_SLUG:-default}
+      OIDC_POST_LOGIN_REDIRECT: ${OIDC_POST_LOGIN_REDIRECT:-/}
+      # Dev — only honored if compiled with the `dev-auth` cargo feature
+      DEV_TENANT_SLUG: ${DEV_TENANT_SLUG:-dev}
+      DEV_USER_EMAIL: ${DEV_USER_EMAIL:-dev@delphi.local}
+      DEV_USER_NAME: ${DEV_USER_NAME:-Dev User}
       # LLM (read at startup by rig via env)
       LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
       LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5}

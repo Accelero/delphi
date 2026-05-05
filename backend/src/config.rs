@@ -9,6 +9,13 @@ use crate::error::{Error, Result};
 use crate::storage::{Storage, SurrealStorage};
 
 pub async fn storage_from_env() -> Result<Arc<dyn Storage>> {
+    Ok(surreal_from_env().await?)
+}
+
+/// Construct a [`SurrealStorage`] directly. The auth subsystem needs the
+/// concrete type so it can borrow the underlying `Surreal<Client>` for the
+/// session store and bootstrap upserts (single shared connection).
+pub async fn surreal_from_env() -> Result<Arc<SurrealStorage>> {
     let backend = std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "surreal".into());
     match backend.as_str() {
         "surreal" => {

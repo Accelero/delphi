@@ -8,6 +8,7 @@
 
 mod admin;
 mod api;
+mod auth;
 mod config;
 mod error;
 mod llm;

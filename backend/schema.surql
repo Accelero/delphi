@@ -88,3 +88,82 @@ DEFINE FIELD IF NOT EXISTS change_summary ON document_version TYPE option<string
 DEFINE FIELD IF NOT EXISTS recorded_at    ON document_version TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX IF NOT EXISTS document_version_unique ON document_version FIELDS doc, version UNIQUE;
+
+-- ===========================================================================
+-- AUTH / TENANCY
+--
+-- `app_user` (not `user`) avoids collision with Surreal's `DEFINE USER`.
+-- Identity is `(iss, sub)` from the OIDC token, NOT email — emails change.
+-- Membership is its own table (not a Surreal RELATE edge) so we can attach
+-- role/billing fields cleanly.
+-- ===========================================================================
+DEFINE TABLE IF NOT EXISTS tenant SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS slug               ON tenant TYPE string
+    ASSERT string::len($value) > 0 AND $value = string::lowercase($value);
+DEFINE FIELD IF NOT EXISTS name               ON tenant TYPE string;
+DEFINE FIELD IF NOT EXISTS plan               ON tenant TYPE string DEFAULT 'free';
+DEFINE FIELD IF NOT EXISTS billing_email      ON tenant TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS stripe_customer_id ON tenant TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_at         ON tenant TYPE datetime DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS metadata           ON tenant FLEXIBLE TYPE object DEFAULT {};
+DEFINE INDEX IF NOT EXISTS tenant_slug        ON tenant FIELDS slug UNIQUE;
+
+DEFINE TABLE IF NOT EXISTS app_user SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS iss          ON app_user TYPE string;
+DEFINE FIELD IF NOT EXISTS sub          ON app_user TYPE string;
+DEFINE FIELD IF NOT EXISTS email        ON app_user TYPE string;
+DEFINE FIELD IF NOT EXISTS display_name ON app_user TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_at   ON app_user TYPE datetime DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS last_seen_at ON app_user TYPE option<datetime>;
+DEFINE INDEX IF NOT EXISTS app_user_identity ON app_user FIELDS iss, sub UNIQUE;
+DEFINE INDEX IF NOT EXISTS app_user_email    ON app_user FIELDS email;
+
+DEFINE TABLE IF NOT EXISTS membership SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS user      ON membership TYPE record<app_user>;
+DEFINE FIELD IF NOT EXISTS tenant    ON membership TYPE record<tenant>;
+DEFINE FIELD IF NOT EXISTS role      ON membership TYPE string
+    ASSERT $value INSIDE ['owner','admin','member','viewer'];
+DEFINE FIELD IF NOT EXISTS joined_at ON membership TYPE datetime DEFAULT time::now();
+DEFINE INDEX IF NOT EXISTS membership_user_tenant ON membership FIELDS user, tenant UNIQUE;
+DEFINE INDEX IF NOT EXISTS membership_user        ON membership FIELDS user;
+DEFINE INDEX IF NOT EXISTS membership_tenant      ON membership FIELDS tenant;
+
+-- ===========================================================================
+-- SESSIONS — backing store for `tower-sessions`. The `data` field holds the
+-- full serialized session payload (including any tokens stored by axum-oidc);
+-- `expiry_date` lets the periodic cleanup task DELETE expired rows.
+-- ===========================================================================
+DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS data        ON session FLEXIBLE TYPE object;
+DEFINE FIELD IF NOT EXISTS expiry_date ON session TYPE datetime;
+DEFINE INDEX IF NOT EXISTS session_expiry ON session FIELDS expiry_date;
+
+-- ===========================================================================
+-- CONVERSATIONS / MESSAGES
+--
+-- Schema is defined here so the chat-history persistence change can land
+-- cleanly without a separate migration. The chat handler does NOT write to
+-- these tables yet — that's the next plan.
+-- ===========================================================================
+DEFINE TABLE IF NOT EXISTS conversation SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS tenant     ON conversation TYPE record<tenant>;
+DEFINE FIELD IF NOT EXISTS user       ON conversation TYPE record<app_user>;
+DEFINE FIELD IF NOT EXISTS title      ON conversation TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_at ON conversation TYPE datetime DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS updated_at ON conversation TYPE datetime DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS metadata   ON conversation FLEXIBLE TYPE object DEFAULT {};
+DEFINE INDEX IF NOT EXISTS conversation_tenant_user ON conversation FIELDS tenant, user;
+DEFINE INDEX IF NOT EXISTS conversation_updated_at  ON conversation FIELDS updated_at;
+
+DEFINE TABLE IF NOT EXISTS message SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS conversation   ON message TYPE record<conversation>;
+DEFINE FIELD IF NOT EXISTS tenant         ON message TYPE record<tenant>;  -- denormalized for tenant-scoped queries
+DEFINE FIELD IF NOT EXISTS role           ON message TYPE string
+    ASSERT $value INSIDE ['system','user','assistant','tool'];
+DEFINE FIELD IF NOT EXISTS content        ON message TYPE string;
+DEFINE FIELD IF NOT EXISTS parts          ON message FLEXIBLE TYPE array DEFAULT [];
+DEFINE FIELD IF NOT EXISTS model          ON message TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS finish_reason  ON message TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS created_at     ON message TYPE datetime DEFAULT time::now();
+DEFINE INDEX IF NOT EXISTS message_conversation   ON message FIELDS conversation;
+DEFINE INDEX IF NOT EXISTS message_tenant_created ON message FIELDS tenant, created_at;
