@@ -1,5 +1,19 @@
 name: delphi
 
+# Tier 1: fast inner-loop dev stack.
+#
+#   surrealdb + backend (with dev-auth) + frontend (Vite HMR)
+#
+# The backend's `dev-auth` cargo feature compiles in a tiny middleware that
+# writes a fixed set of `X-Auth-*` headers onto every request — the same
+# headers the production proxy stack would emit. The downstream identity
+# middleware, claim extractor, and user upsert all run unchanged. This is
+# the "dev switch substitutes for the BFF" guarantee: same code path,
+# different header source.
+#
+# For the full prod-shape stack (Traefik + Dex + oauth2-proxy + Redis),
+# see docker-compose.full.yml.
+
 services:
   surrealdb:
     image: surrealdb/surrealdb:v2.1.4
@@ -43,20 +57,11 @@ services:
       SURREAL_DB: main
       BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
-      # auth — see docs/architecture/dev-environment.md
+      # Auth — `dev` injects `X-Auth-*` headers internally; `header` requires
+      # an upstream proxy (use docker-compose.full.yml for that).
       AUTH_MODE: ${AUTH_MODE:-dev}
       RUST_ENV: ${RUST_ENV:-development}
-      SESSION_KEY: ${SESSION_KEY:-}
-      SECURE_COOKIES: ${SECURE_COOKIES:-false}
-      # OIDC — required when AUTH_MODE=oidc
-      OIDC_ISSUER: ${OIDC_ISSUER:-}
-      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
-      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
-      OIDC_APPLICATION_BASE_URL: ${OIDC_APPLICATION_BASE_URL:-http://localhost:8081}
-      OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email}
-      OIDC_TENANT_CLAIM: ${OIDC_TENANT_CLAIM:-org_id}
-      OIDC_DEFAULT_TENANT_SLUG: ${OIDC_DEFAULT_TENANT_SLUG:-default}
-      OIDC_POST_LOGIN_REDIRECT: ${OIDC_POST_LOGIN_REDIRECT:-/}
+      DEFAULT_TENANT_SLUG: ${DEFAULT_TENANT_SLUG:-dev}
       # Dev — only honored if compiled with the `dev-auth` cargo feature
       DEV_TENANT_SLUG: ${DEV_TENANT_SLUG:-dev}
       DEV_USER_EMAIL: ${DEV_USER_EMAIL:-dev@delphi.local}
@@ -73,22 +78,6 @@ services:
     depends_on:
       surrealdb:
         condition: service_healthy
-
-  # One-shot CLI for admin tasks. Invoked via `docker compose run --rm admin <subcommand>`.
-  admin:
-    image: delphi-backend:dev
-    profiles: ["tools"]
-    environment:
-      STORAGE_BACKEND: surreal
-      SURREAL_URL: ws://surrealdb:8000/rpc
-      SURREAL_USER: root
-      SURREAL_PASS: root
-      SURREAL_NS: delphi
-      SURREAL_DB: main
-    depends_on:
-      surrealdb:
-        condition: service_healthy
-    entrypoint: ["/usr/local/bin/delphi", "admin"]
 
   # Vite dev server with HMR. Mounts ./frontend so edits are live.
   frontend:

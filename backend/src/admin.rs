@@ -1,17 +1,17 @@
-//! Database admin commands: init / status / wipe.
+//! Database admin commands: status / wipe.
+//!
+//! Schema bootstrap is no longer here — `api::serve()` applies the schema
+//! itself on startup. These remaining commands are diagnostic / destructive
+//! ops that are run rarely and out of band.
 
 use anyhow::Result;
 
-use crate::AdminCmd;
 use crate::config::storage_from_env;
+use crate::AdminCmd;
 
 pub async fn run(cmd: AdminCmd) -> Result<()> {
     let storage = storage_from_env().await?;
     match cmd {
-        AdminCmd::Init => {
-            storage.init_schema().await?;
-            println!("schema applied");
-        }
         AdminCmd::Status => {
             let c = storage.counts().await?;
             println!("document          {}", c.documents);

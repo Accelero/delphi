@@ -1,6 +1,7 @@
 .env
 .idea/
 .vscode/
+.claude/settings.local.json
 
 # rust
 target/
@@ -11,3 +12,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+
+# tests
+tests/playwright-report/
+tests/test-results/
+tests/.cache/
+coverage/

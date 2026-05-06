@@ -1,0 +1,36 @@
+# oauth2-proxy alpha-config: maps verified JWT claims to the canonical
+# `X-Auth-*` headers the backend reads.
+#
+# Why a separate config: the legacy CLI flags (`--set-xauthrequest`) only
+# emit a fixed set of `X-Auth-Request-*` names. The backend's contract
+# (per docs/ARCH.md) is `X-Auth-*` without the `Request` infix, so we use
+# the alpha-config `injectRequestHeaders` block to control names exactly.
+#
+# Each header maps to a JWT claim. Missing claims produce no header → the
+# backend's `HeaderClaimsExtractor` treats it as absent (and either falls
+# back to defaults or 401s, depending on whether the header is required).
+
+injectRequestHeaders:
+  - name: X-Auth-User-Id
+    values:
+      - claim: sub
+  - name: X-Auth-Issuer
+    values:
+      - claim: iss
+  - name: X-Auth-Email
+    values:
+      - claim: email
+  - name: X-Auth-Name
+    values:
+      - claim: preferred_username
+  # Tenant: we map the OIDC `groups` claim — the convention is that each
+  # user's first group is the tenant slug. With Dex's static-password
+  # connector there are no groups today, so this header is absent in dev
+  # and the backend falls back to DEFAULT_TENANT_SLUG. Swap Dex for an IdP
+  # with real groups and the multi-tenant path lights up.
+  - name: X-Auth-Tenant-Id
+    values:
+      - claim: groups
+  - name: X-Auth-Roles
+    values:
+      - claim: roles

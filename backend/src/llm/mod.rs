@@ -8,7 +8,7 @@
 //! v1 streams plain text deltas. Citations / tool-call deltas can be
 //! threaded through later by extending [`LlmDelta`].
 
-pub mod rig_impl;
+mod rig_impl;
 
 use std::pin::Pin;
 

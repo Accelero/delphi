@@ -1,13 +1,13 @@
 /**
  * Sidebar user menu: avatar + email + Sign out.
  *
- * Sign-out flow: hit POST /api/auth/logout, invalidate the cached session
- * query, then hard-navigate to `/`. The hard nav forces the route's
- * `beforeLoad` to re-fetch `/api/auth/me`, which now 401s, which redirects
- * to /api/auth/login.
+ * Sign-out is owned by the BFF (oauth2-proxy), so we hard-navigate to
+ * `/oauth2/sign_out`, which clears the session cookie and bounces back to
+ * the IdP's logout endpoint. In dev mode (Tier 1) there's no BFF and no
+ * cookie to clear — the menu hides the sign-out item entirely, since
+ * "logging out" the dev user is a contradiction.
  */
 
-import { useQueryClient } from "@tanstack/react-query";
 import { LogOutIcon, UserIcon } from "lucide-react";
 
 import {
@@ -18,23 +18,16 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { api } from "@/lib/api";
+import { SIGN_OUT_URL } from "@/lib/api";
 import { useSession } from "@/hooks/useSession";
 
 export function UserMenu() {
   const { user, dev, isAuthenticated } = useSession();
-  const qc = useQueryClient();
 
   if (!isAuthenticated || !user) return null;
 
-  const onSignOut = async () => {
-    try {
-      await api.logout();
-    } catch {
-      // best-effort; we'll still flush local state
-    }
-    qc.invalidateQueries({ queryKey: ["session"] });
-    window.location.href = "/";
+  const onSignOut = () => {
+    window.location.href = SIGN_OUT_URL;
   };
 
   const label = user.name?.trim() || user.email || "Signed in";
@@ -54,11 +47,15 @@ export function UserMenu() {
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" side="top">
         <DropdownMenuLabel className="text-xs">{user.email}</DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={onSignOut}>
-          <LogOutIcon className="mr-2 size-4" />
-          Sign out
-        </DropdownMenuItem>
+        {!dev && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={onSignOut}>
+              <LogOutIcon className="mr-2 size-4" />
+              Sign out
+            </DropdownMenuItem>
+          </>
+        )}
       </DropdownMenuContent>
     </DropdownMenu>
   );

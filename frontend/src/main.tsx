@@ -6,7 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ThemeProvider } from "./components/theme-provider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { routeTree } from "./routeTree.gen";
-import { setUnauthorizedHandler } from "./lib/api";
+import { setUnauthorizedHandler, SIGN_IN_URL } from "./lib/api";
 import "./styles/globals.css";
 
 const queryClient = new QueryClient({
@@ -26,11 +26,13 @@ declare module "@tanstack/react-router" {
   }
 }
 
-// On 401 from any /api call, kick the browser to /api/auth/login. The
-// backend's OidcLoginLayer redirects unauth'd users to the IdP; in dev
-// mode the route just 302s to "/" (auth is auto-injected anyway).
+// On 401 from any /api call, hard-navigate to oauth2-proxy's sign-in
+// endpoint, which kicks off the OIDC redirect chain. In Tier 1 (dev) the
+// dev injector means /api calls never 401, so this branch is dead — but
+// pointing at a Tier 2 URL keeps the contract consistent across stacks.
 setUnauthorizedHandler(() => {
-  window.location.href = "/api/auth/login";
+  const rd = encodeURIComponent(window.location.pathname + window.location.search);
+  window.location.href = `${SIGN_IN_URL}?rd=${rd}`;
 });
 
 createRoot(document.getElementById("root")!).render(

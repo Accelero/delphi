@@ -129,14 +129,9 @@ DEFINE INDEX IF NOT EXISTS membership_user        ON membership FIELDS user;
 DEFINE INDEX IF NOT EXISTS membership_tenant      ON membership FIELDS tenant;
 
 -- ===========================================================================
--- SESSIONS — backing store for `tower-sessions`. The `data` field holds the
--- full serialized session payload (including any tokens stored by axum-oidc);
--- `expiry_date` lets the periodic cleanup task DELETE expired rows.
--- ===========================================================================
-DEFINE TABLE IF NOT EXISTS session SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS data        ON session FLEXIBLE TYPE object;
-DEFINE FIELD IF NOT EXISTS expiry_date ON session TYPE datetime;
-DEFINE INDEX IF NOT EXISTS session_expiry ON session FIELDS expiry_date;
+-- (Sessions table removed: the BFF — Traefik + oauth2-proxy — owns session
+-- storage in front of the backend. The backend is stateless w.r.t. user
+-- sessions; identity arrives on every request as `X-Auth-*` headers.)
 
 -- ===========================================================================
 -- CONVERSATIONS / MESSAGES

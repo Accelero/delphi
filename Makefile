@@ -1,38 +1,60 @@
-.PHONY: help up down nuke logs ps build init status wipe surql shell \
+.PHONY: help up down nuke logs ps status wipe surql shell \
+        full-up full-down full-nuke full-logs full-ps \
         backend-build backend-test backend-run backend-run-dev \
-        frontend-install frontend-dev frontend-build
+        frontend-install frontend-dev frontend-build \
+        frontend-test frontend-test-watch \
+        e2e-install e2e-tier1 e2e-tier2 \
+        test-all
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  %-20s %s\n", $$1, $$2}'
 
-# ----- compose lifecycle ---------------------------------------------------
-up: ## Bring up surrealdb + backend + frontend
+# ----- Tier 1: fast inner-loop dev stack -----------------------------------
+# surrealdb + backend (dev-auth: self-injects X-Auth-* headers) + frontend.
+# Schema is applied automatically by the backend on startup.
+up: ## Tier 1: surrealdb + backend (dev-auth) + frontend
 	docker compose up -d --build
-	@$(MAKE) init
 	@echo "frontend: http://localhost:5173    backend: http://localhost:8081    surreal: http://localhost:8000"
 
-down: ## Stop all services (keep volumes)
+down: ## Tier 1: stop services (keep volumes)
 	docker compose down
 
-nuke: ## Stop and delete all data volumes
+nuke: ## Tier 1: stop and delete data volumes
 	docker compose down -v
 
-logs: ## Tail logs for all services
+logs: ## Tier 1: tail logs
 	docker compose logs -f --tail=200
 
-ps: ## Show service status
+ps: ## Tier 1: show service status
 	docker compose ps
 
-# ----- backend admin (via compose) -----------------------------------------
-init: ## Apply DB schema (idempotent)
-	docker compose --profile tools run --rm admin init
+# ----- Tier 2: full prod-shape stack ---------------------------------------
+# surrealdb + backend (header mode, no dev-auth) + frontend +
+# traefik + dex (OIDC IdP) + oauth2-proxy (BFF) + redis (session store).
+full-up: ## Tier 2: full prod-shape stack
+	docker compose -f docker-compose.full.yml up -d --build
+	@echo "open http://localhost  (login: alice@delphi.test / alice)"
+	@echo "traefik dashboard: http://localhost:8088    dex: http://localhost:5556"
 
+full-down: ## Tier 2: stop services (keep volumes)
+	docker compose -f docker-compose.full.yml down
+
+full-nuke: ## Tier 2: stop and delete data volumes
+	docker compose -f docker-compose.full.yml down -v
+
+full-logs: ## Tier 2: tail logs
+	docker compose -f docker-compose.full.yml logs -f --tail=200
+
+full-ps: ## Tier 2: show service status
+	docker compose -f docker-compose.full.yml ps
+
+# ----- backend admin (Tier 1; runs against the live backend container) -----
 status: ## Show row counts
-	docker compose --profile tools run --rm admin status
+	docker compose exec backend /usr/local/bin/delphi admin status
 
 wipe: ## Delete all data, keep schema
-	docker compose --profile tools run --rm admin wipe
+	docker compose exec backend /usr/local/bin/delphi admin wipe
 
 surql: ## Open a SurrealQL shell
 	docker compose exec surrealdb /surreal sql \
@@ -51,8 +73,8 @@ backend-build: ## cargo build (release; production-shaped — NO dev-auth)
 backend-test: ## cargo test
 	cd backend && cargo test
 
-backend-run: ## cargo run delphi serve (against compose surrealdb on localhost:8000)
-	cd backend && SURREAL_URL=ws://localhost:8000/rpc cargo run --release -- serve
+backend-run: ## cargo run delphi serve (header mode; needs an upstream proxy injecting X-Auth-*)
+	cd backend && SURREAL_URL=ws://localhost:8000/rpc AUTH_MODE=header cargo run --release -- serve
 
 backend-run-dev: ## cargo run with dev-auth feature (auto-injected identity)
 	cd backend && SURREAL_URL=ws://localhost:8000/rpc AUTH_MODE=dev \
@@ -67,3 +89,29 @@ frontend-dev: ## bun run dev (http://localhost:5173)
 
 frontend-build: ## bun run build
 	cd frontend && bun run build
+
+frontend-test: ## Vitest (runs via node — Bun's child_process shim breaks tinypool)
+	docker run --rm -v "$$(pwd)/frontend:/app" -w /app -u root \
+	  node:22-alpine sh -c "node node_modules/.bin/vitest run"
+
+frontend-test-watch: ## Vitest in watch mode
+	docker run --rm -it -v "$$(pwd)/frontend:/app" -w /app -u root \
+	  node:22-alpine sh -c "node node_modules/.bin/vitest"
+
+# ----- end-to-end tests (Playwright) ----------------------------------------
+# Stack must be up before invoking these (`make up` for tier1, `make full-up`
+# for tier2). Tests live in /tests; this directory has its own package.json
+# so the playwright dependency tree doesn't bleed into the frontend bundle.
+e2e-install: ## Install Playwright + browsers
+	cd tests && bun install && bunx playwright install --with-deps chromium
+
+e2e-tier1: ## Playwright e2e against Tier 1 (`make up` first)
+	cd tests && bun run test:tier1
+
+e2e-tier2: ## Playwright e2e against Tier 2 (`make full-up` first)
+	cd tests && bun run test:tier2
+
+# ----- composite -----------------------------------------------------------
+test-all: ## Run cargo + vitest (excluding e2e — those need a live stack)
+	cd backend && cargo test --features dev-auth
+	$(MAKE) frontend-test

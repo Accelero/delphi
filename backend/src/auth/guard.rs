@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 
-use crate::auth::config::AuthMode;
+use super::config::AuthMode;
 
 pub fn enforce_production_guard(mode: &AuthMode) -> Result<()> {
     let prod_marker = std::env::var("RUST_ENV").as_deref() == Ok("production");

@@ -5,13 +5,25 @@ edition = "2021"
 description = "Delphi: research-tool backend (axum + storage + agents)."
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "delphi"
+path = "src/lib.rs"
+
 [[bin]]
 name = "delphi"
 path = "src/main.rs"
 
 [dependencies]
 # storage
-surrealdb = { version = "2", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
+# `kv-mem` enables the embedded in-memory engine for fast tests
+# (`Surreal::<Any>::connect("memory")`). Production keeps connecting via
+# `ws://`; the engine type is now resolved at runtime from the URL.
+surrealdb = { version = "2", default-features = false, features = [
+    "protocol-ws",
+    "protocol-http",
+    "kv-mem",
+    "rustls",
+] }
 
 # http server
 axum = { version = "0.8", features = ["macros"] }
@@ -42,16 +54,10 @@ anyhow = "1"
 # LLM agent framework (provider-agnostic)
 rig-core = { version = "0.35", features = ["all"] }
 
-# auth (BFF: backend owns OIDC tokens; browser sees only HTTP-only session cookie)
-axum-oidc       = "0.6"
-tower-sessions  = { version = "0.14", default-features = false, features = ["axum-core", "signed"] }
-tower-sessions-core = "0.14"
-openidconnect   = "3"
-jsonwebtoken    = "9"
-rand            = "0.8"
-base64          = "0.22"
-url             = "2"
-time            = "0.3"
+# auth (BFF lives in front of the backend — Traefik + oauth2-proxy. The
+# backend trusts proxy-injected `X-Auth-*` headers and does no token work
+# itself. Future: add `jsonwebtoken` here if we move to in-backend JWT
+# validation as a second `ClaimsExtractor` impl.)
 
 # (added later when wired up)
 # rmcp = "0.2"
@@ -63,6 +69,16 @@ default  = []
 # Production builds MUST omit this flag — release binaries built with
 # default features literally do not contain the bypass code.
 dev-auth = []
+
+[dev-dependencies]
+# Drive the axum router in tests via `tower::ServiceExt::oneshot()` —
+# in-process, no network, every middleware layer attached.
+tower            = { version = "0.5", features = ["util"] }
+http-body-util   = "0.1"
+bytes            = "1"
+# (surrealdb `kv-mem` engine is in [dependencies] above so prod builds also
+#  link the runtime polymorphic `Any` engine; tests hit the in-memory variant
+#  by URL alone.)
 
 [profile.release]
 lto = "thin"

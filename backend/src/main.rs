@@ -2,22 +2,17 @@
 //!
 //! Single binary with subcommands:
 //!     delphi serve              # axum HTTP server (API + SPA)
-//!     delphi admin init         # apply DB schema
 //!     delphi admin status       # row counts
 //!     delphi admin wipe         # delete all data, keep schema
-
-mod admin;
-mod api;
-mod auth;
-mod config;
-mod error;
-mod llm;
-mod state;
-mod storage;
+//!
+//! Schema is applied automatically on every `serve` startup (idempotent),
+//! so there's no separate init step.
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+use delphi::{admin, api, AdminCmd};
 
 #[derive(Parser)]
 #[command(name = "delphi", version, about = "Delphi research-tool backend")]
@@ -44,16 +39,6 @@ struct ServeArgs {
     /// Path to the built frontend (Vite `dist/`). Optional in dev.
     #[arg(long, env = "STATIC_DIR")]
     static_dir: Option<std::path::PathBuf>,
-}
-
-#[derive(Subcommand)]
-pub enum AdminCmd {
-    /// Apply schema (idempotent)
-    Init,
-    /// Show row counts per table
-    Status,
-    /// Delete all data, keep schema
-    Wipe,
 }
 
 #[tokio::main]

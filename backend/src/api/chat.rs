@@ -2,6 +2,8 @@
 //! Protocol. Consumed by `useChat()` in the React frontend.
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -97,25 +99,38 @@ pub async fn chat(
         Ok(s) => s,
         Err(e) => {
             error!("stream_chat init failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("llm error: {e}"),
-            )
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "llm error").into_response();
         }
     };
 
+    // Track whether any delta errored so the trailing finish marker can
+    // report `error` instead of `stop`. Shared between the two stream
+    // stages because they both close over it.
+    let errored = Arc::new(AtomicBool::new(false));
+    let errored_for_finish = errored.clone();
+
     // Translate LlmDelta stream → AI SDK Data Stream Protocol records.
+    // Provider error details are logged server-side; the wire payload only
+    // carries a generic message so we don't leak provider internals to clients.
     let body_stream = upstream
-        .map(|item| {
+        .map(move |item| {
             let line = match item {
                 Ok(LlmDelta::Text(t)) => proto::text(&t),
-                Err(e) => proto::error(&e.to_string()),
+                Err(e) => {
+                    error!("llm stream error: {e}");
+                    errored.store(true, Ordering::Relaxed);
+                    proto::error("llm stream error")
+                }
             };
             Ok::<_, Infallible>(line.into_bytes())
         })
-        .chain(stream::once(async {
-            Ok::<_, Infallible>(proto::finish("stop").into_bytes())
+        .chain(stream::once(async move {
+            let reason = if errored_for_finish.load(Ordering::Relaxed) {
+                "error"
+            } else {
+                "stop"
+            };
+            Ok::<_, Infallible>(proto::finish(reason).into_bytes())
         }));
 
     Response::builder()

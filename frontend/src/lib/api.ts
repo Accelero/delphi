@@ -2,11 +2,13 @@
  * Thin fetch wrapper for the delphi backend.
  *
  * All paths are relative — Vite's dev server proxies /api, /v1, /healthz to
- * the axum backend; in production the same paths are served by axum directly.
+ * the axum backend; in the full prod-shape stack Traefik routes the same
+ * paths to the backend directly.
  *
- * Auth is cookie-based (BFF: backend owns OIDC tokens, browser only sees an
- * HTTP-only signed session cookie). `credentials: "same-origin"` is set on
- * every request so the cookie rides along.
+ * Auth model: an upstream BFF (Traefik + oauth2-proxy in front of the
+ * backend) owns the session cookie. The browser sends the cookie, the BFF
+ * verifies it and projects identity into `X-Auth-*` headers for the
+ * backend. `credentials: "same-origin"` keeps the cookie attached.
  */
 
 export class ApiError extends Error {
@@ -17,7 +19,7 @@ export class ApiError extends Error {
 
 let onUnauthorized: (() => void) | null = null;
 /** Wire a 401 handler from main.tsx — typically a hard navigation to
- *  `/api/auth/login`, which kicks off the IdP redirect chain. */
+ *  `/oauth2/sign_in`, which kicks off the IdP redirect chain. */
 export function setUnauthorizedHandler(fn: () => void): void {
   onUnauthorized = fn;
 }
@@ -46,5 +48,14 @@ export type Session = {
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   session: () => request<Session>("/api/auth/me"),
-  logout: () => request<void>("/api/auth/logout", { method: "POST" }),
 };
+
+/** URL the browser hard-navigates to for sign-out. Owned by oauth2-proxy
+ *  (the BFF), which clears the session cookie and redirects back to "/".
+ *  In dev (Tier 1) this URL doesn't exist — the UI hides the sign-out
+ *  control whenever `session.dev === true`. */
+export const SIGN_OUT_URL = "/oauth2/sign_out";
+
+/** URL the browser hard-navigates to on a 401. oauth2-proxy starts the
+ *  OIDC redirect chain and ?rd= brings the user back here afterwards. */
+export const SIGN_IN_URL = "/oauth2/sign_in";

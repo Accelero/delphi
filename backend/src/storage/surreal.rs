@@ -1,8 +1,10 @@
 //! SurrealDB implementation of the [`Storage`] trait.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use surrealdb::engine::remote::ws::{Client, Ws};
+use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
 use surrealdb::RecordId;
 use surrealdb::Surreal;
@@ -15,34 +17,102 @@ use crate::storage::{
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
 
 pub struct SurrealStorage {
-    db: Surreal<Client>,
+    db: Surreal<Any>,
 }
 
 impl SurrealStorage {
-    /// Connect to a remote SurrealDB over WebSocket.
-    /// `endpoint` is `host:port` (no scheme, no `/rpc` suffix).
+    /// Connect to SurrealDB. The URL drives the engine choice at runtime:
+    ///   - `ws://host:port`  → remote WebSocket (production / dev compose)
+    ///   - `http://host:port` → remote HTTP
+    ///   - `memory` / `mem://` → embedded in-memory (used by tests)
+    ///   - `rocksdb:///path`  → embedded persistent (single-process use)
+    ///
+    /// `signin` is only required for engines that authenticate (the remote
+    /// ones); for the in-memory engine we skip it.
     pub async fn connect(
-        endpoint: &str,
+        url: &str,
         user: &str,
         password: &str,
         namespace: &str,
         database: &str,
     ) -> Result<Self> {
-        let db = Surreal::new::<Ws>(endpoint).await?;
-        db.signin(Root {
-            username: user,
-            password,
-        })
-        .await?;
+        let db = surrealdb::engine::any::connect(url).await?;
+        if engine_requires_auth(url) {
+            db.signin(Root {
+                username: user,
+                password,
+            })
+            .await?;
+        }
         db.use_ns(namespace).use_db(database).await?;
         Ok(Self { db })
     }
 
-    /// Borrow the underlying Surreal client. The session store and auth
-    /// bootstrap modules need it so they can run their own queries against
-    /// the same multiplexed WS connection rather than opening a second one.
-    pub fn db(&self) -> &Surreal<Client> {
+    /// Borrow the underlying Surreal client. The auth bootstrap module
+    /// needs it so it can run user / tenant / membership upserts against
+    /// the same multiplexed connection rather than opening a second one.
+    pub fn db(&self) -> &Surreal<Any> {
         &self.db
+    }
+}
+
+impl SurrealStorage {
+    /// Spin up an embedded in-memory SurrealDB. **Test-only convenience** —
+    /// every call returns a fresh, empty database, so callers should run
+    /// `init_schema()` afterwards. Production callers must go through
+    /// [`Self::connect`] with a real URL.
+    pub async fn in_memory(namespace: &str, database: &str) -> Result<Self> {
+        Self::connect("memory", "", "", namespace, database).await
+    }
+}
+
+/// `memory` / `rocksdb:` are local engines that don't gate on credentials.
+/// Anything else (ws/wss/http/https/tcp/…) does.
+fn engine_requires_auth(url: &str) -> bool {
+    !(url == "memory"
+        || url.starts_with("mem://")
+        || url.starts_with("rocksdb:")
+        || url.starts_with("surrealkv:")
+        || url.starts_with("file:"))
+}
+
+/// Construct a [`SurrealStorage`] from environment variables.
+///
+/// Returns the concrete handle (not the [`Storage`] trait object) because
+/// `api::serve` also needs the underlying `Surreal<Any>` for tenant/user
+/// bootstrapping. Callers that don't need a raw handle should go through
+/// [`crate::config::storage_from_env`] instead.
+pub(crate) async fn surreal_from_env() -> Result<Arc<SurrealStorage>> {
+    let url = env_or("SURREAL_URL", "ws://surrealdb:8000/rpc");
+    let user = env_or("SURREAL_USER", "root");
+    let password = env_or("SURREAL_PASS", "root");
+    let namespace = env_or("SURREAL_NS", "delphi");
+    let database = env_or("SURREAL_DB", "main");
+    let storage = SurrealStorage::connect(&url, &user, &password, &namespace, &database).await?;
+    Ok(Arc::new(storage))
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::engine_requires_auth;
+
+    #[test]
+    fn auth_required_for_remote_engines() {
+        assert!(engine_requires_auth("ws://surrealdb:8000/rpc"));
+        assert!(engine_requires_auth("wss://x:8000"));
+        assert!(engine_requires_auth("http://x:8000"));
+        assert!(engine_requires_auth("https://x:8000"));
+    }
+
+    #[test]
+    fn auth_skipped_for_local_engines() {
+        assert!(!engine_requires_auth("memory"));
+        assert!(!engine_requires_auth("mem://"));
+        assert!(!engine_requires_auth("rocksdb:/data/db"));
     }
 }
 
@@ -382,7 +452,7 @@ impl Storage for SurrealStorage {
     }
 }
 
-async fn count_table(db: &Surreal<Client>, table: &str) -> Result<u64> {
+async fn count_table(db: &Surreal<Any>, table: &str) -> Result<u64> {
     let mut response = db
         .query(format!("SELECT count() AS n FROM {table} GROUP ALL"))
         .await?;

@@ -8,7 +8,7 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMenu } from "@/components/user-menu";
-import { ApiError, api } from "@/lib/api";
+import { ApiError, api, SIGN_IN_URL } from "@/lib/api";
 import { useSession } from "@/hooks/useSession";
 
 interface RouterContext {
@@ -17,8 +17,9 @@ interface RouterContext {
 
 export const Route = createRootRouteWithContext<RouterContext>()({
   beforeLoad: async ({ context, location }) => {
-    // The backend owns the auth callback URLs (/api/*). Don't gate them.
+    // Don't gate API or BFF callback paths.
     if (location.pathname.startsWith("/api/")) return;
+    if (location.pathname.startsWith("/oauth2/")) return;
     try {
       await context.queryClient.ensureQueryData({
         queryKey: ["session"],
@@ -27,9 +28,10 @@ export const Route = createRootRouteWithContext<RouterContext>()({
       });
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
-        // Backend route — hard-navigate so the browser hits the OIDC
-        // redirect chain instead of the SPA router.
-        window.location.href = "/api/auth/login";
+        // Hard-navigate so the browser hits oauth2-proxy's OIDC redirect
+        // chain instead of the SPA router.
+        const rd = encodeURIComponent(location.pathname + location.search);
+        window.location.href = `${SIGN_IN_URL}?rd=${rd}`;
         // Halt route resolution; the browser will navigate away.
         throw redirect({ to: "/" });
       }

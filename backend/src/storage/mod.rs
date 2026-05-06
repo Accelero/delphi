@@ -3,11 +3,17 @@
 //! Application code must depend only on this trait, not on a concrete
 //! implementation. The choice of backend is made in [`crate::config`].
 
-pub mod models;
-pub mod surreal;
+mod models;
+mod surreal;
 
 pub use models::{Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, Filters};
+
+/// Concrete-Surreal escape hatch. The bin and integration tests both need
+/// the underlying `Surreal<Any>` for auth bootstrap upserts; tests also use
+/// [`SurrealStorage::in_memory`] to spin up a fresh DB per case. Other
+/// callers go through [`crate::config::storage_from_env`].
 pub use surreal::SurrealStorage;
+pub(crate) use surreal::surreal_from_env;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

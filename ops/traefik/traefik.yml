@@ -1,0 +1,25 @@
+# Traefik static configuration. Loaded once at startup.
+
+# Read dynamic routes / middlewares from the file provider — keeps routing
+# config alongside the rest of the ops/ directory rather than scattered
+# across container labels.
+providers:
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+entryPoints:
+  web:
+    address: ":80"
+
+# Surface the Traefik API on :8080 for `make full-debug`. The dashboard
+# is enabled in insecure mode — fine for a localhost dev stack, never use
+# in production.
+api:
+  dashboard: true
+  insecure: true
+
+log:
+  level: INFO
+
+accessLog: {}

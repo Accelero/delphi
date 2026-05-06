@@ -1,0 +1,146 @@
+name: delphi-full
+
+# Tier 2: full prod-shape dev stack.
+#
+# Topology:
+#   browser → traefik (:80) → frontend (Vite)
+#                           → backend (:8081)        [forward-auth required]
+#                           → oauth2-proxy (:4180)   [/oauth2/*]
+#   browser → dex (:5556)                            [login UI, host-exposed]
+#
+#   backend                 → surrealdb
+#   oauth2-proxy            → dex                    [token redemption]
+#                           → redis                  [session store]
+#
+# Goal: validate the auth perimeter end-to-end against the same primitives
+# you'd use in production. The backend image here is built WITHOUT the
+# `dev-auth` cargo feature — it cannot self-inject identity. Every request
+# arrives at the backend with `X-Auth-*` headers placed there by Traefik
+# (which got them from oauth2-proxy via forward-auth).
+#
+# Bring up:   docker compose -f docker-compose.full.yml up -d --build
+# Tear down:  docker compose -f docker-compose.full.yml down
+# Open:       http://localhost   (login: alice@delphi.test / alice)
+#
+# This stack is *not* about UI iteration — for that, use the Tier 1 stack
+# in docker-compose.yml.
+
+services:
+  traefik:
+    image: traefik:v3.1
+    container_name: delphi-full-traefik
+    command:
+      - --configFile=/etc/traefik/traefik.yml
+    ports:
+      - "80:80"
+      - "8088:8080"   # Traefik dashboard
+    volumes:
+      - ./ops/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./ops/traefik/dynamic:/etc/traefik/dynamic:ro
+    depends_on:
+      - oauth2-proxy
+      - backend
+      - frontend
+
+  dex:
+    image: dexidp/dex:v2.39.1
+    container_name: delphi-full-dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    volumes:
+      - ./ops/dex/config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      # Exposed on host so the browser can hit Dex directly during the
+      # OIDC redirect dance — see ops/dex/config.yaml for the URL split.
+      - "5556:5556"
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    container_name: delphi-full-oauth2-proxy
+    command:
+      - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
+      - --alpha-config=/etc/oauth2-proxy/alpha.yaml
+    volumes:
+      - ./ops/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
+      - ./ops/oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
+    extra_hosts:
+      # Lets the in-container `localhost` of the issuer URL resolve to the
+      # docker host, so oauth2-proxy can reach Dex on the host-exposed port
+      # if it falls back to the issuer URL during validation.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - dex
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: delphi-full-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  surrealdb:
+    image: surrealdb/surrealdb:v2.1.4
+    container_name: delphi-full-surrealdb
+    user: "0:0"
+    command:
+      - start
+      - --user=root
+      - --pass=root
+      - --bind=0.0.0.0:8000
+      - --log=info
+      - rocksdb:/data/db
+    volumes:
+      - surreal_data_full:/data/db
+    healthcheck:
+      test: ["CMD", "/surreal", "is-ready", "--endpoint", "http://0.0.0.0:8000"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        # No `dev-auth` feature — release-shaped binary. The dev-injection
+        # middleware is literally not compiled in.
+        BACKEND_FEATURES: ""
+    image: delphi-backend:full
+    container_name: delphi-full-backend
+    command: ["serve"]
+    environment:
+      STORAGE_BACKEND: surreal
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_USER: root
+      SURREAL_PASS: root
+      SURREAL_NS: delphi
+      SURREAL_DB: main
+      BIND_ADDR: 0.0.0.0:8081
+      RUST_LOG: info,delphi=debug
+      AUTH_MODE: header
+      RUST_ENV: production
+      DEFAULT_TENANT_SLUG: default
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+    depends_on:
+      surrealdb:
+        condition: service_healthy
+
+  frontend:
+    image: oven/bun:1.1
+    container_name: delphi-full-frontend
+    working_dir: /app
+    command: ["sh", "-c", "if [ ! -x node_modules/.bin/vite ]; then bun install; fi; exec bun run dev"]
+    environment:
+      # The Vite dev-server proxy is irrelevant in this stack — Traefik
+      # routes `/api/*` directly. We still set BACKEND_URL so anyone hitting
+      # Vite on :5173 (bypassing Traefik) doesn't 404 on /api.
+      BACKEND_URL: http://backend:8081
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules_full:/app/node_modules
+
+volumes:
+  surreal_data_full:
+  frontend_node_modules_full:

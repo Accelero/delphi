@@ -26,11 +26,10 @@ use crate::error::{Error, Result};
 // ---------------------------------------------------------------------------
 
 fn split_history(messages: Vec<LlmMessage>) -> Result<(String, Vec<Message>)> {
-    let mut iter = messages.into_iter();
     let mut history: Vec<Message> = Vec::new();
     let mut last_user: Option<String> = None;
 
-    for m in iter.by_ref() {
+    for m in messages {
         match m.role {
             Role::System => {
                 // Fold any system message into history as a user note. v1
@@ -86,12 +85,12 @@ fn map_multi_turn<R>(item: MultiTurnStreamItem<R>) -> Option<LlmDelta> {
 // Provider impls
 // ---------------------------------------------------------------------------
 
-pub struct AnthropicLlm {
+struct AnthropicLlm {
     agent: Agent<anthropic::completion::CompletionModel>,
 }
 
 impl AnthropicLlm {
-    pub fn from_env(model: &str) -> Result<Self> {
+    fn from_env(model: &str) -> Result<Self> {
         let client = anthropic::Client::from_env();
         let agent = client
             .agent(model)
@@ -120,12 +119,12 @@ impl LlmClient for AnthropicLlm {
     }
 }
 
-pub struct OpenAiLlm {
+struct OpenAiLlm {
     agent: Agent<ResponsesCompletionModel>,
 }
 
 impl OpenAiLlm {
-    pub fn from_env(model: &str) -> Result<Self> {
+    fn from_env(model: &str) -> Result<Self> {
         let client = openai::Client::from_env();
         let agent = client
             .agent(model)
@@ -158,12 +157,12 @@ impl LlmClient for OpenAiLlm {
 /// `https://api.minimax.io/v1`. We build a [`CompletionsClient`] (legacy
 /// chat-completions flavor) with that base URL plus the user's MiniMax
 /// API key. Default model is `MiniMax-M2.7` (their featured coding model).
-pub struct MinimaxLlm {
+struct MinimaxLlm {
     agent: Agent<OpenAiChatCompletionModel>,
 }
 
 impl MinimaxLlm {
-    pub fn from_env(model: &str) -> Result<Self> {
+    fn from_env(model: &str) -> Result<Self> {
         let api_key = std::env::var("MINIMAX_API_KEY")
             .map_err(|_| Error::EnvMissing("MINIMAX_API_KEY".into()))?;
         let base_url = std::env::var("MINIMAX_BASE_URL")

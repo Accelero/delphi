@@ -1,8 +1,10 @@
 //! Per-request authenticated identity.
 //!
-//! The [`AuthContext`] extractor is mode-agnostic — it just looks at request
-//! extensions. Whichever middleware ran (dev injection, OIDC + lazy upsert,
-//! …) is responsible for putting the value there. Handlers stay clean.
+//! [`AuthContext`] is what handlers consume. It is built once per request by
+//! [`super::identity_middleware`] from a [`super::Claims`], and stashed in
+//! request extensions. Whichever [`super::ClaimsExtractor`] produced the
+//! claims is invisible to downstream code — that is the point of the
+//! abstraction.
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -18,6 +20,7 @@ pub struct AuthContext {
     pub display_name: Option<String>,
     pub iss: String,
     pub sub: String,
+    pub roles: Vec<String>,
     pub is_dev: bool,
 }
 
@@ -33,5 +36,22 @@ where
             .get::<AuthContext>()
             .cloned()
             .ok_or((StatusCode::UNAUTHORIZED, "not authenticated"))
+    }
+}
+
+// Allow `Option<AuthContext>` as a handler argument: handlers like `me` accept
+// the absence case (returning 401) instead of failing with the extractor's
+// default rejection.
+impl<S> axum::extract::OptionalFromRequestParts<S> for AuthContext
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> Result<Option<Self>, Self::Rejection> {
+        Ok(parts.extensions.get::<AuthContext>().cloned())
     }
 }

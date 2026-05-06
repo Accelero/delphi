@@ -1,0 +1,69 @@
+# Dynamic Traefik configuration: routers, services, middlewares.
+#
+# Routing summary:
+#   /oauth2/*  → oauth2-proxy directly (no auth gate; this *is* the gate).
+#   /api/*     → backend, gated by `oauth2-forward-auth` middleware.
+#   /healthz   → backend, public.
+#   /          → frontend SPA.
+#
+# The frontend itself is served anonymously. The SPA's first call to
+# /api/auth/me trips the forward-auth gate; oauth2-proxy returns 401 →
+# Traefik 302s the browser to /oauth2/sign_in → Dex login → callback →
+# cookie set → SPA reload sees the user logged in.
+
+http:
+  routers:
+    oauth2-proxy:
+      rule: "PathPrefix(`/oauth2/`)"
+      service: oauth2-proxy
+      entryPoints: [web]
+
+    backend-public:
+      rule: "Path(`/healthz`)"
+      service: backend
+      entryPoints: [web]
+
+    backend-api:
+      rule: "PathPrefix(`/api/`)"
+      service: backend
+      entryPoints: [web]
+      middlewares:
+        - oauth2-forward-auth
+
+    frontend:
+      rule: "PathPrefix(`/`)"
+      service: frontend
+      entryPoints: [web]
+      priority: 1   # lowest — only matches when nothing more specific did
+
+  services:
+    oauth2-proxy:
+      loadBalancer:
+        servers:
+          - url: "http://oauth2-proxy:4180"
+    backend:
+      loadBalancer:
+        servers:
+          - url: "http://backend:8081"
+    frontend:
+      loadBalancer:
+        servers:
+          - url: "http://frontend:5173"
+
+  middlewares:
+    # Forward-auth: every /api/* request triggers a sub-request to
+    # oauth2-proxy's /oauth2/auth endpoint. On 2xx we forward the listed
+    # response headers onto the original request (so the backend sees
+    # `X-Auth-*`). On 401 oauth2-proxy emits a redirect to /oauth2/sign_in
+    # and Traefik propagates it to the browser.
+    oauth2-forward-auth:
+      forwardAuth:
+        address: "http://oauth2-proxy:4180/oauth2/auth"
+        trustForwardHeader: true
+        authResponseHeaders:
+          - X-Auth-User-Id
+          - X-Auth-Issuer
+          - X-Auth-Email
+          - X-Auth-Name
+          - X-Auth-Tenant-Id
+          - X-Auth-Roles

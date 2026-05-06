@@ -45,10 +45,11 @@ import {
   PromptInputTools,
   type PromptInputMessage,
 } from "@/components/ai-elements/prompt-input";
-import { MessageBody } from "@/components/message";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
+
+import { MessageBody } from "./MessageBody";
 
 export type ChatProps = {
   api: string;
