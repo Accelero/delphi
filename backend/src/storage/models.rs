@@ -1,6 +1,5 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use surrealdb::RecordId;
+use surrealdb::{Datetime, RecordId};
 
 /// SurrealDB record id, e.g. `document:abc…`.
 pub type DocId = RecordId;
@@ -22,12 +21,23 @@ pub struct Document {
     pub title: Option<String>,
     #[serde(default)]
     pub authors: Vec<String>,
+    /// SurrealDB-native datetime (vs. `chrono::DateTime`) so the SDK
+    /// serializer emits the protocol's datetime tag instead of an ISO
+    /// string — Surreal rejects raw strings for `TYPE datetime` fields.
+    /// Convert from `chrono::DateTime<Utc>` via `.into()` at the
+    /// ingestion boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<DateTime<Utc>>,
+    pub published_at: Option<Datetime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingested_at: Option<DateTime<Utc>>,
+    pub ingested_at: Option<Datetime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+
+    /// Author/publisher-written short prose (paper abstract, book flap
+    /// copy, article deck). Distinct from `document_content.text`, which
+    /// holds the body. Optional: not every source provides one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 
     /// Hex-encoded SHA-256 of normalized content. Dedup key.
     pub content_hash: String,

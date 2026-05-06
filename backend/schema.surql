@@ -29,6 +29,10 @@ DEFINE FIELD IF NOT EXISTS authors      ON document TYPE array<string> DEFAULT [
 DEFINE FIELD IF NOT EXISTS published_at ON document TYPE option<datetime>;
 DEFINE FIELD IF NOT EXISTS ingested_at  ON document TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS language     ON document TYPE option<string>;
+-- Author/publisher-written short prose (paper abstract, book flap copy,
+-- article deck). Distinct from `document_content.text`, which holds the
+-- full body. Optional: not every source provides one.
+DEFINE FIELD IF NOT EXISTS summary      ON document TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS content_hash ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS version      ON document TYPE int DEFAULT 1;
 DEFINE FIELD IF NOT EXISTS metadata     ON document FLEXIBLE TYPE object DEFAULT {};
@@ -88,6 +92,20 @@ DEFINE FIELD IF NOT EXISTS change_summary ON document_version TYPE option<string
 DEFINE FIELD IF NOT EXISTS recorded_at    ON document_version TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX IF NOT EXISTS document_version_unique ON document_version FIELDS doc, version UNIQUE;
+
+-- ---------------------------------------------------------------------------
+-- source_state
+-- Per-adapter incremental-fetch cursor. Opaque JSON object so each adapter
+-- owns its own shape (e.g. `{ "since": "<ISO8601>" }`). Keyed by the
+-- adapter's stable `name()`.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS source_state SCHEMAFULL;
+
+DEFINE FIELD IF NOT EXISTS adapter    ON source_state TYPE string;
+DEFINE FIELD IF NOT EXISTS cursor     ON source_state FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS updated_at ON source_state TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS source_state_adapter ON source_state FIELDS adapter UNIQUE;
 
 -- ===========================================================================
 -- AUTH / TENANCY

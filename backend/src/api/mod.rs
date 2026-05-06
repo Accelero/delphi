@@ -17,7 +17,11 @@ use tracing::info;
 use crate::auth::{
     self, AuthConfig, AuthMode, ClaimsExtractor, HeaderClaimsExtractor, IdentityDeps,
 };
+use crate::filter::{IngestFilter, NoopFilter};
+use crate::ingestion::{self, Pipeline};
 use crate::llm::llm_from_env;
+use crate::object_store::{self, ObjectStore};
+use crate::sources;
 use crate::state::AppState;
 use crate::storage::{surreal_from_env, Storage};
 
@@ -70,9 +74,42 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         default_tenant_id,
     };
 
+    let storage: Arc<dyn Storage> = surreal.clone();
+    let sink: Arc<dyn ingestion::IngestSink> = Arc::new(Pipeline::new(storage.clone()));
+    let object_store: Arc<dyn ObjectStore> = object_store::from_url(
+        &std::env::var("OBJECT_STORE_URL")
+            .unwrap_or_else(|_| "file:///var/lib/delphi/originals".into()),
+    )
+    .context("constructing object store")?;
+    // Slice 2 ships NoopFilter; the real semantic filter is a future
+    // drop-in implementing the same `IngestFilter` trait.
+    let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
+
     let state = AppState {
-        storage: surreal,
+        storage: storage.clone(),
         llm,
+        sink: sink.clone(),
+        object_store: object_store.clone(),
+    };
+
+    // Source-adapter scheduler runs alongside the HTTP server. It shares
+    // the same `IngestSink` the HTTP handler uses — internal and external
+    // ingestion paths converge on one method. The filter sits between
+    // adapter output and `sink.ingest`; HTTP pushes deliberately bypass
+    // it.
+    let sources_enabled = std::env::var("SOURCES_ENABLED").as_deref() == Ok("true");
+    let scheduler = if sources_enabled {
+        let registry = sources::default_registry(object_store.clone());
+        if registry.is_empty() {
+            info!("SOURCES_ENABLED=true but no adapters configured; scheduler idle");
+            None
+        } else {
+            info!("starting source-adapter scheduler");
+            Some(sources::run_scheduler(sink, filter, storage, registry))
+        }
+    } else {
+        info!("SOURCES_ENABLED is not 'true'; source-adapter scheduler disabled");
+        None
     };
 
     // Today there's only one production extractor. When we add a second
@@ -96,6 +133,11 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("axum::serve")?;
+
+    if let Some(handle) = scheduler {
+        info!("stopping source-adapter scheduler");
+        handle.shutdown().await;
+    }
     Ok(())
 }
 
@@ -113,7 +155,11 @@ pub fn build_router(
     // Routes that require an authenticated identity.
     let api_protected = Router::new()
         .route("/api/chat", post(chat::chat))
-        .route("/api/auth/me", get(auth::me));
+        .route("/api/auth/me", get(auth::me))
+        .route(
+            "/api/ingestion/documents",
+            post(ingestion::ingest_documents),
+        );
 
     // Routes that don't require an authenticated identity.
     let api_public = Router::new().route("/healthz", get(health::healthz));

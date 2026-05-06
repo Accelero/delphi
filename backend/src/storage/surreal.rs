@@ -126,6 +126,11 @@ struct CountRow {
     n: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct CursorRow {
+    cursor: serde_json::Value,
+}
+
 #[derive(Debug, Serialize)]
 struct ContentData {
     doc: RecordId,
@@ -424,6 +429,48 @@ impl Storage for SurrealStorage {
         }
         let mut response = q.await?;
         Ok(response.take(0)?)
+    }
+
+    // ---- source state ------------------------------------------------------
+
+    async fn get_source_cursor(&self, adapter: &str) -> Result<Option<serde_json::Value>> {
+        let mut response = self
+            .db
+            .query("SELECT cursor FROM source_state WHERE adapter = $name LIMIT 1")
+            .bind(("name", adapter.to_string()))
+            .await?;
+        let row: Option<CursorRow> = response.take(0)?;
+        Ok(row.map(|r| r.cursor))
+    }
+
+    async fn put_source_cursor(
+        &self,
+        adapter: &str,
+        cursor: &serde_json::Value,
+    ) -> Result<()> {
+        let mut response = self
+            .db
+            .query("SELECT id FROM source_state WHERE adapter = $name LIMIT 1")
+            .bind(("name", adapter.to_string()))
+            .await?;
+        let existing: Option<IdRow> = response.take(0)?;
+
+        if let Some(IdRow { id }) = existing {
+            self.db
+                .query("UPDATE $rid MERGE { cursor: $cursor, updated_at: time::now() }")
+                .bind(("rid", id))
+                .bind(("cursor", cursor.clone()))
+                .await?
+                .check()?;
+        } else {
+            self.db
+                .query("CREATE source_state CONTENT { adapter: $name, cursor: $cursor }")
+                .bind(("name", adapter.to_string()))
+                .bind(("cursor", cursor.clone()))
+                .await?
+                .check()?;
+        }
+        Ok(())
     }
 
     // ---- ops ---------------------------------------------------------------

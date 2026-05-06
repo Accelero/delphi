@@ -1158,11 +1158,16 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "hex",
  "http-body-util",
+ "quick-xml",
+ "reqwest 0.12.28",
  "rig-core",
  "serde",
  "serde_json",
+ "sha2",
  "surrealdb",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tower",
@@ -3293,6 +3298,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "quick-xml"
+version = "0.36.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
+dependencies = [
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "quick_cache"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4815,10 +4830,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

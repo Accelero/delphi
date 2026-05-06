@@ -78,6 +78,20 @@ pub trait Storage: Send + Sync {
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>>;
 
+    // ---- source state ------------------------------------------------------
+
+    /// Read the persisted cursor for a source adapter. Cursor shape is
+    /// adapter-defined (opaque JSON object): the storage layer just round-
+    /// trips it, so each adapter can pick whatever payload makes sense
+    /// (e.g. `{ "since": "<ISO8601>" }`).
+    async fn get_source_cursor(&self, adapter: &str) -> Result<Option<serde_json::Value>>;
+
+    async fn put_source_cursor(
+        &self,
+        adapter: &str,
+        cursor: &serde_json::Value,
+    ) -> Result<()>;
+
     // ---- ops ---------------------------------------------------------------
 
     async fn counts(&self) -> Result<Counts>;

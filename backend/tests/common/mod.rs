@@ -8,6 +8,8 @@
 #![allow(dead_code)] // each test binary uses a different subset of helpers
 
 pub mod fake_llm;
+pub mod fake_sink;
+pub mod fake_source;
 
 use std::sync::Arc;
 
@@ -23,8 +25,10 @@ use delphi::api;
 use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderClaimsExtractor, HeaderConfig, IdentityDeps,
 };
+use delphi::ingestion::Pipeline;
+use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
-use delphi::storage::SurrealStorage;
+use delphi::storage::{Storage, SurrealStorage};
 
 use crate::common::fake_llm::FakeLlmClient;
 
@@ -34,6 +38,7 @@ use crate::common::fake_llm::FakeLlmClient;
 pub struct TestApp {
     pub router: Router,
     pub storage: Arc<SurrealStorage>,
+    pub object_store: Arc<dyn ObjectStore>,
     pub default_tenant_id: RecordId,
     pub default_tenant_slug: String,
 }
@@ -54,7 +59,6 @@ impl TestApp {
 
         // Same code path the real backend takes on startup: applies the
         // canonical schema. `IF NOT EXISTS` everywhere — safe to re-run.
-        use delphi::storage::Storage;
         storage
             .init_schema()
             .await
@@ -77,9 +81,13 @@ impl TestApp {
 
         let extractor: Arc<dyn ClaimsExtractor> = Arc::new(HeaderClaimsExtractor::new());
 
+        let trait_storage: Arc<dyn Storage> = storage.clone();
+        let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let state = AppState {
-            storage: storage.clone(),
+            storage: trait_storage.clone(),
             llm: Arc::new(FakeLlmClient::default()),
+            sink: Arc::new(Pipeline::new(trait_storage)),
+            object_store: object_store.clone(),
         };
 
         let router = api::build_router(state, None, &mode, identity_deps, extractor);
@@ -87,6 +95,7 @@ impl TestApp {
         TestApp {
             router,
             storage,
+            object_store,
             default_tenant_id,
             default_tenant_slug,
         }

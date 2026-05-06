@@ -11,7 +11,11 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod filter;
+pub mod ingestion;
 pub mod llm;
+pub mod object_store;
+pub mod sources;
 pub mod state;
 pub mod storage;
 

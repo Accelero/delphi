@@ -1,0 +1,491 @@
+//! arXiv adapter.
+//!
+//! Polls the arXiv search API (Atom XML, sorted desc by submittedDate),
+//! downloads each new paper's PDF into the configured `ObjectStore`,
+//! shells out to `pdftotext` for body extraction, and yields fully-formed
+//! `IngestRequest`s for the scheduler to filter + ingest.
+//!
+//! Cursor shape: `{ "last_published": "<RFC3339>" }`. arXiv's API has no
+//! `since` filter, so we rely on the desc sort + client-side cutoff.
+//!
+//! Slice-2 simplifications:
+//! - One page per cycle (no pagination loop). With a 6 h cadence and
+//!   page size 50, that's 200 papers/day — sufficient for live ingest.
+//!   Initial backfill of an old query is a future one-shot tool.
+//! - PDF fetch failures are logged and the paper falls through with
+//!   `raw_text = None` — metadata still lands.
+//! - `pdftotext` extraction failures likewise just suppress the body;
+//!   the paper still ingests with summary + metadata.
+
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use reqwest::Client;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use crate::error::{Error, Result};
+use crate::ingestion::IngestRequest;
+use crate::object_store::ObjectStore;
+
+use super::{Fetched, SourceAdapter};
+
+const ADAPTER_NAME: &str = "arxiv";
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 21_600; // 6 h
+const DEFAULT_PAGE_SIZE: usize = 50;
+const ENDPOINT: &str = "https://export.arxiv.org/api/query";
+const PDF_FETCH_DELAY: Duration = Duration::from_secs(3);
+/// arXiv asks API consumers to put a contact email in the User-Agent so
+/// they can reach out before rate-limiting an offending client. The
+/// `ARXIV_CONTACT_EMAIL` env var fills the address; if unset we fall
+/// back to a generic UA (works but is more 429-prone).
+const USER_AGENT_FALLBACK: &str =
+    "delphi-backend/0.1 (https://github.com/Accelero/delphi)";
+
+pub struct ArxivAdapter {
+    query: String,
+    poll_interval: Duration,
+    page_size: usize,
+    http: Client,
+    object_store: Arc<dyn ObjectStore>,
+}
+
+impl ArxivAdapter {
+    /// `None` when `ARXIV_QUERY` is unset — the install/uninstall switch.
+    pub fn try_from_env(object_store: Arc<dyn ObjectStore>) -> Option<Self> {
+        let query = std::env::var("ARXIV_QUERY").ok().filter(|s| !s.trim().is_empty())?;
+        let poll_interval = std::env::var("ARXIV_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
+        let page_size = std::env::var("ARXIV_PAGE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE);
+        let user_agent = match std::env::var("ARXIV_CONTACT_EMAIL").ok() {
+            Some(email) if !email.trim().is_empty() => format!(
+                "delphi-backend/0.1 (https://github.com/Accelero/delphi; mailto:{})",
+                email.trim()
+            ),
+            _ => USER_AGENT_FALLBACK.to_string(),
+        };
+        let http = Client::builder().user_agent(user_agent).build().ok()?;
+        Some(Self {
+            query,
+            poll_interval: Duration::from_secs(poll_interval),
+            page_size,
+            http,
+            object_store,
+        })
+    }
+}
+
+// ─── Atom XML structs ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct AtomFeed {
+    #[serde(rename = "entry", default)]
+    entries: Vec<AtomEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomEntry {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    published: String,
+    #[serde(rename = "author", default)]
+    authors: Vec<AtomAuthor>,
+    #[serde(rename = "link", default)]
+    links: Vec<AtomLink>,
+    #[serde(rename = "category", default)]
+    categories: Vec<AtomCategory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomAuthor {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomLink {
+    #[serde(rename = "@href", default)]
+    href: String,
+    #[serde(rename = "@title", default)]
+    title: String,
+    #[serde(rename = "@type", default)]
+    typ: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AtomCategory {
+    #[serde(rename = "@term", default)]
+    term: String,
+}
+
+// ─── adapter impl ──────────────────────────────────────────────────────────
+
+#[async_trait]
+impl SourceAdapter for ArxivAdapter {
+    fn name(&self) -> &str {
+        ADAPTER_NAME
+    }
+    fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+    async fn fetch(&self, cursor: Option<Value>) -> Result<Fetched> {
+        let last_published = cursor
+            .as_ref()
+            .and_then(|c| c.get("last_published"))
+            .and_then(|v| v.as_str())
+            .and_then(parse_rfc3339);
+
+        let resp = self
+            .http
+            .get(ENDPOINT)
+            .query(&[
+                ("search_query", self.query.as_str()),
+                ("sortBy", "submittedDate"),
+                ("sortOrder", "descending"),
+                ("start", "0"),
+                ("max_results", &self.page_size.to_string()),
+            ])
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_secs =
+                parse_retry_after(resp.headers().get(reqwest::header::RETRY_AFTER))
+                    .map(|d| d.as_secs());
+            tracing::warn!(
+                ?retry_after_secs,
+                next_cycle_secs = self.poll_interval.as_secs(),
+                "arxiv: 429 Too Many Requests; skipping this cycle, retry on next interval"
+            );
+            return Ok(Fetched {
+                items: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(Error::Adapter {
+                name: ADAPTER_NAME.into(),
+                message: format!("HTTP {status}: {body}"),
+            });
+        }
+        let xml = resp.text().await?;
+        let entries = parse_atom_feed(&xml)?;
+
+        let mut items = Vec::with_capacity(entries.len());
+        let mut newest = last_published;
+
+        for (idx, entry) in entries.into_iter().enumerate() {
+            let Some(published) = parse_rfc3339(&entry.published) else {
+                tracing::warn!(id = %entry.id, ts = %entry.published, "unparseable arxiv date, skipping");
+                continue;
+            };
+            if let Some(cutoff) = last_published {
+                if published <= cutoff {
+                    // sorted desc — once we hit something we've seen, the rest are older too
+                    break;
+                }
+            }
+            newest = Some(newest.map_or(published, |n| n.max(published)));
+
+            // arXiv courtesy: pace PDF fetches. Don't sleep before the first
+            // one (we already paid for the search request).
+            if idx > 0 {
+                tokio::time::sleep(PDF_FETCH_DELAY).await;
+            }
+
+            match self.build_ingest_request(entry, published).await {
+                Ok(req) => items.push(req),
+                Err(e) => {
+                    tracing::error!(error = %e, "arxiv: failed to build ingest request");
+                }
+            }
+        }
+
+        let next_cursor = newest.map(|dt| json!({ "last_published": dt.to_rfc3339() }));
+        Ok(Fetched {
+            items,
+            next_cursor,
+        })
+    }
+}
+
+impl ArxivAdapter {
+    async fn build_ingest_request(
+        &self,
+        entry: AtomEntry,
+        published: DateTime<Utc>,
+    ) -> Result<IngestRequest> {
+        // Identity. arXiv ids look like "http://arxiv.org/abs/2106.09685v2".
+        let abs_id = parse_arxiv_abs_id(&entry.id).ok_or_else(|| Error::Adapter {
+            name: ADAPTER_NAME.into(),
+            message: format!("malformed arxiv id: {}", entry.id),
+        })?;
+        let canonical_id = format!("arxiv:{abs_id}");
+        let source_uri = format!("https://arxiv.org/abs/{abs_id}");
+        let pdf_url = entry
+            .links
+            .iter()
+            .find(|l| l.title == "pdf" || l.typ == "application/pdf")
+            .map(|l| l.href.clone());
+
+        // Fetch + store + extract. Soft-fail any of these — the paper
+        // still ingests with metadata + summary, body just stays None.
+        let (storage_uri, raw_text) = match pdf_url {
+            Some(ref url) => self.fetch_and_extract(&abs_id, url).await,
+            None => (None, None),
+        };
+
+        let title = entry.title.split_whitespace().collect::<Vec<_>>().join(" ");
+        let summary = entry.summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        let authors: Vec<String> = entry
+            .authors
+            .into_iter()
+            .filter(|a| !a.name.is_empty())
+            .map(|a| a.name.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect();
+        let categories: Vec<String> =
+            entry.categories.into_iter().map(|c| c.term).collect();
+
+        let metadata = json!({
+            "arxiv_id": abs_id,
+            "categories": categories,
+            "primary_category": categories_first(&abs_id, &entry.id), // best-effort
+        });
+
+        Ok(IngestRequest {
+            canonical_id,
+            source_type: ADAPTER_NAME.into(),
+            source_uri,
+            title: if title.is_empty() { None } else { Some(title) },
+            authors,
+            published_at: Some(published),
+            language: None,
+            summary: if summary.is_empty() { None } else { Some(summary) },
+            raw_text,
+            storage_uri,
+            metadata,
+        })
+    }
+
+    async fn fetch_and_extract(
+        &self,
+        abs_id: &str,
+        pdf_url: &str,
+    ) -> (Option<String>, Option<String>) {
+        let bytes = match self.http.get(pdf_url).send().await {
+            Ok(r) if r.status().is_success() => match r.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, %pdf_url, "arxiv: pdf body read failed");
+                    return (None, None);
+                }
+            },
+            Ok(r) => {
+                tracing::warn!(status = %r.status(), %pdf_url, "arxiv: pdf fetch non-success");
+                return (None, None);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %pdf_url, "arxiv: pdf fetch network error");
+                return (None, None);
+            }
+        };
+
+        let key = format!("arxiv/{abs_id}.pdf");
+        let storage_uri = match self.object_store.put(&key, bytes.clone()).await {
+            Ok(uri) => Some(uri),
+            Err(e) => {
+                tracing::error!(error = %e, key, "arxiv: object_store.put failed");
+                None
+            }
+        };
+
+        let text = match extract_pdf_text(&bytes).await {
+            Ok(s) if s.trim().is_empty() => {
+                tracing::info!(abs_id, "arxiv: pdftotext returned empty (scanned PDF?)");
+                None
+            }
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, abs_id, "arxiv: pdftotext failed");
+                None
+            }
+        };
+
+        (storage_uri, text)
+    }
+}
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// Honour an HTTP `Retry-After` header: either an integer number of
+/// seconds or an RFC 7231 absolute date. Returns the wait duration, or
+/// `None` if the header is absent / unparseable.
+fn parse_retry_after(h: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+    let v = h?.to_str().ok()?.trim();
+    if let Ok(secs) = v.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    // Absolute date form. RFC 7231 says it's an HTTP-date; chrono parses
+    // it as RFC 2822.
+    let target = DateTime::parse_from_rfc2822(v).ok()?;
+    let now = Utc::now();
+    let diff = target.with_timezone(&Utc) - now;
+    diff.to_std().ok()
+}
+
+/// `http://arxiv.org/abs/2106.09685v2` → `2106.09685v2`
+fn parse_arxiv_abs_id(id: &str) -> Option<String> {
+    id.rsplit_once("/abs/").map(|(_, tail)| tail.to_string())
+}
+
+/// Best-effort first-category guess. arXiv's primary_category lives in
+/// the `arxiv:` namespace which our serde model doesn't cover; we'd
+/// need either custom XML walking or to read `<category>` and call the
+/// first one primary. For slice 2 we just leave this as a string-shaped
+/// hint inside metadata; consumers can read `metadata.categories[0]`.
+fn categories_first(_abs_id: &str, _id: &str) -> Option<String> {
+    None
+}
+
+fn parse_atom_feed(xml: &str) -> Result<Vec<AtomEntry>> {
+    let feed: AtomFeed = quick_xml::de::from_str(xml).map_err(|e| Error::Adapter {
+        name: ADAPTER_NAME.into(),
+        message: format!("xml parse: {e}"),
+    })?;
+    Ok(feed.entries)
+}
+
+async fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
+    // pdftotext - -  reads PDF bytes from stdin, writes UTF-8 to stdout.
+    // We pipe the bytes in on a background task while we collect output;
+    // this avoids buffering the whole PDF twice in memory.
+    let mut child = Command::new("pdftotext")
+        .arg("-q")           // quiet
+        .arg("-enc")         // explicit UTF-8
+        .arg("UTF-8")
+        .arg("-")            // stdin
+        .arg("-")            // stdout
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Adapter {
+            name: ADAPTER_NAME.into(),
+            message: "pdftotext: stdin not captured".into(),
+        })?;
+    let bytes_owned = bytes.to_vec();
+    let writer = tokio::spawn(async move {
+        let _ = stdin.write_all(&bytes_owned).await;
+        let _ = stdin.shutdown().await;
+    });
+
+    let output = child.wait_with_output().await?;
+    let _ = writer.await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::Adapter {
+            name: ADAPTER_NAME.into(),
+            message: format!("pdftotext failed: {stderr}"),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+// ─── tests ─────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Trimmed real-shaped arXiv response. Two entries, one with PDF
+    /// link, one with just metadata-shaped links.
+    const ATOM_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>arXiv Query Result</title>
+  <id>http://arxiv.org/api/query</id>
+  <entry>
+    <id>http://arxiv.org/abs/2106.09685v2</id>
+    <updated>2021-10-16T00:00:00Z</updated>
+    <published>2021-06-17T17:37:18Z</published>
+    <title>LoRA: Low-Rank Adaptation of Large Language Models</title>
+    <summary>An important paradigm of natural language processing
+consists of large-scale pre-training on general domain data and adaptation
+to particular tasks or domains. We propose Low-Rank Adaptation, or LoRA.</summary>
+    <author><name>Edward J. Hu</name></author>
+    <author><name>Yelong Shen</name></author>
+    <author><name>Phillip Wallis</name></author>
+    <link href="http://arxiv.org/abs/2106.09685v2" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2106.09685v2" rel="related" type="application/pdf"/>
+    <category term="cs.CL"/>
+    <category term="cs.AI"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2305.14314v1</id>
+    <updated>2023-05-23T00:00:00Z</updated>
+    <published>2023-05-23T17:50:33Z</published>
+    <title>QLoRA: Efficient Finetuning of Quantized LLMs</title>
+    <summary>We present QLoRA, an efficient finetuning approach.</summary>
+    <author><name>Tim Dettmers</name></author>
+    <link href="http://arxiv.org/abs/2305.14314v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2305.14314v1" rel="related" type="application/pdf"/>
+    <category term="cs.LG"/>
+  </entry>
+</feed>
+"#;
+
+    #[test]
+    fn parses_atom_feed_into_entries() {
+        let entries = parse_atom_feed(ATOM_FIXTURE).unwrap();
+        assert_eq!(entries.len(), 2);
+
+        let first = &entries[0];
+        assert_eq!(first.id, "http://arxiv.org/abs/2106.09685v2");
+        assert!(first.title.contains("LoRA"));
+        assert_eq!(first.authors.len(), 3);
+        assert_eq!(first.authors[0].name, "Edward J. Hu");
+        assert!(first.links.iter().any(|l| l.title == "pdf"));
+        assert_eq!(first.categories.len(), 2);
+        assert_eq!(first.categories[0].term, "cs.CL");
+    }
+
+    #[test]
+    fn extracts_canonical_id_from_atom_url() {
+        assert_eq!(
+            parse_arxiv_abs_id("http://arxiv.org/abs/2106.09685v2").as_deref(),
+            Some("2106.09685v2")
+        );
+        assert_eq!(parse_arxiv_abs_id("malformed").as_deref(), None);
+    }
+
+    #[test]
+    fn parses_published_timestamp() {
+        let dt = parse_rfc3339("2021-06-17T17:37:18Z").unwrap();
+        assert_eq!(dt.to_rfc3339(), "2021-06-17T17:37:18+00:00");
+    }
+}

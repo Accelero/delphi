@@ -31,7 +31,7 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "fs", "cors"] }
 
 # async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "fs"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -59,6 +59,20 @@ rig-core = { version = "0.35", features = ["all"] }
 # itself. Future: add `jsonwebtoken` here if we move to in-backend JWT
 # validation as a second `ClaimsExtractor` impl.)
 
+# Source-adapter HTTP fetch + content hashing. The default reqwest TLS stack
+# (native-tls) drags in OpenSSL; rustls keeps the build pure-Rust and matches
+# what surrealdb already pulls in.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# arXiv adapter speaks Atom XML, not JSON.
+quick-xml = { version = "0.36", features = ["serialize"] }
+
+# `Bytes` is in our `ObjectStore` API to avoid copies when piping PDFs
+# from `reqwest` through to disk.
+bytes = "1"
+
 # (added later when wired up)
 # rmcp = "0.2"
 # fastembed = "4"
@@ -76,6 +90,7 @@ dev-auth = []
 tower            = { version = "0.5", features = ["util"] }
 http-body-util   = "0.1"
 bytes            = "1"
+tempfile         = "3"
 # (surrealdb `kv-mem` engine is in [dependencies] above so prod builds also
 #  link the runtime polymorphic `Any` engine; tests hit the in-memory variant
 #  by URL alone.)

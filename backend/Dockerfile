@@ -23,6 +23,7 @@ RUN cargo build --release --bin delphi ${BACKEND_FEATURES:+--features ${BACKEND_
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/target/release/delphi /usr/local/bin/delphi
