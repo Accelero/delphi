@@ -41,6 +41,10 @@ pub struct TestApp {
     pub object_store: Arc<dyn ObjectStore>,
     pub default_tenant_id: RecordId,
     pub default_tenant_slug: String,
+    /// Shared with the Discovery SSE endpoint and `NotifyingSink`. Tests
+    /// can `subscribe()` to verify ingest fan-out without parsing the
+    /// SSE stream.
+    pub events: tokio::sync::broadcast::Sender<delphi::ingestion::NewDocumentEvent>,
 }
 
 impl TestApp {
@@ -83,11 +87,17 @@ impl TestApp {
 
         let trait_storage: Arc<dyn Storage> = storage.clone();
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
+        let (events_tx, _) = tokio::sync::broadcast::channel(64);
+        let pipeline: Arc<dyn delphi::ingestion::IngestSink> =
+            Arc::new(Pipeline::new(trait_storage.clone()));
+        let sink: Arc<dyn delphi::ingestion::IngestSink> =
+            Arc::new(delphi::ingestion::NotifyingSink::new(pipeline, events_tx.clone()));
         let state = AppState {
-            storage: trait_storage.clone(),
+            storage: trait_storage,
             llm: Arc::new(FakeLlmClient::default()),
-            sink: Arc::new(Pipeline::new(trait_storage)),
+            sink,
             object_store: object_store.clone(),
+            events: events_tx.clone(),
         };
 
         let router = api::build_router(state, None, &mode, identity_deps, extractor);
@@ -98,6 +108,7 @@ impl TestApp {
             object_store,
             default_tenant_id,
             default_tenant_slug,
+            events: events_tx,
         }
     }
 

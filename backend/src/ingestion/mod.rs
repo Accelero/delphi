@@ -16,7 +16,9 @@
 //! not a parallel pipeline.
 
 mod http;
+mod notifier;
 mod pipeline;
 
 pub use http::ingest_documents;
+pub use notifier::{NewDocumentEvent, NotifyingSink, DEFAULT_BROADCAST_CAPACITY};
 pub use pipeline::{IngestOutcome, IngestRequest, IngestSink, Pipeline};

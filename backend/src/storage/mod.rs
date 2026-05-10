@@ -6,7 +6,9 @@
 mod models;
 mod surreal;
 
-pub use models::{Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, Filters};
+pub use models::{
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
+};
 
 /// Concrete-Surreal escape hatch. The bin and integration tests both need
 /// the underlying `Surreal<Any>` for auth bootstrap upserts; tests also use
@@ -90,6 +92,31 @@ pub trait Storage: Send + Sync {
         &self,
         adapter: &str,
         cursor: &serde_json::Value,
+    ) -> Result<()>;
+
+    // ---- discovery feed ----------------------------------------------------
+
+    /// Cursor-paginated list of documents joined with the caller's read
+    /// state. Sorted newest-first by `(ingested_at, id)`.
+    async fn list_feed(
+        &self,
+        user_id: &surrealdb::RecordId,
+        cursor: Option<FeedCursor>,
+        limit: usize,
+    ) -> Result<Vec<FeedItem>>;
+
+    /// Idempotent. Marks `(user, doc)` as read; succeeds even if already marked.
+    async fn mark_read(
+        &self,
+        user_id: &surrealdb::RecordId,
+        doc_id: &DocId,
+    ) -> Result<()>;
+
+    /// Idempotent. Removes the read marker; succeeds even if not present.
+    async fn mark_unread(
+        &self,
+        user_id: &surrealdb::RecordId,
+        doc_id: &DocId,
     ) -> Result<()>;
 
     // ---- ops ---------------------------------------------------------------

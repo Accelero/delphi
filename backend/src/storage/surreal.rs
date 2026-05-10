@@ -11,7 +11,8 @@ use surrealdb::Surreal;
 
 use crate::error::{Error, Result};
 use crate::storage::{
-    Chunk, ChunkId, ChunkSearchResult, Content, Counts, DocId, Document, Filters, Storage,
+    Chunk, ChunkId, ChunkSearchResult, Content, Counts, DocId, Document, FeedCursor, FeedItem,
+    Filters, Storage,
 };
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
@@ -94,6 +95,148 @@ pub(crate) async fn surreal_from_env() -> Result<Arc<SurrealStorage>> {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
+}
+
+#[cfg(test)]
+mod feed_query_tests {
+    use super::*;
+    use crate::storage::{Document, FeedCursor};
+    use chrono::{Duration, Utc};
+    use surrealdb::RecordId;
+
+    async fn seed_user(s: &SurrealStorage) -> RecordId {
+        let mut r = s
+            .db
+            .query(
+                "CREATE app_user CONTENT { iss: 'test', sub: 'u1', email: 'u1@example.com' } RETURN id",
+            )
+            .await
+            .unwrap();
+        let row: Option<IdRow> = r.take(0).unwrap();
+        row.unwrap().id
+    }
+
+    fn doc(canonical_id: &str) -> Document {
+        Document {
+            id: None,
+            canonical_id: canonical_id.into(),
+            source_type: "test".into(),
+            source_uri: format!("https://test/{canonical_id}"),
+            storage_uri: None,
+            title: Some(format!("Title {canonical_id}")),
+            authors: vec!["A".into()],
+            published_at: None,
+            ingested_at: None,
+            language: None,
+            summary: None,
+            content_hash: format!("hash-{canonical_id}"),
+            version: 1,
+            metadata: serde_json::json!({}),
+        }
+    }
+
+    async fn fresh() -> SurrealStorage {
+        let s = SurrealStorage::in_memory("feed_query_test", "main").await.unwrap();
+        s.init_schema().await.unwrap();
+        s
+    }
+
+    #[tokio::test]
+    async fn list_feed_returns_empty_when_no_documents() {
+        let s = fresh().await;
+        let user = seed_user(&s).await;
+        let items = s.list_feed(&user, None, 50).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_feed_orders_newest_first_and_marks_read() {
+        let s = fresh().await;
+        let user = seed_user(&s).await;
+
+        // Insert three docs and override ingested_at to control ordering.
+        let mut ids = Vec::new();
+        for (i, c) in ["a", "b", "c"].iter().enumerate() {
+            let id = s.upsert_document(&doc(c)).await.unwrap();
+            // Backdate so we have predictable ordering: a oldest, c newest.
+            let ts = (Utc::now() - Duration::seconds(100 - i as i64 * 10)).to_rfc3339();
+            s.db
+                .query("UPDATE $rid SET ingested_at = <datetime>$ts")
+                .bind(("rid", id.clone()))
+                .bind(("ts", ts))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+            ids.push(id);
+        }
+
+        // Mark middle doc as read
+        s.mark_read(&user, &ids[1]).await.unwrap();
+
+        let items = s.list_feed(&user, None, 50).await.unwrap();
+        assert_eq!(items.len(), 3);
+        // Newest first → c, b, a
+        assert_eq!(items[0].document.canonical_id, "c");
+        assert_eq!(items[1].document.canonical_id, "b");
+        assert_eq!(items[2].document.canonical_id, "a");
+        assert!(!items[0].read, "c should be unread");
+        assert!(items[1].read, "b should be read");
+        assert!(!items[2].read, "a should be unread");
+    }
+
+    #[tokio::test]
+    async fn list_feed_paginates_with_cursor() {
+        let s = fresh().await;
+        let user = seed_user(&s).await;
+
+        for i in 0..5 {
+            let id = s.upsert_document(&doc(&format!("d{i}"))).await.unwrap();
+            let ts = (Utc::now() - Duration::seconds(100 - i * 10)).to_rfc3339();
+            s.db
+                .query("UPDATE $rid SET ingested_at = <datetime>$ts")
+                .bind(("rid", id))
+                .bind(("ts", ts))
+                .await
+                .unwrap()
+                .check()
+                .unwrap();
+        }
+
+        let page1 = s.list_feed(&user, None, 2).await.unwrap();
+        assert_eq!(page1.len(), 2);
+        let last = page1.last().unwrap();
+        let cursor = FeedCursor {
+            ingested_at: last.document.ingested_at.clone().unwrap(),
+            id: last.document.id.clone().unwrap(),
+        };
+        let page2 = s.list_feed(&user, Some(cursor), 2).await.unwrap();
+        assert_eq!(page2.len(), 2);
+
+        // No overlap: assert the ids in page2 are not in page1.
+        let p1: Vec<_> = page1.iter().filter_map(|i| i.document.id.clone()).collect();
+        for item in &page2 {
+            let id = item.document.id.clone().unwrap();
+            assert!(!p1.contains(&id), "page2 should not overlap page1");
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_read_is_idempotent_and_unread_removes() {
+        let s = fresh().await;
+        let user = seed_user(&s).await;
+        let id = s.upsert_document(&doc("x")).await.unwrap();
+
+        s.mark_read(&user, &id).await.unwrap();
+        s.mark_read(&user, &id).await.unwrap(); // should not error
+        let items = s.list_feed(&user, None, 50).await.unwrap();
+        assert!(items[0].read);
+
+        s.mark_unread(&user, &id).await.unwrap();
+        s.mark_unread(&user, &id).await.unwrap(); // should not error
+        let items = s.list_feed(&user, None, 50).await.unwrap();
+        assert!(!items[0].read);
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +613,101 @@ impl Storage for SurrealStorage {
                 .await?
                 .check()?;
         }
+        Ok(())
+    }
+
+    // ---- discovery feed ----------------------------------------------------
+
+    async fn list_feed(
+        &self,
+        user_id: &RecordId,
+        cursor: Option<FeedCursor>,
+        limit: usize,
+    ) -> Result<Vec<FeedItem>> {
+        // Two-query merge instead of an in-DB join. The alternative — a
+        // nested-SELECT subquery for the `read` flag — round-trips a row
+        // through serde via FeedItem<#[flatten] Document>, which the
+        // SurrealDB SDK refuses to deserialize when Document carries a
+        // `serde_json::Value` (flatten + untagged enum collide).
+        let where_cursor = if cursor.is_some() {
+            "WHERE ingested_at < $cursor_ts \
+               OR (ingested_at = $cursor_ts AND id < $cursor_id)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT * FROM document \
+             {where_cursor} \
+             ORDER BY ingested_at DESC, id DESC \
+             LIMIT $limit"
+        );
+        let mut q = self.db.query(sql).bind(("limit", limit as i64));
+        if let Some(c) = cursor {
+            q = q
+                .bind(("cursor_ts", c.ingested_at))
+                .bind(("cursor_id", c.id));
+        }
+        let mut response = q.await?;
+        let docs: Vec<Document> = response.take(0)?;
+
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let doc_ids: Vec<RecordId> =
+            docs.iter().filter_map(|d| d.id.clone()).collect();
+        let mut response = self
+            .db
+            .query(
+                "SELECT VALUE document FROM feed_read \
+                 WHERE user = $user AND document IN $doc_ids",
+            )
+            .bind(("user", user_id.clone()))
+            .bind(("doc_ids", doc_ids))
+            .await?;
+        let read_ids: Vec<RecordId> = response.take(0)?;
+        let read_set: std::collections::HashSet<RecordId> = read_ids.into_iter().collect();
+
+        Ok(docs
+            .into_iter()
+            .map(|d| {
+                let read = d.id.as_ref().is_some_and(|id| read_set.contains(id));
+                FeedItem { document: d, read }
+            })
+            .collect())
+    }
+
+    async fn mark_read(&self, user_id: &RecordId, doc_id: &DocId) -> Result<()> {
+        // Idempotent: lookup-then-create. The unique index on (user,
+        // document) is the safety net if a race slips through.
+        let mut response = self
+            .db
+            .query(
+                "SELECT id FROM feed_read \
+                 WHERE user = $user AND document = $doc LIMIT 1",
+            )
+            .bind(("user", user_id.clone()))
+            .bind(("doc", doc_id.clone()))
+            .await?;
+        let existing: Option<IdRow> = response.take(0)?;
+        if existing.is_some() {
+            return Ok(());
+        }
+        self.db
+            .query("CREATE feed_read CONTENT { user: $user, document: $doc }")
+            .bind(("user", user_id.clone()))
+            .bind(("doc", doc_id.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn mark_unread(&self, user_id: &RecordId, doc_id: &DocId) -> Result<()> {
+        self.db
+            .query("DELETE feed_read WHERE user = $user AND document = $doc")
+            .bind(("user", user_id.clone()))
+            .bind(("doc", doc_id.clone()))
+            .await?
+            .check()?;
         Ok(())
     }
 

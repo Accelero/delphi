@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::ingestion::IngestSink;
+use tokio::sync::broadcast;
+
+use crate::ingestion::{IngestSink, NewDocumentEvent};
 use crate::llm::LlmClient;
 use crate::object_store::ObjectStore;
 use crate::storage::Storage;
@@ -18,4 +20,8 @@ pub struct AppState {
     /// directly; HTTP handlers can dereference `Document.storage_uri`
     /// through it for "show original" features.
     pub object_store: Arc<dyn ObjectStore>,
+    /// Fan-out channel for "new document accepted" events. The Discovery
+    /// SSE handler subscribes per request; `NotifyingSink` (wrapping the
+    /// canonical `Pipeline`) publishes on the `Created` outcome.
+    pub events: broadcast::Sender<NewDocumentEvent>,
 }

@@ -45,9 +45,66 @@ export type Session = {
   dev: boolean;
 };
 
+/** Wire shape returned by `GET /api/discovery/feed`. Mirrors the Rust
+ *  `FeedItem` (Document fields plus `read`). `id` is a SurrealDB record
+ *  id stringified as `document:<key>`; `docKey()` strips the prefix for
+ *  paths that take just the key. */
+export type FeedDocument = {
+  id: string;
+  canonical_id: string;
+  source_type: string;
+  source_uri: string;
+  storage_uri?: string | null;
+  title?: string | null;
+  authors: string[];
+  published_at?: string | null;
+  ingested_at?: string | null;
+  language?: string | null;
+  summary?: string | null;
+  content_hash: string;
+  version: number;
+  metadata: Record<string, unknown>;
+  read: boolean;
+};
+
+export type FeedPage = {
+  items: FeedDocument[];
+  /** Opaque cursor for the next page. `null` ⇒ end of feed. */
+  next_cursor: string | null;
+};
+
+export type FeedSort = "recency";
+
+/** Strip the `document:` table prefix from a record-id string. The mark-
+ *  read endpoints take only the key portion in the path. */
+export function docKey(id: string): string {
+  return id.startsWith("document:") ? id.slice("document:".length) : id;
+}
+
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   session: () => request<Session>("/api/auth/me"),
+  discovery: {
+    feed: (params: {
+      sort?: FeedSort;
+      cursor?: string | null;
+      limit?: number;
+    }) => {
+      const q = new URLSearchParams();
+      if (params.sort) q.set("sort", params.sort);
+      if (params.cursor) q.set("cursor", params.cursor);
+      if (params.limit) q.set("limit", String(params.limit));
+      const qs = q.toString();
+      return request<FeedPage>(`/api/discovery/feed${qs ? `?${qs}` : ""}`);
+    },
+    markRead: (id: string) =>
+      request<void>(`/api/discovery/items/${docKey(id)}/read`, { method: "POST" }),
+    markUnread: (id: string) =>
+      request<void>(`/api/discovery/items/${docKey(id)}/read`, { method: "DELETE" }),
+    /** URL for the SSE `EventSource`. Plain string because EventSource
+     *  manages its own fetch, separate from `request()`. */
+    eventsUrl: "/api/discovery/feed/events",
+  },
 };
 
 /** URL the browser hard-navigates to for sign-out. Owned by oauth2-proxy

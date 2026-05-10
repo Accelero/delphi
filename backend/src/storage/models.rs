@@ -111,3 +111,22 @@ pub struct Filters {
     pub chunk_strategy: Option<String>,
     pub source_type: Option<String>,
 }
+
+/// One row in the discovery feed. A `Document` plus per-user read state.
+/// Built in storage by joining `document` with `feed_read`; not stored
+/// directly. Serialized as `{ ...document fields, "read": bool }` for
+/// the API.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedItem {
+    #[serde(flatten)]
+    pub document: Document,
+    pub read: bool,
+}
+
+/// Anchor for cursor-paginated feed reads. The API layer base64-encodes
+/// this for the wire; the storage layer takes it as a typed value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedCursor {
+    pub ingested_at: Datetime,
+    pub id: DocId,
+}

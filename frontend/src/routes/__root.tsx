@@ -69,7 +69,7 @@ function RootLayout() {
             DEV AUTH MODE — auto-signed in. Real auth is bypassed.
           </div>
         )}
-        <div className="flex-1 p-6 overflow-auto">
+        <div id="app-scroll" className="flex-1 p-6 overflow-auto">
           <Outlet />
         </div>
       </main>

@@ -65,6 +65,7 @@ rig-core = { version = "0.35", features = ["all"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 
 # arXiv adapter speaks Atom XML, not JSON.
 quick-xml = { version = "0.36", features = ["serialize"] }

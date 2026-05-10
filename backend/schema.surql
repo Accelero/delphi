@@ -146,6 +146,18 @@ DEFINE INDEX IF NOT EXISTS membership_user_tenant ON membership FIELDS user, ten
 DEFINE INDEX IF NOT EXISTS membership_user        ON membership FIELDS user;
 DEFINE INDEX IF NOT EXISTS membership_tenant      ON membership FIELDS tenant;
 
+-- ---------------------------------------------------------------------------
+-- feed_read
+-- Per-user, per-document read state. Existence == read; absence == unread.
+-- mark-read = idempotent upsert; mark-unread = delete the row.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS feed_read SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS user     ON feed_read TYPE record<app_user>;
+DEFINE FIELD IF NOT EXISTS document ON feed_read TYPE record<document>;
+DEFINE FIELD IF NOT EXISTS read_at  ON feed_read TYPE datetime DEFAULT time::now();
+DEFINE INDEX IF NOT EXISTS feed_read_user_doc ON feed_read FIELDS user, document UNIQUE;
+DEFINE INDEX IF NOT EXISTS feed_read_user     ON feed_read FIELDS user;
+
 -- ===========================================================================
 -- (Sessions table removed: the BFF — Traefik + oauth2-proxy — owns session
 -- storage in front of the backend. The backend is stateless w.r.t. user

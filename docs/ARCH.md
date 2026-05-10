@@ -158,9 +158,15 @@ authoritative schema lives in `backend/schema.surql`.
   (Semantic Scholar first). Adapters run on a scheduler inside the backend
   process; they hand documents to the ingestion pipeline.
 - **Ingestion pipeline.** Filter (semantic gate) → embed → persist → notify.
-  Each stage is independently testable.
+  Each stage is independently testable. The canonical `Pipeline` is wrapped
+  in middleware-style `IngestSink` decorators (e.g. `NotifyingSink` for
+  Discovery-feed fan-out) so cross-cutting concerns compose without
+  changing callers.
 - **API.** JSON HTTP for the SPA. Endpoints are organised by pillar:
-  `discovery/*`, `corpus/*`, `chat/*`, eventually `knowledge/*`.
+  `discovery/*`, `corpus/*`, `chat/*`, eventually `knowledge/*`. The
+  Discovery surface ships first — cursor-paginated feed, per-user read
+  state, and an SSE stream that pushes new accepted documents to clients.
+  Details: [`architecture/discovery-feed.md`](architecture/discovery-feed.md).
 
 Module boundaries follow the project rules in `.claude/CLAUDE.md`: each
 module exposes a public interface (`mod.rs`); cross-module access goes only
@@ -174,6 +180,11 @@ through that interface.
 - **Chat surface.** Reusable component used for both corpus-RAG chat and
   per-document analysis chat. Streaming responses with markdown and
   reasoning rendering.
+- **Discovery feed.** Reverse-chronological infinite scroll over the
+  user's corpus. Cursor pagination via TanStack Query's `useInfiniteQuery`,
+  live-prepend via SSE, native `overflow-anchor` for scroll preservation,
+  IntersectionObserver-driven "newness" fade, optimistic mark-read.
+  Details: [`architecture/discovery-feed.md`](architecture/discovery-feed.md).
 - **Theme.** Token-based theming so the same surface drops into different
   product areas.
 

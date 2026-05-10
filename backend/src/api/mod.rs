@@ -1,6 +1,7 @@
 //! HTTP server: routes, static-SPA fallback, axum boot.
 
 mod chat;
+mod discovery;
 mod health;
 mod stream;
 
@@ -18,7 +19,7 @@ use crate::auth::{
     self, AuthConfig, AuthMode, ClaimsExtractor, HeaderClaimsExtractor, IdentityDeps,
 };
 use crate::filter::{IngestFilter, NoopFilter};
-use crate::ingestion::{self, Pipeline};
+use crate::ingestion::{self, NotifyingSink, Pipeline, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
 use crate::object_store::{self, ObjectStore};
 use crate::sources;
@@ -75,7 +76,14 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     };
 
     let storage: Arc<dyn Storage> = surreal.clone();
-    let sink: Arc<dyn ingestion::IngestSink> = Arc::new(Pipeline::new(storage.clone()));
+    let (events_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
+    // Wrap the canonical Pipeline in NotifyingSink so every successful
+    // first-time ingest fans out to Discovery-feed SSE subscribers.
+    // Both ingest paths (HTTP + scheduler) share this exact sink, so
+    // there is no codepath that creates a document silently.
+    let pipeline: Arc<dyn ingestion::IngestSink> = Arc::new(Pipeline::new(storage.clone()));
+    let sink: Arc<dyn ingestion::IngestSink> =
+        Arc::new(NotifyingSink::new(pipeline, events_tx.clone()));
     let object_store: Arc<dyn ObjectStore> = object_store::from_url(
         &std::env::var("OBJECT_STORE_URL")
             .unwrap_or_else(|_| "file:///var/lib/delphi/originals".into()),
@@ -90,6 +98,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         llm,
         sink: sink.clone(),
         object_store: object_store.clone(),
+        events: events_tx,
     };
 
     // Source-adapter scheduler runs alongside the HTTP server. It shares
@@ -159,6 +168,12 @@ pub fn build_router(
         .route(
             "/api/ingestion/documents",
             post(ingestion::ingest_documents),
+        )
+        .route("/api/discovery/feed", get(discovery::feed))
+        .route("/api/discovery/feed/events", get(discovery::events))
+        .route(
+            "/api/discovery/items/{key}/read",
+            post(discovery::mark_read).delete(discovery::mark_unread),
         );
 
     // Routes that don't require an authenticated identity.
