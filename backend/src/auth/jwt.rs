@@ -1,27 +1,118 @@
-//! SurrealDB session-token minting.
+//! JWT plumbing — both directions.
 //!
-//! The backend mints a per-request JWT from an [`AuthContext`] and hands
-//! it to `db.authenticate(jwt)`. SurrealDB validates the signature
-//! against the matching `DEFINE ACCESS … TYPE RECORD WITH JWT` (see
-//! [`crate::storage::SystemDb::define_jwt_access`]), resolves
-//! `$auth = app_user`, exposes the JWT's other claims as `$token.*`,
-//! and applies the table `PERMISSIONS` clauses on every subsequent
-//! query.
+//! Two responsibilities, both about JWTs:
 //!
-//! Today: HS512 only. The same `SURREAL_JWT_SECRET` lives on the
-//! backend and in the `DEFINE ACCESS` clause SurrealDB validates with.
-//! When we want a real OIDC IdP's JWTs to be forwarded straight to
-//! SurrealDB (no re-signing — defence in depth), `JwtAccessKind::Jwks`
-//! is the corresponding access shape; the backend's minting helper
-//! stops being on the hot path for that flow.
+//! 1. **Inbound** — [`JwtClaimsExtractor`]. Reads
+//!    `Authorization: Bearer <jwt>` from incoming requests, decodes the
+//!    payload, and produces a [`Claims`] struct downstream code can
+//!    rely on. The signature is **not** validated by the backend; the
+//!    BFF (Traefik + oauth2-proxy + Keycloak's JWKS) already did that.
+//!    Defence-in-depth (backend re-validates) is a small drop-in via
+//!    `jsonwebtoken::decode`; not load-bearing today.
+//!
+//! 2. **Outbound** — [`SessionTokenSigner`]. Mints a SurrealDB-scoped
+//!    JWT from an [`AuthContext`] for `db.authenticate(jwt)` per
+//!    request. Validated by SurrealDB against the matching
+//!    `DEFINE ACCESS … TYPE RECORD WITH JWT` (see
+//!    [`crate::storage::SystemDb::define_jwt_access`]); engine-side
+//!    PERMISSIONS clauses then enforce tenant isolation per query.
+//!
+//! HS512 only today. The same secret lives on the backend and in the
+//! `DEFINE ACCESS` clause SurrealDB validates with.
 
+use async_trait::async_trait;
+use axum::http::{HeaderMap, HeaderName};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::Utc;
 use jsonwebtoken::{encode, EncodingKey, Header};
-use serde::Serialize;
-use surrealdb::RecordId;
+use serde::{Deserialize, Serialize};
 
+use super::claims::{Claims, ClaimsError, ClaimsExtractor};
 use super::context::AuthContext;
-use crate::error::{Error, Result};
+use crate::error::Error;
+
+// ─── inbound: JWT → Claims ────────────────────────────────────────────────
+
+const H_AUTHORIZATION: HeaderName = HeaderName::from_static("authorization");
+
+/// Reads `Authorization: Bearer <jwt>`, decodes the payload (no
+/// signature validation — BFF already did it), returns [`Claims`].
+///
+/// 401 on missing or malformed Authorization. The single source of
+/// identity for the production path.
+#[derive(Default, Clone)]
+pub struct JwtClaimsExtractor;
+
+impl JwtClaimsExtractor {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl ClaimsExtractor for JwtClaimsExtractor {
+    async fn extract(
+        &self,
+        headers: &HeaderMap,
+    ) -> std::result::Result<Claims, ClaimsError> {
+        let bearer = bearer_token(headers).ok_or(ClaimsError::Missing)?;
+        let payload = decode_jwt_payload(bearer)
+            .ok_or_else(|| ClaimsError::Invalid("malformed JWT in Authorization header".into()))?;
+
+        let sub = payload.sub.ok_or_else(|| {
+            ClaimsError::Invalid("JWT missing required `sub` claim".into())
+        })?;
+        let iss = payload.iss.ok_or_else(|| {
+            ClaimsError::Invalid("JWT missing required `iss` claim".into())
+        })?;
+        let email = payload.email.ok_or_else(|| {
+            ClaimsError::Invalid("JWT missing required `email` claim".into())
+        })?;
+
+        Ok(Claims {
+            sub,
+            iss,
+            email,
+            display_name: payload.preferred_username.or(payload.name),
+            tenant_slug: payload.tenant_id,
+            roles: payload.roles.unwrap_or_default(),
+        })
+    }
+}
+
+/// Subset of JWT claims the backend cares about. Anything else in the
+/// token is ignored.
+#[derive(Debug, Default, Deserialize)]
+struct InboundClaims {
+    sub: Option<String>,
+    iss: Option<String>,
+    email: Option<String>,
+    preferred_username: Option<String>,
+    name: Option<String>,
+    /// Custom claim emitted by the IdP (Keycloak: user-attribute mapper).
+    tenant_id: Option<String>,
+    /// Top-level realm-role array.
+    roles: Option<Vec<String>>,
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let v = headers.get(&H_AUTHORIZATION)?.to_str().ok()?;
+    v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))
+}
+
+/// Decode the payload segment of a JWT without verifying the signature.
+/// The BFF already verified against the IdP's JWKS — we just need the
+/// claims.
+fn decode_jwt_payload(jwt: &str) -> Option<InboundClaims> {
+    let mut parts = jwt.split('.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    serde_json::from_slice::<InboundClaims>(&bytes).ok()
+}
+
+// ─── outbound: AuthContext → SurrealDB JWT ────────────────────────────────
 
 /// Claims the backend embeds in the SurrealDB session token. Field
 /// names match what `PERMISSIONS` clauses reference (`$token.tenant_id`,
@@ -48,7 +139,6 @@ struct SessionClaims<'a> {
     exp: i64,
 }
 
-/// Configuration for the backend's session-token signer.
 #[derive(Debug, Clone)]
 pub struct SessionTokenSigner {
     secret: Vec<u8>,
@@ -59,7 +149,7 @@ pub struct SessionTokenSigner {
     /// access definition.
     access_method: String,
     /// Per-token lifetime, seconds. Should be ≥ the typical request
-    /// duration. Defaults are bound at construction time.
+    /// duration.
     ttl_secs: i64,
 }
 
@@ -90,16 +180,16 @@ impl SessionTokenSigner {
 
     /// Mint a session token for the given [`AuthContext`]. The
     /// returned string is the input to `db.authenticate(jwt)`.
-    pub fn sign(&self, auth: &AuthContext) -> Result<String> {
+    pub fn sign(&self, auth: &AuthContext) -> crate::error::Result<String> {
         let now = Utc::now().timestamp();
         let claims = SessionClaims {
-            id: record_id_to_string(&auth.user_id),
+            id: auth.user_id.to_string(),
             access: &self.access_method,
             namespace: &self.namespace,
             database: &self.database,
             iss: &auth.iss,
             sub: &auth.sub,
-            tenant_id: record_id_to_string(&auth.tenant_id),
+            tenant_id: auth.tenant_id.to_string(),
             roles: &auth.roles,
             iat: now,
             exp: now + self.ttl_secs,
@@ -110,28 +200,22 @@ impl SessionTokenSigner {
     }
 }
 
-/// `RecordId` Display is `table:key`; that's what SurrealDB wants in
-/// the `ID` claim and in `$token.tenant_id` references.
-fn record_id_to_string(id: &RecordId) -> String {
-    id.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use jsonwebtoken::{decode, DecodingKey, Validation};
-    use serde::Deserialize;
+    use serde_json::json;
+    use surrealdb::RecordId;
 
-    #[derive(Debug, Deserialize)]
-    struct DecodedClaims {
-        #[serde(rename = "ID")]
-        id: String,
-        #[serde(rename = "ac")]
-        access: String,
-        tenant_id: String,
-        roles: Vec<String>,
-        iss: String,
-        sub: String,
+    /// Construct an unsigned JWT (header.payload.empty-sig). The
+    /// extractor doesn't validate signatures, so this is enough for
+    /// tests of the inbound path.
+    fn craft_unsigned_jwt(payload: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
+        let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+        let sig = URL_SAFE_NO_PAD.encode(b"");
+        format!("{header}.{body}.{sig}")
     }
 
     fn ctx() -> AuthContext {
@@ -147,14 +231,92 @@ mod tests {
         }
     }
 
+    // ── inbound extractor ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn extracts_full_claims_from_bearer_jwt() {
+        let jwt = craft_unsigned_jwt(json!({
+            "sub":  "alice-uuid",
+            "iss":  "http://localhost:8088/realms/delphi",
+            "email": "alice@delphi.test",
+            "preferred_username": "alice",
+            "tenant_id": "tenant-a",
+            "roles": ["member", "owner"],
+        }));
+        let mut h = HeaderMap::new();
+        h.insert(
+            &H_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {jwt}")).unwrap(),
+        );
+
+        let claims = JwtClaimsExtractor::new().extract(&h).await.unwrap();
+        assert_eq!(claims.sub, "alice-uuid");
+        assert_eq!(claims.iss, "http://localhost:8088/realms/delphi");
+        assert_eq!(claims.email, "alice@delphi.test");
+        assert_eq!(claims.display_name.as_deref(), Some("alice"));
+        assert_eq!(claims.tenant_slug.as_deref(), Some("tenant-a"));
+        assert_eq!(claims.roles, vec!["member", "owner"]);
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_header_is_missing() {
+        let h = HeaderMap::new();
+        assert!(matches!(
+            JwtClaimsExtractor::new().extract(&h).await,
+            Err(ClaimsError::Missing)
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_bearer_is_invalid() {
+        let mut h = HeaderMap::new();
+        h.insert(&H_AUTHORIZATION, HeaderValue::from_static("Bearer not-a-jwt"));
+        assert!(matches!(
+            JwtClaimsExtractor::new().extract(&h).await,
+            Err(ClaimsError::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn jwt_missing_required_claim_is_invalid() {
+        // sub is required; this JWT has only iss and email.
+        let jwt = craft_unsigned_jwt(json!({
+            "iss":  "http://localhost:8088/realms/delphi",
+            "email": "alice@delphi.test",
+        }));
+        let mut h = HeaderMap::new();
+        h.insert(
+            &H_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {jwt}")).unwrap(),
+        );
+        assert!(matches!(
+            JwtClaimsExtractor::new().extract(&h).await,
+            Err(ClaimsError::Invalid(_))
+        ));
+    }
+
+    // ── outbound signer ───────────────────────────────────────────────────
+
+    #[derive(Debug, Deserialize)]
+    struct DecodedSessionClaims {
+        #[serde(rename = "ID")]
+        id: String,
+        #[serde(rename = "ac")]
+        access: String,
+        tenant_id: String,
+        roles: Vec<String>,
+        iss: String,
+        sub: String,
+    }
+
     #[test]
-    fn mint_and_decode_roundtrip() {
+    fn signer_mint_and_decode_roundtrip() {
         let signer = SessionTokenSigner::new(b"secret-for-test".to_vec(), "delphi", "main");
         let token = signer.sign(&ctx()).unwrap();
 
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS512);
         validation.validate_aud = false;
-        let decoded = decode::<DecodedClaims>(
+        let decoded = decode::<DecodedSessionClaims>(
             &token,
             &DecodingKey::from_secret(b"secret-for-test"),
             &validation,
@@ -170,13 +332,12 @@ mod tests {
     }
 
     #[test]
-    fn token_signature_rejects_wrong_secret() {
+    fn signer_rejects_wrong_secret() {
         let signer = SessionTokenSigner::new(b"right".to_vec(), "delphi", "main");
         let token = signer.sign(&ctx()).unwrap();
-
         let mut validation = Validation::new(jsonwebtoken::Algorithm::HS512);
         validation.validate_aud = false;
-        let bad = decode::<DecodedClaims>(
+        let bad = decode::<DecodedSessionClaims>(
             &token,
             &DecodingKey::from_secret(b"wrong"),
             &validation,

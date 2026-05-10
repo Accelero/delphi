@@ -8,8 +8,8 @@
 #
 # The frontend itself is served anonymously. The SPA's first call to
 # /api/auth/me trips the forward-auth gate; oauth2-proxy returns 401 →
-# Traefik 302s the browser to /oauth2/sign_in → Dex login → callback →
-# cookie set → SPA reload sees the user logged in.
+# Traefik 302s the browser to /oauth2/sign_in → Keycloak login →
+# callback → cookie set → SPA reload sees the user logged in.
 
 http:
   routers:
@@ -60,10 +60,9 @@ http:
       forwardAuth:
         address: "http://oauth2-proxy:4180/oauth2/auth"
         trustForwardHeader: true
+        # Single header: Authorization: Bearer <IdP-issued JWT>. The
+        # backend's `JwtClaimsExtractor` decodes the payload for all
+        # identity claims. See docs/architecture/multitenancy.md for
+        # the trust model.
         authResponseHeaders:
-          - X-Auth-User-Id
-          - X-Auth-Issuer
-          - X-Auth-Email
-          - X-Auth-Name
-          - X-Auth-Tenant-Id
-          - X-Auth-Roles
+          - Authorization

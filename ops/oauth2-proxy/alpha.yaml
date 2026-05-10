@@ -1,10 +1,10 @@
-# oauth2-proxy alpha-config (single source of truth).
+# oauth2-proxy alpha-config.
 #
-# v7.4+ when --alpha-config is provided, the alpha schema covers every
-# config block. We can't split with the legacy cfg anymore — alpha
-# claims ownership of all overlapping keys and rejects them in legacy.
-# So this file holds the full provider / upstream / server / header
-# configuration. Cookie / session / domain options pass via legacy cfg.
+# Forward only the IdP-issued access token to the upstream as
+# `Authorization: Bearer <jwt>`. The backend's `JwtClaimsExtractor`
+# decodes the payload to lift sub / iss / email / preferred_username
+# / tenant_id / roles into a typed `AuthContext`. There is no longer
+# any X-Auth-* projection — one trust boundary, one path.
 
 server:
   BindAddress: 0.0.0.0:4180
@@ -23,7 +23,7 @@ providers:
       skipDiscovery: true
       jwksURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
       emailClaim: email
-      userIDClaim: sub
+      userIDClaim: email
       audienceClaims: [aud]
       insecureSkipNonce: true
 
@@ -37,27 +37,11 @@ upstreamConfig:
       static: true
       staticCode: 202
 
-# Custom header names — what the backend's HeaderClaimsExtractor reads.
-injectRequestHeaders:
-  - name: X-Auth-User-Id
+# `claim: access_token` is a special name that gives us the raw
+# IdP-issued JWT — the backend's `JwtClaimsExtractor` decodes it for
+# all identity claims.
+injectResponseHeaders:
+  - name: Authorization
     values:
-      - claim: sub
-  - name: X-Auth-Issuer
-    values:
-      - claim: iss
-  - name: X-Auth-Email
-    values:
-      - claim: email
-  - name: X-Auth-Name
-    values:
-      - claim: preferred_username
-  # Tenant: Keycloak emits this from a user-attribute mapper (see
-  # ops/keycloak/realm-export.json).
-  - name: X-Auth-Tenant-Id
-    values:
-      - claim: tenant_id
-  # Roles: realm-role mapper produces a top-level `roles` array.
-  # oauth2-proxy joins arrays with commas; the backend splits.
-  - name: X-Auth-Roles
-    values:
-      - claim: roles
+      - claim: access_token
+        prefix: "Bearer "

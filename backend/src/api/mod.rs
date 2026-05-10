@@ -16,7 +16,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use crate::auth::{
-    self, AuthConfig, AuthMode, ClaimsExtractor, HeaderClaimsExtractor, IdentityDeps,
+    self, AuthConfig, AuthMode, ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
 use crate::config::system_db_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
@@ -141,9 +141,10 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         None
     };
 
-    // Today there's only one production extractor. When we add a second
-    // (e.g. JWT-in-backend), the choice happens here based on `auth_cfg`.
-    let extractor: Arc<dyn ClaimsExtractor> = Arc::new(HeaderClaimsExtractor::new());
+    // Today there's only one production extractor. When we want
+    // defence-in-depth (backend re-validates the JWT signature against
+    // the IdP's JWKS), the choice happens here based on `auth_cfg`.
+    let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new());
 
     let app = build_router(
         state,

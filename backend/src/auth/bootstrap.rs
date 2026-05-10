@@ -45,9 +45,21 @@ struct UserRow {
     display_name: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct TenantRow {
-    id: RecordId,
+/// `"tenant-a"` → `"Tenant A"`. Best-effort display name for an
+/// auto-provisioned tenant. Operators can edit in the admin surface
+/// once that ships.
+fn slug_to_display_name(slug: &str) -> String {
+    slug.split(&['-', '_'][..])
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut chars = p.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(c) => c.to_uppercase().chain(chars).collect(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn upsert_tenant(system: &SystemDb, slug: &str, name: &str) -> Result<RecordId> {
@@ -155,10 +167,16 @@ pub async fn resolve_default_tenant(system: &SystemDb, slug: &str) -> Result<Rec
 /// Per-request user upsert. Looks up `(iss, sub)`; creates the user +
 /// membership against the resolved tenant if missing.
 ///
-/// Tenant resolution: claim slug exists → use it; unknown non-default slug
-/// → fall back to default with a warning (we do not auto-create arbitrary
-/// tenants — self-serve org creation is an onboarding-flow concern, not
-/// something to derive from a claim).
+/// Tenant resolution: claim slug exists → use it; unknown slug →
+/// **upsert** (auto-create on first sight). The BFF is trusted to
+/// only emit tenant_ids the IdP admin has configured (e.g. as a
+/// Keycloak user attribute), so the set of slugs that ever reach
+/// here is bounded by IdP configuration. Auto-provisioning matches
+/// the SaaS shape: the IdP admin grants a user a tenant attribute
+/// and the tenant materialises in Delphi on first login.
+///
+/// `name` defaults to a title-cased slug; operators can rename in
+/// the admin surface later.
 pub async fn ensure_user(
     system: &SystemDb,
     claims: &Claims,
@@ -167,25 +185,7 @@ pub async fn ensure_user(
 ) -> Result<AuthContext> {
     let tenant_id = match claims.tenant_slug.as_deref() {
         Some(slug) if slug == default_tenant_slug => default_tenant_id.clone(),
-        Some(slug) => {
-            let mut r = system
-                .raw()
-                .query("SELECT id FROM tenant WHERE slug = $slug LIMIT 1")
-                .bind(("slug", slug.to_string()))
-                .await
-                .context("select tenant by claim slug")?;
-            let row: Option<TenantRow> = r.take(0).context("decode tenant-by-claim select")?;
-            match row {
-                Some(t) => t.id,
-                None => {
-                    tracing::warn!(
-                        tenant = slug,
-                        "tenant claim references unknown tenant; falling back to default"
-                    );
-                    default_tenant_id.clone()
-                }
-            }
-        }
+        Some(slug) => upsert_tenant(system, slug, &slug_to_display_name(slug)).await?,
         None => default_tenant_id.clone(),
     };
 

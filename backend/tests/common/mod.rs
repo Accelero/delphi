@@ -21,9 +21,13 @@ use serde::de::DeserializeOwned;
 use surrealdb::RecordId;
 use tower::ServiceExt;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use serde_json::json;
+
 use delphi::api;
 use delphi::auth::{
-    self, AuthMode, ClaimsExtractor, HeaderClaimsExtractor, HeaderConfig, IdentityDeps,
+    self, AuthMode, ClaimsExtractor, HeaderConfig, IdentityDeps, JwtClaimsExtractor,
 };
 use delphi::ingestion::Pipeline;
 use delphi::object_store::{MemObjectStore, ObjectStore};
@@ -79,7 +83,7 @@ impl TestApp {
             default_tenant_slug: default_tenant_slug.clone(),
         });
 
-        let extractor: Arc<dyn ClaimsExtractor> = Arc::new(HeaderClaimsExtractor::new());
+        let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new());
 
         let request_pool = Arc::new(RequestDbPool::from_system(&system));
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
@@ -146,16 +150,21 @@ impl TestResponse {
     }
 }
 
-/// Build a `Request` with the canonical `X-Auth-*` headers a real proxy
-/// would set. Defaults to a dev-shaped identity in the default tenant —
-/// mutate with `.tenant()` / `.roles()` before calling `.build()`.
+/// Build a `Request` with an `Authorization: Bearer <jwt>` header
+/// shaped like what the BFF produces. Defaults to a dev-shaped
+/// identity in the default tenant — mutate with `.tenant()` /
+/// `.roles()` before calling `.apply()`.
+///
+/// Tokens are unsigned (`alg: none`, empty signature). The backend's
+/// `JwtClaimsExtractor` doesn't validate signatures — that's the
+/// BFF's job in production — so unsigned is sufficient for tests.
 pub struct AuthRequestBuilder {
     sub: String,
     iss: String,
     email: String,
     name: Option<String>,
     tenant_slug: Option<String>,
-    roles: Option<String>,
+    roles: Vec<String>,
 }
 
 impl Default for AuthRequestBuilder {
@@ -166,7 +175,7 @@ impl Default for AuthRequestBuilder {
             email: "test@delphi.test".into(),
             name: Some("Test User".into()),
             tenant_slug: None,
-            roles: None,
+            roles: Vec::new(),
         }
     }
 }
@@ -176,8 +185,17 @@ impl AuthRequestBuilder {
         self.tenant_slug = Some(slug.into());
         self
     }
+    /// Comma-separated list of role names, matching the legacy
+    /// X-Auth-Roles wire format. Convenient for one-line role
+    /// declarations in test bodies.
     pub fn roles(mut self, csv: impl Into<String>) -> Self {
-        self.roles = Some(csv.into());
+        self.roles = csv
+            .into()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
         self
     }
     pub fn sub(mut self, s: impl Into<String>) -> Self {
@@ -193,40 +211,37 @@ impl AuthRequestBuilder {
         self
     }
 
-    /// Apply the configured headers to a `Request::builder()`. Returns a
-    /// builder you finalise with `.body(Body::empty())` / similar.
+    /// Mint a JWT carrying the configured claims and attach it to the
+    /// request as `Authorization: Bearer …`.
     pub fn apply<B>(self, mut req: Request<B>) -> Request<B> {
-        let h = req.headers_mut();
-        h.insert(
-            HeaderName::from_static("x-auth-user-id"),
-            HeaderValue::from_str(&self.sub).unwrap(),
-        );
-        h.insert(
-            HeaderName::from_static("x-auth-issuer"),
-            HeaderValue::from_str(&self.iss).unwrap(),
-        );
-        h.insert(
-            HeaderName::from_static("x-auth-email"),
-            HeaderValue::from_str(&self.email).unwrap(),
-        );
-        if let Some(n) = self.name {
-            h.insert(
-                HeaderName::from_static("x-auth-name"),
-                HeaderValue::from_str(&n).unwrap(),
-            );
+        let mut payload = json!({
+            "sub": self.sub,
+            "iss": self.iss,
+            "email": self.email,
+        });
+        if let Some(n) = &self.name {
+            payload["preferred_username"] = json!(n);
         }
-        if let Some(t) = self.tenant_slug {
-            h.insert(
-                HeaderName::from_static("x-auth-tenant-id"),
-                HeaderValue::from_str(&t).unwrap(),
-            );
+        if let Some(t) = &self.tenant_slug {
+            payload["tenant_id"] = json!(t);
         }
-        if let Some(r) = self.roles {
-            h.insert(
-                HeaderName::from_static("x-auth-roles"),
-                HeaderValue::from_str(&r).unwrap(),
-            );
+        if !self.roles.is_empty() {
+            payload["roles"] = json!(self.roles);
         }
+        let jwt = unsigned_jwt(&payload);
+        req.headers_mut().insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_str(&format!("Bearer {jwt}")).unwrap(),
+        );
         req
     }
+}
+
+/// `header.payload.signature` with `alg: none` and an empty signature
+/// — sufficient for the inbound extractor (which doesn't validate).
+fn unsigned_jwt(payload: &serde_json::Value) -> String {
+    let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
+    let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
+    let sig = URL_SAFE_NO_PAD.encode(b"");
+    format!("{header}.{body}.{sig}")
 }
