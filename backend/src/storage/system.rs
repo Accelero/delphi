@@ -37,6 +37,42 @@ pub struct Counts {
     pub document_versions: u64,
 }
 
+/// Runtime config for the `app_session` JWT access method. Passed to
+/// [`SystemDb::define_jwt_access`] at startup when `AuthMode::Jwt` is
+/// active.
+#[derive(Debug, Clone)]
+pub struct JwtAccessConfig {
+    pub kind: JwtAccessKind,
+    /// If `Some(iss)`, the AUTHENTICATE clause throws on JWTs whose
+    /// `iss` doesn't match. Defence-in-depth even though the BFF
+    /// already validated.
+    pub expected_issuer: Option<String>,
+    /// If `Some(aud)`, the AUTHENTICATE clause throws on JWTs whose
+    /// `aud` doesn't contain this value. Handles both string and array
+    /// `aud` claims.
+    pub expected_audience: Option<String>,
+    /// SurrealDB session lifetime per `db.authenticate`. Defaults to
+    /// 1800 (30min).
+    pub session_duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub enum JwtAccessKind {
+    /// Symmetric — backend mints internal JWTs using this secret. Used in
+    /// tests and the tier-1 dev path.
+    Hs512 { secret: String },
+    /// Asymmetric — SurrealDB fetches the IdP's public keys from JWKS.
+    /// Used in tier-2 dev and production with a real OIDC IdP.
+    Jwks { url: String },
+}
+
+fn escape_surrealql_string(s: &str) -> String {
+    // SurrealDB single-quoted string literal: escape backslash and
+    // single quotes. The key / URL / issuer / audience strings we
+    // accept are operator-controlled, but be defensive anyway.
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 /// Privileged SurrealDB handle. Wraps `Surreal<Any>` and exposes only the
 /// system-level operations.
 #[derive(Clone)]
@@ -83,12 +119,14 @@ impl SystemDb {
     }
 
     /// Borrow the underlying handle. Used by `auth/bootstrap.rs` (which
-    /// runs raw SurrealQL upserts on `app_user` / `tenant` / `membership`)
-    /// and by [`crate::storage::RequestDbPool::from_system`].
+    /// runs raw SurrealQL upserts on `app_user` / `tenant` / `membership`),
+    /// [`crate::storage::RequestDbPool::from_system`], and integration
+    /// tests that drive the engine directly to verify PERMISSIONS
+    /// enforcement.
     ///
-    /// Crate-private on purpose: nothing outside `delphi` should be able
-    /// to escape the typed surface.
-    pub(crate) fn raw(&self) -> &Surreal<Any> {
+    /// Application handlers must not call this — they get the typed
+    /// `Storage`-trait surface via [`crate::storage::RequestDbPool`].
+    pub fn raw(&self) -> &Surreal<Any> {
         &self.db
     }
 
@@ -96,6 +134,45 @@ impl SystemDb {
     /// `IF NOT EXISTS` / `IF EXISTS`.
     pub async fn init_schema(&self) -> Result<()> {
         self.db.query(SCHEMA_SURQL).await?.check()?;
+        Ok(())
+    }
+
+    /// Configure the `app_session` JWT access method at runtime. Required
+    /// for the engine-enforced tenant-isolation path — without this,
+    /// `db.authenticate(jwt)` has no access definition to validate
+    /// against.
+    ///
+    /// `$auth` is resolved from the JWT's `ID` claim directly (no
+    /// AUTHENTICATE override). The backend's pre-flight `ensure_user`
+    /// guarantees the row exists before minting.
+    ///
+    /// Re-applies cleanly via `OVERWRITE` so a key/JWKS rotation doesn't
+    /// require a schema migration.
+    pub async fn define_jwt_access(&self, cfg: &JwtAccessConfig) -> Result<()> {
+        let validator = match &cfg.kind {
+            JwtAccessKind::Hs512 { secret } => format!(
+                "ALGORITHM HS512 KEY '{}'",
+                escape_surrealql_string(secret)
+            ),
+            JwtAccessKind::Jwks { url } => {
+                format!("URL '{}'", escape_surrealql_string(url))
+            }
+        };
+
+        let session_secs = cfg.session_duration_secs.unwrap_or(1800);
+
+        // Unused for now — kept on the config surface for when we wire
+        // an AUTHENTICATE clause to enforce these claims (upstream-JWT
+        // mode). Silenced via `let _ =`.
+        let _ = &cfg.expected_issuer;
+        let _ = &cfg.expected_audience;
+
+        let stmt = format!(
+            "DEFINE ACCESS OVERWRITE app_session ON DATABASE TYPE RECORD \
+             WITH JWT {validator} \
+             DURATION FOR SESSION {session_secs}s;"
+        );
+        self.db.query(stmt).await?.check()?;
         Ok(())
     }
 

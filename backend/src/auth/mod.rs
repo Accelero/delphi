@@ -20,6 +20,7 @@ mod config;
 mod context;
 mod guard;
 mod headers;
+mod jwt;
 mod middleware;
 mod routes;
 
@@ -33,6 +34,7 @@ pub use config::{AuthConfig, AuthMode, HeaderConfig};
 pub use context::AuthContext;
 pub use guard::{enforce_production_guard, print_banner};
 pub use headers::HeaderClaimsExtractor;
+pub use jwt::SessionTokenSigner;
 pub use middleware::{identity_middleware, IdentityDeps};
 
 pub use bootstrap::{ensure_user, resolve_default_tenant};

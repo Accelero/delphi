@@ -67,6 +67,13 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 
+# JWT minting for the SurrealDB record-user session token. We hand the
+# token to `db.authenticate(jwt)`; SurrealDB validates against the same
+# secret/JWKS via `DEFINE ACCESS … TYPE RECORD WITH JWT`. HS512-mode
+# only today; RS256 is a feature-flag away when we want upstream-IdP
+# JWTs to flow straight through to the DB without re-signing.
+jsonwebtoken = { version = "9", default-features = false }
+
 # arXiv adapter speaks Atom XML, not JSON.
 quick-xml = { version = "0.36", features = ["serialize"] }
 

@@ -1161,6 +1161,7 @@ dependencies = [
  "futures",
  "hex",
  "http-body-util",
+ "jsonwebtoken",
  "quick-xml",
  "reqwest 0.12.28",
  "rig-core",
