@@ -36,12 +36,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use surrealdb::RecordId;
 
 use crate::error::Result;
 use crate::ingestion::IngestRequest;
 
 pub use registry::{default_registry, AdapterRegistry};
 pub use scheduler::{run_scheduler, SchedulerHandle};
+
+/// Placeholder tenant id adapters use when constructing an
+/// `IngestRequest`. The scheduler overwrites it before the request
+/// reaches the sink — adapters are tenant-agnostic.
+pub(crate) fn placeholder_tenant_id() -> RecordId {
+    RecordId::from(("tenant", "scheduler-placeholder"))
+}
 
 /// One adapter's output for a single fetch cycle.
 pub struct Fetched {

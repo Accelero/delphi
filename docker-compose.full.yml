@@ -108,10 +108,13 @@ services:
     environment:
       STORAGE_BACKEND: surreal
       SURREAL_URL: ws://surrealdb:8000/rpc
-      SURREAL_USER: root
-      SURREAL_PASS: root
+      # Service-account credentials. Production guard rejects 'root' / unset
+      # under RUST_ENV=production — operator must provide real values.
+      SURREAL_SERVICE_USER: ${SURREAL_SERVICE_USER:?required for tier-2 stack}
+      SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:?required for tier-2 stack}
       SURREAL_NS: delphi
       SURREAL_DB: main
+      SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-default}
       BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
       AUTH_MODE: header

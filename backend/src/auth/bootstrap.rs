@@ -13,16 +13,21 @@
 //! [`resolve_default_tenant`] is the bridge: both modes need the default
 //! tenant's `RecordId` resolved at startup so the request hot path doesn't
 //! re-resolve it on every call.
+//!
+//! All operations here run under the privileged [`SystemDb`] handle —
+//! they're upserting into `tenant` / `app_user` / `membership`, which
+//! are the auth-foundation tables. The per-request engine-enforced
+//! path can't touch them because the user record may not exist yet.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use surrealdb::engine::any::Any;
-use surrealdb::{RecordId, Surreal};
+use surrealdb::RecordId;
 
 use super::claims::Claims;
 use super::context::AuthContext;
 #[cfg(feature = "dev-auth")]
 use super::config::DevConfig;
+use crate::storage::SystemDb;
 
 #[derive(Debug, Deserialize)]
 struct IdRow {
@@ -45,7 +50,8 @@ struct TenantRow {
     id: RecordId,
 }
 
-async fn upsert_tenant(db: &Surreal<Any>, slug: &str, name: &str) -> Result<RecordId> {
+async fn upsert_tenant(system: &SystemDb, slug: &str, name: &str) -> Result<RecordId> {
+    let db = system.raw();
     let mut r = db
         .query("SELECT id FROM tenant WHERE slug = $slug LIMIT 1")
         .bind(("slug", slug.to_string()))
@@ -67,12 +73,13 @@ async fn upsert_tenant(db: &Surreal<Any>, slug: &str, name: &str) -> Result<Reco
 }
 
 async fn upsert_user(
-    db: &Surreal<Any>,
+    system: &SystemDb,
     iss: &str,
     sub: &str,
     email: &str,
     display_name: Option<&str>,
 ) -> Result<UserRow> {
+    let db = system.raw();
     let mut r = db
         .query(
             "SELECT id, iss, sub, email, display_name FROM app_user \
@@ -112,13 +119,14 @@ async fn upsert_user(
 }
 
 async fn upsert_membership(
-    db: &Surreal<Any>,
+    system: &SystemDb,
     user: &RecordId,
     tenant: &RecordId,
     role: &str,
 ) -> Result<()> {
+    let db = system.raw();
     let mut r = db
-        .query("SELECT id FROM membership WHERE user = $u AND tenant = $t LIMIT 1")
+        .query("SELECT id FROM membership WHERE user = $u AND tenant_id = $t LIMIT 1")
         .bind(("u", user.clone()))
         .bind(("t", tenant.clone()))
         .await
@@ -127,7 +135,7 @@ async fn upsert_membership(
     if existing.is_some() {
         return Ok(());
     }
-    db.query("CREATE membership CONTENT { user: $u, tenant: $t, role: $role }")
+    db.query("CREATE membership CONTENT { user: $u, tenant_id: $t, role: $role }")
         .bind(("u", user.clone()))
         .bind(("t", tenant.clone()))
         .bind(("role", role.to_string()))
@@ -140,8 +148,8 @@ async fn upsert_membership(
 
 /// Resolve the default tenant by slug, creating it if missing. Called once
 /// at startup so the per-request hot path can skip this query.
-pub async fn resolve_default_tenant(db: &Surreal<Any>, slug: &str) -> Result<RecordId> {
-    upsert_tenant(db, slug, "Default").await
+pub async fn resolve_default_tenant(system: &SystemDb, slug: &str) -> Result<RecordId> {
+    upsert_tenant(system, slug, "Default").await
 }
 
 /// Per-request user upsert. Looks up `(iss, sub)`; creates the user +
@@ -152,7 +160,7 @@ pub async fn resolve_default_tenant(db: &Surreal<Any>, slug: &str) -> Result<Rec
 /// tenants — self-serve org creation is an onboarding-flow concern, not
 /// something to derive from a claim).
 pub async fn ensure_user(
-    db: &Surreal<Any>,
+    system: &SystemDb,
     claims: &Claims,
     default_tenant_slug: &str,
     default_tenant_id: &RecordId,
@@ -160,7 +168,8 @@ pub async fn ensure_user(
     let tenant_id = match claims.tenant_slug.as_deref() {
         Some(slug) if slug == default_tenant_slug => default_tenant_id.clone(),
         Some(slug) => {
-            let mut r = db
+            let mut r = system
+                .raw()
                 .query("SELECT id FROM tenant WHERE slug = $slug LIMIT 1")
                 .bind(("slug", slug.to_string()))
                 .await
@@ -181,14 +190,14 @@ pub async fn ensure_user(
     };
 
     let user = upsert_user(
-        db,
+        system,
         &claims.iss,
         &claims.sub,
         &claims.email,
         claims.display_name.as_deref(),
     )
     .await?;
-    upsert_membership(db, &user.id, &tenant_id, "member").await?;
+    upsert_membership(system, &user.id, &tenant_id, "member").await?;
 
     Ok(AuthContext {
         user_id: user.id,
@@ -206,10 +215,16 @@ pub async fn ensure_user(
 /// per-request [`ensure_user`] (which assigns role=member to fresh users) is
 /// a no-op SELECT for the dev user. Returns the resolved tenant id.
 #[cfg(feature = "dev-auth")]
-pub async fn seed_dev_world(db: &Surreal<Any>, cfg: &DevConfig) -> Result<RecordId> {
-    let tenant_id = upsert_tenant(db, &cfg.tenant_slug, "Dev Tenant").await?;
-    let user = upsert_user(db, "dev://local", "dev-user", &cfg.user_email, Some(&cfg.user_name))
-        .await?;
-    upsert_membership(db, &user.id, &tenant_id, "owner").await?;
+pub async fn seed_dev_world(system: &SystemDb, cfg: &DevConfig) -> Result<RecordId> {
+    let tenant_id = upsert_tenant(system, &cfg.tenant_slug, "Dev Tenant").await?;
+    let user = upsert_user(
+        system,
+        "dev://local",
+        "dev-user",
+        &cfg.user_email,
+        Some(&cfg.user_name),
+    )
+    .await?;
+    upsert_membership(system, &user.id, &tenant_id, "owner").await?;
     Ok(tenant_id)
 }

@@ -1,80 +1,106 @@
-//! Storage backend trait. The single contract every implementation satisfies.
+//! Storage layer.
 //!
-//! Application code must depend only on this trait, not on a concrete
-//! implementation. The choice of backend is made in [`crate::config`].
+//! Two distinct entry points, on purpose:
+//!
+//! - [`SystemDb`] — privileged singleton signed in as the service user.
+//!   Used only by the composition root (`api::serve`), bootstrap (tenant
+//!   + user upserts), the scheduler, and the admin CLI. Holds the
+//!   "above-RBAC" credential. Not in [`crate::state::AppState`] — request
+//!   handlers physically cannot reach it.
+//!
+//! - [`RequestDbPool`] — what request handlers receive (via
+//!   [`crate::state::AppState`]). Phase 1: a thin wrapper around the
+//!   shared client that implements the [`Storage`] trait; tenant
+//!   isolation is application-layer (every method takes `tenant: &RecordId`
+//!   and the impl writes / filters by it). Phase 2: a pool of N
+//!   connections, each authenticated per-request via the IdP-issued JWT
+//!   so SurrealDB record-level rules enforce isolation engine-side.
+//!
+//! Application code depends only on the [`Storage`] trait — never on a
+//! concrete backend.
 
 mod models;
+mod request;
 mod surreal;
+mod system;
 
 pub use models::{
     Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
 };
-
-/// Concrete-Surreal escape hatch. The bin and integration tests both need
-/// the underlying `Surreal<Any>` for auth bootstrap upserts; tests also use
-/// [`SurrealStorage::in_memory`] to spin up a fresh DB per case. Other
-/// callers go through [`crate::config::storage_from_env`].
-pub use surreal::SurrealStorage;
-pub(crate) use surreal::surreal_from_env;
+pub use request::{AuthenticatedDb, RequestDbPool};
+pub use system::{Counts, SystemDb};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use surrealdb::RecordId;
 
 use crate::error::Result;
 
+/// Per-request storage operations. Every method takes `tenant: &RecordId`
+/// to make tenant scoping a structural property of the API surface
+/// (Phase 1: enforced in-handler; Phase 2: backed by engine-level
+/// PERMISSIONS clauses).
+///
+/// Schema apply, cross-tenant counts, and wipe live on [`SystemDb`] —
+/// not in this trait — because they run with elevated privilege and
+/// shouldn't be reachable from request handlers.
 #[async_trait]
 pub trait Storage: Send + Sync {
-    // ---- lifecycle ---------------------------------------------------------
-
-    async fn init_schema(&self) -> Result<()>;
-
     // ---- documents ---------------------------------------------------------
 
-    /// Insert or update a document by `canonical_id`. Returns the backend id.
-    async fn upsert_document(&self, doc: &Document) -> Result<DocId>;
+    /// Insert or update a document by `(tenant_id, canonical_id)`.
+    async fn upsert_document(&self, tenant: &RecordId, doc: &Document) -> Result<DocId>;
 
-    async fn get_document(&self, id: &DocId) -> Result<Option<Document>>;
+    async fn get_document(&self, tenant: &RecordId, id: &DocId) -> Result<Option<Document>>;
 
     async fn get_document_by_canonical(
         &self,
+        tenant: &RecordId,
         canonical_id: &str,
     ) -> Result<Option<Document>>;
 
     /// Cascade-deletes content, chunks, and version history.
-    async fn delete_document(&self, id: &DocId) -> Result<()>;
+    async fn delete_document(&self, tenant: &RecordId, id: &DocId) -> Result<()>;
 
     // ---- content -----------------------------------------------------------
 
-    async fn upsert_content(&self, doc_id: &DocId, content: &Content) -> Result<()>;
+    async fn upsert_content(
+        &self,
+        tenant: &RecordId,
+        doc_id: &DocId,
+        content: &Content,
+    ) -> Result<()>;
 
-    async fn get_content(&self, doc_id: &DocId) -> Result<Option<Content>>;
+    async fn get_content(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Option<Content>>;
 
     // ---- chunks ------------------------------------------------------------
 
     /// Bulk upsert. Returns chunk ids in input order.
     async fn upsert_chunks(
         &self,
+        tenant: &RecordId,
         doc_id: &DocId,
         chunks: &[Chunk],
     ) -> Result<Vec<ChunkId>>;
 
-    async fn list_chunks(&self, doc_id: &DocId) -> Result<Vec<Chunk>>;
+    async fn list_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Vec<Chunk>>;
 
-    async fn delete_chunks(&self, doc_id: &DocId) -> Result<()>;
+    async fn delete_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<()>;
 
     // ---- search ------------------------------------------------------------
 
-    /// KNN search over chunk embeddings.
+    /// KNN search over chunk embeddings, scoped to the caller's tenant.
     async fn search_vector(
         &self,
+        tenant: &RecordId,
         query: &[f32],
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>>;
 
-    /// Full-text BM25 search over chunk text.
+    /// Full-text BM25 search over chunk text, scoped to the caller's tenant.
     async fn search_keyword(
         &self,
+        tenant: &RecordId,
         query: &str,
         top_k: usize,
         filters: &Filters,
@@ -82,14 +108,16 @@ pub trait Storage: Send + Sync {
 
     // ---- source state ------------------------------------------------------
 
-    /// Read the persisted cursor for a source adapter. Cursor shape is
-    /// adapter-defined (opaque JSON object): the storage layer just round-
-    /// trips it, so each adapter can pick whatever payload makes sense
-    /// (e.g. `{ "since": "<ISO8601>" }`).
-    async fn get_source_cursor(&self, adapter: &str) -> Result<Option<serde_json::Value>>;
+    /// Read the persisted cursor for a (tenant, adapter) pair.
+    async fn get_source_cursor(
+        &self,
+        tenant: &RecordId,
+        adapter: &str,
+    ) -> Result<Option<serde_json::Value>>;
 
     async fn put_source_cursor(
         &self,
+        tenant: &RecordId,
         adapter: &str,
         cursor: &serde_json::Value,
     ) -> Result<()>;
@@ -97,10 +125,11 @@ pub trait Storage: Send + Sync {
     // ---- discovery feed ----------------------------------------------------
 
     /// Cursor-paginated list of documents joined with the caller's read
-    /// state. Sorted newest-first by `(ingested_at, id)`.
+    /// state. Sorted newest-first by `(ingested_at, id)`. Scoped to tenant.
     async fn list_feed(
         &self,
-        user_id: &surrealdb::RecordId,
+        tenant: &RecordId,
+        user_id: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
     ) -> Result<Vec<FeedItem>>;
@@ -108,29 +137,16 @@ pub trait Storage: Send + Sync {
     /// Idempotent. Marks `(user, doc)` as read; succeeds even if already marked.
     async fn mark_read(
         &self,
-        user_id: &surrealdb::RecordId,
+        tenant: &RecordId,
+        user_id: &RecordId,
         doc_id: &DocId,
     ) -> Result<()>;
 
     /// Idempotent. Removes the read marker; succeeds even if not present.
     async fn mark_unread(
         &self,
-        user_id: &surrealdb::RecordId,
+        tenant: &RecordId,
+        user_id: &RecordId,
         doc_id: &DocId,
     ) -> Result<()>;
-
-    // ---- ops ---------------------------------------------------------------
-
-    async fn counts(&self) -> Result<Counts>;
-
-    /// Delete all data; keep schema.
-    async fn wipe(&self) -> Result<()>;
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct Counts {
-    pub documents: u64,
-    pub document_content: u64,
-    pub chunks: u64,
-    pub document_versions: u64,
 }

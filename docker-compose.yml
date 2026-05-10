@@ -51,10 +51,15 @@ services:
     environment:
       STORAGE_BACKEND: surreal
       SURREAL_URL: ws://surrealdb:8000/rpc
-      SURREAL_USER: root
-      SURREAL_PASS: root
+      # Service-account credentials for the backend's privileged DB
+      # connection (boot, admin, scheduler). Production guard refuses to
+      # start with these defaults when RUST_ENV=production.
+      SURREAL_SERVICE_USER: ${SURREAL_SERVICE_USER:-root}
+      SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:-root}
       SURREAL_NS: delphi
       SURREAL_DB: main
+      # Tenant the scheduler-driven adapters write to (single-tenant v1).
+      SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-dev}
       BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
       # Auth — `dev` injects `X-Auth-*` headers internally; `header` requires

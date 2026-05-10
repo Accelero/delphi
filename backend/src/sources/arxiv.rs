@@ -61,7 +61,7 @@ use crate::error::{Error, Result};
 use crate::ingestion::IngestRequest;
 use crate::object_store::ObjectStore;
 
-use super::{Fetched, SourceAdapter};
+use super::{placeholder_tenant_id, Fetched, SourceAdapter};
 
 const ADAPTER_NAME: &str = "arxiv";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 21_600; // 6 h
@@ -335,6 +335,11 @@ impl ArxivAdapter {
         });
 
         Ok(IngestRequest {
+            // Tenant placeholder: scheduler is authoritative and always
+            // overwrites this before the request reaches the sink. The
+            // adapter is tenant-agnostic; v2 multi-tenant scheduler will
+            // construct one adapter instance per tenant.
+            tenant_id: placeholder_tenant_id(),
             canonical_id,
             source_type: ADAPTER_NAME.into(),
             source_uri,

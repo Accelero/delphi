@@ -6,13 +6,14 @@
 //! 1. Look up the configured [`ClaimsExtractor`] from request extensions.
 //! 2. Call `extract(&headers)` — fails fast with 401 on `Missing` / `Invalid`.
 //! 3. [`super::ensure_user`] does the SELECT-then-CREATE on `app_user` /
-//!    `membership`, resolving the tenant by slug.
+//!    `membership` against the privileged [`SystemDb`], resolving the
+//!    tenant by slug.
 //! 4. Stash the resulting [`AuthContext`] in request extensions for the
 //!    `AuthContext` extractor to pull out in handlers.
 //!
-//! This module is the only place that knows about both the extractor trait
-//! and the storage layer. Handlers stay clean: they just ask for an
-//! `AuthContext`.
+//! The privileged [`SystemDb`] handle is plumbed through [`IdentityDeps`]
+//! (an axum `Extension` attached at startup). Handlers do not see it —
+//! they only get the [`AuthContext`] this middleware produces.
 
 use std::sync::Arc;
 
@@ -21,18 +22,17 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use surrealdb::engine::any::Any;
-use surrealdb::{RecordId, Surreal};
+use surrealdb::RecordId;
 
 use super::bootstrap;
 use super::claims::{ClaimsError, ClaimsExtractor};
+use crate::storage::SystemDb;
 
 /// Bundle the per-request dependencies the middleware needs. Attached to the
-/// router as an `Extension` once at startup, then cloned cheaply per request
-/// (`Surreal<Any>` is itself an `Arc` internally).
+/// router as an `Extension` once at startup, then cloned cheaply per request.
 #[derive(Clone)]
 pub struct IdentityDeps {
-    pub db: Surreal<Any>,
+    pub system: Arc<SystemDb>,
     pub default_tenant_slug: String,
     pub default_tenant_id: RecordId,
 }
@@ -55,7 +55,7 @@ pub async fn identity_middleware(
     };
 
     let mut auth = match bootstrap::ensure_user(
-        &deps.db,
+        &deps.system,
         &claims,
         &deps.default_tenant_slug,
         &deps.default_tenant_id,

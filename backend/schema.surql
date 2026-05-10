@@ -1,11 +1,26 @@
 -- delphi storage schema (SurrealDB single-store)
 --
--- Applied by `delphi_storage init`.
--- Re-applying is safe: every statement uses IF NOT EXISTS.
+-- Applied automatically on every `delphi serve` startup (idempotent).
+-- Re-applying is safe: every statement uses IF NOT EXISTS / IF EXISTS.
 --
 -- Vector dimension is hardcoded to 384 (BAAI/bge-small-en-v1.5).
 -- Changing models with a different dim requires dropping and recreating
 -- the chunk_embedding index.
+--
+-- ===========================================================================
+-- Multi-tenancy
+--
+-- Every domain row carries a `tenant_id: record<tenant>` field with
+-- ASSERT $value != NONE. Phase 1 enforces tenancy at the application
+-- layer (every `Storage` method takes a tenant arg and writes / filters
+-- by it). Phase 2 turns on engine-level enforcement via PERMISSIONS
+-- clauses + DEFINE ACCESS RECORD WITH JWT — at which point a forgotten
+-- WHERE in any handler becomes impossible to leak.
+--
+-- This file has been re-shaped for tenancy. If applied to a pre-tenancy
+-- DB with existing rows, the NOT NULL ASSERT on the new tenant_id
+-- column will fail — pre-customer, expected, wipe and re-apply.
+-- ===========================================================================
 
 -- ---------------------------------------------------------------------------
 -- analyzer used by full-text indexes
@@ -14,106 +29,13 @@ DEFINE ANALYZER IF NOT EXISTS text_en
     TOKENIZERS blank, class
     FILTERS lowercase, snowball(english);
 
--- ---------------------------------------------------------------------------
--- document
--- One row per ingested artifact. Canonical record of identity and metadata.
--- ---------------------------------------------------------------------------
-DEFINE TABLE IF NOT EXISTS document SCHEMAFULL;
-
-DEFINE FIELD IF NOT EXISTS canonical_id ON document TYPE string;
-DEFINE FIELD IF NOT EXISTS source_type  ON document TYPE string;
-DEFINE FIELD IF NOT EXISTS source_uri   ON document TYPE string;
-DEFINE FIELD IF NOT EXISTS storage_uri  ON document TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS title        ON document TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS authors      ON document TYPE array<string> DEFAULT [];
-DEFINE FIELD IF NOT EXISTS published_at ON document TYPE option<datetime>;
-DEFINE FIELD IF NOT EXISTS ingested_at  ON document TYPE datetime DEFAULT time::now();
-DEFINE FIELD IF NOT EXISTS language     ON document TYPE option<string>;
--- Author/publisher-written short prose (paper abstract, book flap copy,
--- article deck). Distinct from `document_content.text`, which holds the
--- full body. Optional: not every source provides one.
-DEFINE FIELD IF NOT EXISTS summary      ON document TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS content_hash ON document TYPE string;
-DEFINE FIELD IF NOT EXISTS version      ON document TYPE int DEFAULT 1;
-DEFINE FIELD IF NOT EXISTS metadata     ON document FLEXIBLE TYPE object DEFAULT {};
-
-DEFINE INDEX IF NOT EXISTS document_canonical_id ON document FIELDS canonical_id UNIQUE;
-DEFINE INDEX IF NOT EXISTS document_source_type  ON document FIELDS source_type;
-DEFINE INDEX IF NOT EXISTS document_content_hash ON document FIELDS content_hash;
-
--- ---------------------------------------------------------------------------
--- document_content
--- Extracted text. Separated from `document` because it is large and changes
--- independently (re-extraction with a better parser).
--- ---------------------------------------------------------------------------
-DEFINE TABLE IF NOT EXISTS document_content SCHEMAFULL;
-
-DEFINE FIELD IF NOT EXISTS doc          ON document_content TYPE record<document>;
-DEFINE FIELD IF NOT EXISTS format       ON document_content TYPE string;
-DEFINE FIELD IF NOT EXISTS text         ON document_content TYPE string;
-DEFINE FIELD IF NOT EXISTS extractor    ON document_content TYPE string;
-DEFINE FIELD IF NOT EXISTS extracted_at ON document_content TYPE datetime DEFAULT time::now();
-
-DEFINE INDEX IF NOT EXISTS document_content_doc  ON document_content FIELDS doc UNIQUE;
-DEFINE INDEX IF NOT EXISTS document_content_text ON document_content FIELDS text SEARCH ANALYZER text_en BM25;
-
--- ---------------------------------------------------------------------------
--- chunk
--- Vector + text + payload in one record. Source of truth for retrieval.
--- ---------------------------------------------------------------------------
-DEFINE TABLE IF NOT EXISTS chunk SCHEMAFULL;
-
-DEFINE FIELD IF NOT EXISTS doc             ON chunk TYPE record<document>;
-DEFINE FIELD IF NOT EXISTS ordinal         ON chunk TYPE int;
-DEFINE FIELD IF NOT EXISTS char_start      ON chunk TYPE int;
-DEFINE FIELD IF NOT EXISTS char_end        ON chunk TYPE int;
-DEFINE FIELD IF NOT EXISTS page            ON chunk TYPE option<int>;
-DEFINE FIELD IF NOT EXISTS bbox            ON chunk FLEXIBLE TYPE option<object>;
-DEFINE FIELD IF NOT EXISTS text            ON chunk TYPE string;
-DEFINE FIELD IF NOT EXISTS embedding       ON chunk TYPE array<float>;
-DEFINE FIELD IF NOT EXISTS embedding_model ON chunk TYPE string;
-DEFINE FIELD IF NOT EXISTS chunk_strategy  ON chunk TYPE string;
-DEFINE FIELD IF NOT EXISTS created_at      ON chunk TYPE datetime DEFAULT time::now();
-
-DEFINE INDEX IF NOT EXISTS chunk_doc       ON chunk FIELDS doc;
-DEFINE INDEX IF NOT EXISTS chunk_unique    ON chunk FIELDS doc, ordinal, embedding_model, chunk_strategy UNIQUE;
-DEFINE INDEX IF NOT EXISTS chunk_text      ON chunk FIELDS text SEARCH ANALYZER text_en BM25;
-DEFINE INDEX IF NOT EXISTS chunk_embedding ON chunk FIELDS embedding HNSW DIMENSION 384 DIST COSINE TYPE F32 EFC 200 M 16;
-
--- ---------------------------------------------------------------------------
--- document_version (append-only history)
--- ---------------------------------------------------------------------------
-DEFINE TABLE IF NOT EXISTS document_version SCHEMAFULL;
-
-DEFINE FIELD IF NOT EXISTS doc            ON document_version TYPE record<document>;
-DEFINE FIELD IF NOT EXISTS version        ON document_version TYPE int;
-DEFINE FIELD IF NOT EXISTS content_hash   ON document_version TYPE string;
-DEFINE FIELD IF NOT EXISTS change_summary ON document_version TYPE option<string>;
-DEFINE FIELD IF NOT EXISTS recorded_at    ON document_version TYPE datetime DEFAULT time::now();
-
-DEFINE INDEX IF NOT EXISTS document_version_unique ON document_version FIELDS doc, version UNIQUE;
-
--- ---------------------------------------------------------------------------
--- source_state
--- Per-adapter incremental-fetch cursor. Opaque JSON object so each adapter
--- owns its own shape (e.g. `{ "since": "<ISO8601>" }`). Keyed by the
--- adapter's stable `name()`.
--- ---------------------------------------------------------------------------
-DEFINE TABLE IF NOT EXISTS source_state SCHEMAFULL;
-
-DEFINE FIELD IF NOT EXISTS adapter    ON source_state TYPE string;
-DEFINE FIELD IF NOT EXISTS cursor     ON source_state FLEXIBLE TYPE object DEFAULT {};
-DEFINE FIELD IF NOT EXISTS updated_at ON source_state TYPE datetime DEFAULT time::now();
-
-DEFINE INDEX IF NOT EXISTS source_state_adapter ON source_state FIELDS adapter UNIQUE;
-
 -- ===========================================================================
 -- AUTH / TENANCY
 --
 -- `app_user` (not `user`) avoids collision with Surreal's `DEFINE USER`.
 -- Identity is `(iss, sub)` from the OIDC token, NOT email — emails change.
 -- Membership is its own table (not a Surreal RELATE edge) so we can attach
--- role/billing fields cleanly.
+-- role/billing fields cleanly. Listed first so domain tables can FK to it.
 -- ===========================================================================
 DEFINE TABLE IF NOT EXISTS tenant SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS slug               ON tenant TYPE string
@@ -136,53 +58,183 @@ DEFINE FIELD IF NOT EXISTS last_seen_at ON app_user TYPE option<datetime>;
 DEFINE INDEX IF NOT EXISTS app_user_identity ON app_user FIELDS iss, sub UNIQUE;
 DEFINE INDEX IF NOT EXISTS app_user_email    ON app_user FIELDS email;
 
+-- membership: which tenant(s) does an app_user belong to.
+-- v1 enforces single-membership at the API; schema permits multi.
 DEFINE TABLE IF NOT EXISTS membership SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS user      ON membership TYPE record<app_user>;
-DEFINE FIELD IF NOT EXISTS tenant    ON membership TYPE record<tenant>;
+-- legacy `tenant` field (pre-tenancy schema) — drop on apply if present.
+REMOVE FIELD IF EXISTS tenant ON membership;
+DEFINE FIELD IF NOT EXISTS tenant_id ON membership TYPE record<tenant>;
 DEFINE FIELD IF NOT EXISTS role      ON membership TYPE string
     ASSERT $value INSIDE ['owner','admin','member','viewer'];
 DEFINE FIELD IF NOT EXISTS joined_at ON membership TYPE datetime DEFAULT time::now();
-DEFINE INDEX IF NOT EXISTS membership_user_tenant ON membership FIELDS user, tenant UNIQUE;
-DEFINE INDEX IF NOT EXISTS membership_user        ON membership FIELDS user;
-DEFINE INDEX IF NOT EXISTS membership_tenant      ON membership FIELDS tenant;
+-- legacy index names (pre-tenancy schema) — drop on apply if present.
+REMOVE INDEX IF EXISTS membership_user_tenant ON membership;
+REMOVE INDEX IF EXISTS membership_tenant ON membership;
+DEFINE INDEX IF NOT EXISTS membership_user_tenant_id ON membership FIELDS user, tenant_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS membership_user           ON membership FIELDS user;
+DEFINE INDEX IF NOT EXISTS membership_tenant_id      ON membership FIELDS tenant_id;
+
+-- ---------------------------------------------------------------------------
+-- document
+-- One row per ingested artefact. Canonical record of identity and metadata.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS document SCHEMAFULL;
+
+DEFINE FIELD IF NOT EXISTS tenant_id    ON document TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS canonical_id ON document TYPE string;
+DEFINE FIELD IF NOT EXISTS source_type  ON document TYPE string;
+DEFINE FIELD IF NOT EXISTS source_uri   ON document TYPE string;
+DEFINE FIELD IF NOT EXISTS storage_uri  ON document TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS title        ON document TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS authors      ON document TYPE array<string> DEFAULT [];
+DEFINE FIELD IF NOT EXISTS published_at ON document TYPE option<datetime>;
+DEFINE FIELD IF NOT EXISTS ingested_at  ON document TYPE datetime DEFAULT time::now();
+DEFINE FIELD IF NOT EXISTS language     ON document TYPE option<string>;
+-- Author/publisher-written short prose (paper abstract, book flap copy,
+-- article deck). Distinct from `document_content.text`, which holds the
+-- full body. Optional: not every source provides one.
+DEFINE FIELD IF NOT EXISTS summary      ON document TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS content_hash ON document TYPE string;
+DEFINE FIELD IF NOT EXISTS version      ON document TYPE int DEFAULT 1;
+DEFINE FIELD IF NOT EXISTS metadata     ON document FLEXIBLE TYPE object DEFAULT {};
+
+-- canonical_id is unique *per tenant*. Closes audit finding H1: pre-tenancy
+-- schema had a global UNIQUE which silently merged cross-tenant rows.
+REMOVE INDEX IF EXISTS document_canonical_id ON document;
+DEFINE INDEX IF NOT EXISTS document_tenant_canonical ON document FIELDS tenant_id, canonical_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS document_tenant_id        ON document FIELDS tenant_id;
+DEFINE INDEX IF NOT EXISTS document_source_type      ON document FIELDS source_type;
+DEFINE INDEX IF NOT EXISTS document_content_hash     ON document FIELDS content_hash;
+
+-- ---------------------------------------------------------------------------
+-- document_content
+-- Extracted text. Separated from `document` because it is large and changes
+-- independently (re-extraction with a better parser).
+-- tenant_id denormalized for query-speed and to make PERMISSIONS rules
+-- direct (no traversal through `doc`).
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS document_content SCHEMAFULL;
+
+DEFINE FIELD IF NOT EXISTS tenant_id    ON document_content TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS doc          ON document_content TYPE record<document>;
+DEFINE FIELD IF NOT EXISTS format       ON document_content TYPE string;
+DEFINE FIELD IF NOT EXISTS text         ON document_content TYPE string;
+DEFINE FIELD IF NOT EXISTS extractor    ON document_content TYPE string;
+DEFINE FIELD IF NOT EXISTS extracted_at ON document_content TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS document_content_doc       ON document_content FIELDS doc UNIQUE;
+DEFINE INDEX IF NOT EXISTS document_content_tenant_id ON document_content FIELDS tenant_id;
+DEFINE INDEX IF NOT EXISTS document_content_text      ON document_content FIELDS text SEARCH ANALYZER text_en BM25;
+
+-- ---------------------------------------------------------------------------
+-- chunk
+-- Vector + text + payload in one record. Source of truth for retrieval.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS chunk SCHEMAFULL;
+
+DEFINE FIELD IF NOT EXISTS tenant_id       ON chunk TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS doc             ON chunk TYPE record<document>;
+DEFINE FIELD IF NOT EXISTS ordinal         ON chunk TYPE int;
+DEFINE FIELD IF NOT EXISTS char_start      ON chunk TYPE int;
+DEFINE FIELD IF NOT EXISTS char_end        ON chunk TYPE int;
+DEFINE FIELD IF NOT EXISTS page            ON chunk TYPE option<int>;
+DEFINE FIELD IF NOT EXISTS bbox            ON chunk FLEXIBLE TYPE option<object>;
+DEFINE FIELD IF NOT EXISTS text            ON chunk TYPE string;
+DEFINE FIELD IF NOT EXISTS embedding       ON chunk TYPE array<float>;
+DEFINE FIELD IF NOT EXISTS embedding_model ON chunk TYPE string;
+DEFINE FIELD IF NOT EXISTS chunk_strategy  ON chunk TYPE string;
+DEFINE FIELD IF NOT EXISTS created_at      ON chunk TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS chunk_doc       ON chunk FIELDS doc;
+DEFINE INDEX IF NOT EXISTS chunk_tenant_id ON chunk FIELDS tenant_id;
+DEFINE INDEX IF NOT EXISTS chunk_unique    ON chunk FIELDS doc, ordinal, embedding_model, chunk_strategy UNIQUE;
+DEFINE INDEX IF NOT EXISTS chunk_text      ON chunk FIELDS text SEARCH ANALYZER text_en BM25;
+DEFINE INDEX IF NOT EXISTS chunk_embedding ON chunk FIELDS embedding HNSW DIMENSION 384 DIST COSINE TYPE F32 EFC 200 M 16;
+
+-- ---------------------------------------------------------------------------
+-- document_version (append-only history)
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS document_version SCHEMAFULL;
+
+DEFINE FIELD IF NOT EXISTS tenant_id      ON document_version TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS doc            ON document_version TYPE record<document>;
+DEFINE FIELD IF NOT EXISTS version        ON document_version TYPE int;
+DEFINE FIELD IF NOT EXISTS content_hash   ON document_version TYPE string;
+DEFINE FIELD IF NOT EXISTS change_summary ON document_version TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS recorded_at    ON document_version TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS document_version_unique    ON document_version FIELDS doc, version UNIQUE;
+DEFINE INDEX IF NOT EXISTS document_version_tenant_id ON document_version FIELDS tenant_id;
+
+-- ---------------------------------------------------------------------------
+-- source_state
+-- Per-adapter incremental-fetch cursor. Opaque JSON object so each adapter
+-- owns its own shape (e.g. `{ "since": "<ISO8601>" }`). Keyed by
+-- (tenant_id, adapter) so v2 can run per-tenant scheduler ingest.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS source_state SCHEMAFULL;
+
+DEFINE FIELD IF NOT EXISTS tenant_id  ON source_state TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS adapter    ON source_state TYPE string;
+DEFINE FIELD IF NOT EXISTS cursor     ON source_state FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS updated_at ON source_state TYPE datetime DEFAULT time::now();
+
+REMOVE INDEX IF EXISTS source_state_adapter ON source_state;
+DEFINE INDEX IF NOT EXISTS source_state_tenant_adapter ON source_state FIELDS tenant_id, adapter UNIQUE;
 
 -- ---------------------------------------------------------------------------
 -- feed_read
 -- Per-user, per-document read state. Existence == read; absence == unread.
 -- mark-read = idempotent upsert; mark-unread = delete the row.
+-- tenant_id denormalized so PERMISSIONS rules can be direct.
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS feed_read SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS user     ON feed_read TYPE record<app_user>;
-DEFINE FIELD IF NOT EXISTS document ON feed_read TYPE record<document>;
-DEFINE FIELD IF NOT EXISTS read_at  ON feed_read TYPE datetime DEFAULT time::now();
-DEFINE INDEX IF NOT EXISTS feed_read_user_doc ON feed_read FIELDS user, document UNIQUE;
-DEFINE INDEX IF NOT EXISTS feed_read_user     ON feed_read FIELDS user;
+DEFINE FIELD IF NOT EXISTS tenant_id ON feed_read TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS user      ON feed_read TYPE record<app_user>;
+DEFINE FIELD IF NOT EXISTS document  ON feed_read TYPE record<document>;
+DEFINE FIELD IF NOT EXISTS read_at   ON feed_read TYPE datetime DEFAULT time::now();
+DEFINE INDEX IF NOT EXISTS feed_read_user_doc  ON feed_read FIELDS user, document UNIQUE;
+DEFINE INDEX IF NOT EXISTS feed_read_user      ON feed_read FIELDS user;
+DEFINE INDEX IF NOT EXISTS feed_read_tenant_id ON feed_read FIELDS tenant_id;
 
 -- ===========================================================================
 -- (Sessions table removed: the BFF — Traefik + oauth2-proxy — owns session
 -- storage in front of the backend. The backend is stateless w.r.t. user
--- sessions; identity arrives on every request as `X-Auth-*` headers.)
+-- sessions; identity arrives on every request as the IdP-issued JWT.)
+-- ===========================================================================
 
 -- ===========================================================================
 -- CONVERSATIONS / MESSAGES
 --
--- Schema is defined here so the chat-history persistence change can land
--- cleanly without a separate migration. The chat handler does NOT write to
--- these tables yet — that's the next plan.
+-- Schema reserved for the chat-history persistence work. Currently unused
+-- by code (see audit finding H7); kept here so the eventual landing is
+-- migration-free.
 -- ===========================================================================
 DEFINE TABLE IF NOT EXISTS conversation SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS tenant     ON conversation TYPE record<tenant>;
+REMOVE FIELD IF EXISTS tenant ON conversation;
+DEFINE FIELD IF NOT EXISTS tenant_id  ON conversation TYPE record<tenant>
+    ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS user       ON conversation TYPE record<app_user>;
 DEFINE FIELD IF NOT EXISTS title      ON conversation TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON conversation TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS updated_at ON conversation TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS metadata   ON conversation FLEXIBLE TYPE object DEFAULT {};
-DEFINE INDEX IF NOT EXISTS conversation_tenant_user ON conversation FIELDS tenant, user;
+REMOVE INDEX IF EXISTS conversation_tenant_user ON conversation;
+DEFINE INDEX IF NOT EXISTS conversation_tenant_user ON conversation FIELDS tenant_id, user;
 DEFINE INDEX IF NOT EXISTS conversation_updated_at  ON conversation FIELDS updated_at;
 
 DEFINE TABLE IF NOT EXISTS message SCHEMAFULL;
+REMOVE FIELD IF EXISTS tenant ON message;
 DEFINE FIELD IF NOT EXISTS conversation   ON message TYPE record<conversation>;
-DEFINE FIELD IF NOT EXISTS tenant         ON message TYPE record<tenant>;  -- denormalized for tenant-scoped queries
+DEFINE FIELD IF NOT EXISTS tenant_id      ON message TYPE record<tenant>
+    ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS role           ON message TYPE string
     ASSERT $value INSIDE ['system','user','assistant','tool'];
 DEFINE FIELD IF NOT EXISTS content        ON message TYPE string;
@@ -191,4 +243,5 @@ DEFINE FIELD IF NOT EXISTS model          ON message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS finish_reason  ON message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at     ON message TYPE datetime DEFAULT time::now();
 DEFINE INDEX IF NOT EXISTS message_conversation   ON message FIELDS conversation;
-DEFINE INDEX IF NOT EXISTS message_tenant_created ON message FIELDS tenant, created_at;
+REMOVE INDEX IF EXISTS message_tenant_created ON message;
+DEFINE INDEX IF NOT EXISTS message_tenant_created ON message FIELDS tenant_id, created_at;

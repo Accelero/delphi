@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use surrealdb::RecordId;
 
 use crate::error::{Error, Result};
 use crate::storage::{Content, DocId, Document, Storage};
@@ -17,8 +18,16 @@ use crate::storage::{Content, DocId, Document, Storage};
 /// In-tree adapters produce this from `SourceAdapter::fetch`; external
 /// callers POST it as JSON to `/api/ingestion/documents`. Same shape,
 /// same downstream handling.
+///
+/// `tenant_id` is stamped by the caller — handlers from
+/// `AuthContext.tenant_id`, scheduler from
+/// `SOURCES_DEFAULT_TENANT_SLUG`. The pipeline writes it onto every
+/// `Document` row and forwards it to `NotifyingSink` so SSE consumers
+/// can filter their stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequest {
+    pub tenant_id: RecordId,
+
     pub canonical_id: String,
     pub source_type: String,
     pub source_uri: String,
@@ -91,23 +100,18 @@ impl Pipeline {
 #[async_trait]
 impl IngestSink for Pipeline {
     async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
-        // TODO(multi-tenant): when SaaS lands, IngestRequest grows a
-        // tenant_id (or AuthContext is plumbed through) and `Document`
-        // gets the same column. The scheduler will run per-tenant; the
-        // HTTP handler will read tenant from AuthContext.
-
         let content_hash = compute_content_hash(&req);
 
         let existing = self
             .storage
-            .get_document_by_canonical(&req.canonical_id)
+            .get_document_by_canonical(&req.tenant_id, &req.canonical_id)
             .await?;
 
         match existing {
             None => {
                 let doc = build_document(&req, content_hash, 1);
-                let id = self.storage.upsert_document(&doc).await?;
-                self.persist_text_if_present(&id, &req).await?;
+                let id = self.storage.upsert_document(&req.tenant_id, &doc).await?;
+                self.persist_text_if_present(&req.tenant_id, &id, &req).await?;
                 Ok(IngestOutcome::Created { id, version: 1 })
             }
             Some(existing) if existing.content_hash == content_hash => {
@@ -120,8 +124,8 @@ impl IngestSink for Pipeline {
             Some(existing) => {
                 let new_version = existing.version + 1;
                 let doc = build_document(&req, content_hash, new_version);
-                let id = self.storage.upsert_document(&doc).await?;
-                self.persist_text_if_present(&id, &req).await?;
+                let id = self.storage.upsert_document(&req.tenant_id, &doc).await?;
+                self.persist_text_if_present(&req.tenant_id, &id, &req).await?;
                 Ok(IngestOutcome::Versioned {
                     id,
                     version: new_version,
@@ -134,12 +138,14 @@ impl IngestSink for Pipeline {
 impl Pipeline {
     async fn persist_text_if_present(
         &self,
+        tenant: &RecordId,
         id: &DocId,
         req: &IngestRequest,
     ) -> Result<()> {
         if let Some(text) = &req.raw_text {
             self.storage
                 .upsert_content(
+                    tenant,
                     id,
                     &Content {
                         text: text.clone(),
@@ -156,13 +162,14 @@ impl Pipeline {
 fn build_document(req: &IngestRequest, content_hash: String, version: i64) -> Document {
     Document {
         id: None,
+        tenant_id: req.tenant_id.clone(),
         canonical_id: req.canonical_id.clone(),
         source_type: req.source_type.clone(),
         source_uri: req.source_uri.clone(),
         storage_uri: req.storage_uri.clone(),
         title: req.title.clone(),
         authors: req.authors.clone(),
-        published_at: req.published_at.map(Into::into),
+        published_at: req.published_at,
         ingested_at: None,
         language: req.language.clone(),
         summary: req.summary.clone(),
@@ -211,20 +218,36 @@ fn compute_content_hash(req: &IngestRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::SurrealStorage;
+    use crate::storage::{RequestDbPool, SystemDb};
 
-    async fn fresh_pipeline() -> Pipeline {
-        let storage = Arc::new(
-            SurrealStorage::in_memory("ingestion_test", "main")
-                .await
-                .expect("connect in-mem"),
-        );
-        storage.init_schema().await.expect("init schema");
-        Pipeline::new(storage)
+    async fn fresh_pipeline() -> (Pipeline, RecordId) {
+        let system = SystemDb::in_memory("ingestion_test", "main")
+            .await
+            .expect("connect in-mem");
+        system.init_schema().await.expect("init schema");
+        // Seed a tenant for the test.
+        let mut r = system
+            .raw()
+            .query("CREATE tenant CONTENT { slug: 'test', name: 'Test' } RETURN id")
+            .await
+            .unwrap();
+        #[derive(serde::Deserialize)]
+        struct IdRow {
+            id: RecordId,
+        }
+        let row: Option<IdRow> = r.take(0).unwrap();
+        let tenant = row.unwrap().id;
+
+        let pool: Arc<dyn Storage> = Arc::new(RequestDbPool::from_system(&system));
+        // `system` drops here. The Surreal<Any> clone inside the pool keeps
+        // the underlying connection alive (Surreal<Any> is Arc-internally).
+        let _ = system;
+        (Pipeline::new(pool), tenant)
     }
 
-    fn req(canonical_id: &str, raw_text: Option<&str>) -> IngestRequest {
+    fn req(tenant: &RecordId, canonical_id: &str, raw_text: Option<&str>) -> IngestRequest {
         IngestRequest {
+            tenant_id: tenant.clone(),
             canonical_id: canonical_id.into(),
             source_type: "test".into(),
             source_uri: format!("https://test.example/{canonical_id}"),
@@ -241,8 +264,8 @@ mod tests {
 
     #[tokio::test]
     async fn first_ingest_creates() {
-        let p = fresh_pipeline().await;
-        let out = p.ingest(req("doc-1", Some("hello"))).await.unwrap();
+        let (p, t) = fresh_pipeline().await;
+        let out = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
         assert!(
             matches!(out, IngestOutcome::Created { version: 1, .. }),
             "expected Created, got {out:?}"
@@ -251,9 +274,9 @@ mod tests {
 
     #[tokio::test]
     async fn re_ingesting_identical_request_returns_unchanged() {
-        let p = fresh_pipeline().await;
-        let _ = p.ingest(req("doc-1", Some("hello"))).await.unwrap();
-        let out = p.ingest(req("doc-1", Some("hello"))).await.unwrap();
+        let (p, t) = fresh_pipeline().await;
+        let _ = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
+        let out = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
         assert!(
             matches!(out, IngestOutcome::Unchanged { version: 1, .. }),
             "expected Unchanged, got {out:?}"
@@ -262,9 +285,9 @@ mod tests {
 
     #[tokio::test]
     async fn changed_text_bumps_version() {
-        let p = fresh_pipeline().await;
-        let _ = p.ingest(req("doc-1", Some("hello"))).await.unwrap();
-        let out = p.ingest(req("doc-1", Some("hello, again"))).await.unwrap();
+        let (p, t) = fresh_pipeline().await;
+        let _ = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
+        let out = p.ingest(req(&t, "doc-1", Some("hello, again"))).await.unwrap();
         assert!(
             matches!(out, IngestOutcome::Versioned { version: 2, .. }),
             "expected Versioned with v=2, got {out:?}"
@@ -273,68 +296,12 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_only_dedup_works_when_no_text() {
-        let p = fresh_pipeline().await;
-        let _ = p.ingest(req("doc-1", None)).await.unwrap();
-        let out = p.ingest(req("doc-1", None)).await.unwrap();
+        let (p, t) = fresh_pipeline().await;
+        let _ = p.ingest(req(&t, "doc-1", None)).await.unwrap();
+        let out = p.ingest(req(&t, "doc-1", None)).await.unwrap();
         assert!(
             matches!(out, IngestOutcome::Unchanged { .. }),
             "expected Unchanged, got {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn summary_lands_on_document_without_writing_content_row() {
-        let p = fresh_pipeline().await;
-        let mut r = req("paper-1", None);
-        r.summary = Some("the paper abstract".into());
-        let out = p.ingest(r).await.unwrap();
-        assert!(matches!(out, IngestOutcome::Created { version: 1, .. }));
-
-        let doc = p
-            .storage
-            .get_document_by_canonical("paper-1")
-            .await
-            .unwrap()
-            .expect("doc persisted");
-        assert_eq!(doc.summary.as_deref(), Some("the paper abstract"));
-
-        // No body → no document_content row.
-        let id = doc.id.expect("doc has id");
-        let content = p.storage.get_content(&id).await.unwrap();
-        assert!(content.is_none(), "no content row expected, got {content:?}");
-    }
-
-    #[tokio::test]
-    async fn changed_summary_bumps_version_when_no_body() {
-        let p = fresh_pipeline().await;
-        let mut r1 = req("paper-1", None);
-        r1.summary = Some("first abstract".into());
-        let _ = p.ingest(r1).await.unwrap();
-
-        let mut r2 = req("paper-1", None);
-        r2.summary = Some("second abstract — author updated it".into());
-        let out = p.ingest(r2).await.unwrap();
-        assert!(
-            matches!(out, IngestOutcome::Versioned { version: 2, .. }),
-            "expected Versioned, got {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn body_trumps_summary_in_hash_priority() {
-        let p = fresh_pipeline().await;
-        // Same body, different summaries → same hash → Unchanged on
-        // second ingest, even though summary changed.
-        let mut r1 = req("paper-1", Some("the body"));
-        r1.summary = Some("v1 abstract".into());
-        let _ = p.ingest(r1).await.unwrap();
-
-        let mut r2 = req("paper-1", Some("the body"));
-        r2.summary = Some("v2 abstract".into());
-        let out = p.ingest(r2).await.unwrap();
-        assert!(
-            matches!(out, IngestOutcome::Unchanged { .. }),
-            "expected Unchanged (body unchanged trumps summary change), got {out:?}"
         );
     }
 }

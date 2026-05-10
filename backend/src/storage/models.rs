@@ -1,5 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use surrealdb::{Datetime, RecordId};
+use surrealdb::RecordId;
 
 /// SurrealDB record id, e.g. `document:abc…`.
 pub type DocId = RecordId;
@@ -11,6 +12,12 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RecordId>,
 
+    /// Multi-tenancy: every domain row carries the tenant it belongs to.
+    /// Populated by the ingestion pipeline from `AuthContext.tenant_id`
+    /// (HTTP path) or from `SOURCES_DEFAULT_TENANT_SLUG` (scheduler).
+    /// `Storage::upsert_document` writes it; reads filter by it.
+    pub tenant_id: RecordId,
+
     pub canonical_id: String,
     pub source_type: String,
     pub source_uri: String,
@@ -21,15 +28,10 @@ pub struct Document {
     pub title: Option<String>,
     #[serde(default)]
     pub authors: Vec<String>,
-    /// SurrealDB-native datetime (vs. `chrono::DateTime`) so the SDK
-    /// serializer emits the protocol's datetime tag instead of an ISO
-    /// string — Surreal rejects raw strings for `TYPE datetime` fields.
-    /// Convert from `chrono::DateTime<Utc>` via `.into()` at the
-    /// ingestion boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub published_at: Option<Datetime>,
+    pub published_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ingested_at: Option<Datetime>,
+    pub ingested_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
@@ -125,8 +127,10 @@ pub struct FeedItem {
 
 /// Anchor for cursor-paginated feed reads. The API layer base64-encodes
 /// this for the wire; the storage layer takes it as a typed value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `chrono::DateTime<Utc>` at the public boundary; SurrealDB-native
+/// datetime conversion is hidden inside `SurrealStorage`.
+#[derive(Debug, Clone)]
 pub struct FeedCursor {
-    pub ingested_at: Datetime,
+    pub ingested_at: DateTime<Utc>,
     pub id: DocId,
 }

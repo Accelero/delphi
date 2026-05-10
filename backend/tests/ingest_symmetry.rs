@@ -12,11 +12,13 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
+use surrealdb::RecordId;
 
+use delphi::auth::resolve_default_tenant;
 use delphi::filter::{IngestFilter, NoopFilter};
 use delphi::ingestion::{IngestRequest, IngestSink, Pipeline};
 use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{Storage, SurrealStorage};
+use delphi::storage::{RequestDbPool, Storage, SystemDb};
 
 use crate::common::fake_source::FakeAdapter;
 use crate::common::{AuthRequestBuilder, TestApp};
@@ -30,6 +32,23 @@ fn payload(canonical_id: &str) -> serde_json::Value {
         "raw_text": "the same body for both paths",
         "metadata": { "x": 1 },
     })
+}
+
+fn build_request(tenant: &RecordId, canonical_id: &str) -> IngestRequest {
+    IngestRequest {
+        tenant_id: tenant.clone(),
+        canonical_id: canonical_id.into(),
+        source_type: "symmetry-test".into(),
+        source_uri: "https://symmetry.example/x".into(),
+        title: Some("Symmetry".into()),
+        authors: vec![],
+        published_at: None,
+        language: None,
+        summary: None,
+        raw_text: Some("the same body for both paths".into()),
+        storage_uri: None,
+        metadata: json!({ "x": 1 }),
+    }
 }
 
 #[tokio::test]
@@ -54,23 +73,28 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     assert_eq!(http_outcome["outcome"], "created");
     assert_eq!(http_outcome["version"], 1);
     let http_doc = app_http
-        .storage
-        .get_document_by_canonical("sym-1")
+        .db
+        .get_document_by_canonical(&app_http.default_tenant_id, "sym-1")
         .await
         .unwrap()
         .expect("HTTP path persisted doc");
 
-    // Path B: scheduler with the exact same `IngestRequest` in a fresh DB.
-    let storage_b = Arc::new(
-        SurrealStorage::in_memory("symmetry_test_b", "main")
+    // Path B: scheduler with the exact same `IngestRequest` shape in a
+    // fresh DB.
+    let system_b = Arc::new(
+        SystemDb::in_memory("symmetry_test_b", "main")
             .await
             .unwrap(),
     );
-    storage_b.init_schema().await.unwrap();
-    let trait_storage_b: Arc<dyn Storage> = storage_b.clone();
+    system_b.init_schema().await.unwrap();
+    let tenant_b = resolve_default_tenant(&system_b, "test")
+        .await
+        .expect("tenant");
+    let pool_b = Arc::new(RequestDbPool::from_system(&system_b));
+    let trait_storage_b: Arc<dyn Storage> = pool_b.clone();
     let sink_b: Arc<dyn IngestSink> = Arc::new(Pipeline::new(trait_storage_b.clone()));
 
-    let item: IngestRequest = serde_json::from_value(payload("sym-1")).unwrap();
+    let item = build_request(&tenant_b, "sym-1");
     let adapter = Arc::new(FakeAdapter::new(
         "symmetry",
         Duration::from_millis(50),
@@ -79,18 +103,25 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     let mut registry = AdapterRegistry::new();
     registry.register(adapter.clone());
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
-    let handle = run_scheduler(sink_b, filter, trait_storage_b.clone(), registry);
+    let handle = run_scheduler(
+        sink_b,
+        filter,
+        trait_storage_b.clone(),
+        tenant_b.clone(),
+        registry,
+    );
     tokio::time::sleep(Duration::from_millis(150)).await;
     handle.shutdown().await;
 
     let sched_doc = trait_storage_b
-        .get_document_by_canonical("sym-1")
+        .get_document_by_canonical(&tenant_b, "sym-1")
         .await
         .unwrap()
         .expect("scheduler path persisted doc");
 
     // Symmetry: both paths agree on every persisted field except for
-    // server-stamped `ingested_at` (different DBs, different wall-clock).
+    // server-stamped `ingested_at` (different DBs, different wall-clock)
+    // and `tenant_id` (different DBs have different tenant RecordIds).
     assert_eq!(http_doc.canonical_id, sched_doc.canonical_id);
     assert_eq!(http_doc.source_type, sched_doc.source_type);
     assert_eq!(http_doc.source_uri, sched_doc.source_uri);

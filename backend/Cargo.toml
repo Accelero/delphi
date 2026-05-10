@@ -28,7 +28,7 @@ surrealdb = { version = "2", default-features = false, features = [
 # http server
 axum = { version = "0.8", features = ["macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "fs", "cors"] }
+tower-http = { version = "0.6", features = ["trace", "fs"] }
 
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "fs"] }

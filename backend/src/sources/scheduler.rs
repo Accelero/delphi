@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use surrealdb::RecordId;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -30,11 +31,12 @@ impl SchedulerHandle {
 /// Spawn one task per adapter and return a handle for shutdown.
 ///
 /// Each task ticks on `adapter.poll_interval()`, calls
-/// `adapter.fetch(cursor)`, hands every returned `IngestRequest` to
-/// the filter, and on `Accept` funnels it through `sink.ingest`. The
-/// filter is the *only* thing on this path that the HTTP `POST
-/// /api/ingestion/documents` handler doesn't run — manual pushes
-/// bypass filtering by design.
+/// `adapter.fetch(cursor)`, hands every returned `IngestRequest` to the
+/// filter, and on `Accept` funnels it through `sink.ingest`. The
+/// scheduler stamps `tenant_id` on every `IngestRequest` before passing
+/// to filter / sink — adapters set the field to a placeholder; the
+/// scheduler is authoritative. v1 is single-tenant scheduler-wide; v2
+/// multi-tenant will spawn one scheduler per tenant.
 ///
 /// Errors at any stage are logged and the task continues — no DLQ in
 /// slice 2.
@@ -46,6 +48,7 @@ pub fn run_scheduler(
     sink: Arc<dyn IngestSink>,
     filter: Arc<dyn IngestFilter>,
     storage: Arc<dyn Storage>,
+    tenant_id: RecordId,
     registry: AdapterRegistry,
 ) -> SchedulerHandle {
     let shutdown = Arc::new(Notify::new());
@@ -54,9 +57,10 @@ pub fn run_scheduler(
         let sink = sink.clone();
         let filter = filter.clone();
         let storage = storage.clone();
+        let tenant_id = tenant_id.clone();
         let shutdown = shutdown.clone();
         handles.push(tokio::spawn(adapter_loop(
-            adapter, sink, filter, storage, shutdown,
+            adapter, sink, filter, storage, tenant_id, shutdown,
         )));
     }
     SchedulerHandle { shutdown, handles }
@@ -67,6 +71,7 @@ async fn adapter_loop(
     sink: Arc<dyn IngestSink>,
     filter: Arc<dyn IngestFilter>,
     storage: Arc<dyn Storage>,
+    tenant_id: RecordId,
     shutdown: Arc<Notify>,
 ) {
     let name = adapter.name().to_string();
@@ -85,6 +90,7 @@ async fn adapter_loop(
                     sink.as_ref(),
                     filter.as_ref(),
                     storage.as_ref(),
+                    &tenant_id,
                 )
                 .await
                 {
@@ -100,15 +106,19 @@ async fn run_once(
     sink: &dyn IngestSink,
     filter: &dyn IngestFilter,
     storage: &dyn Storage,
+    tenant_id: &RecordId,
 ) -> Result<()> {
-    let cursor = storage.get_source_cursor(adapter.name()).await?;
+    let cursor = storage.get_source_cursor(tenant_id, adapter.name()).await?;
     let fetched = adapter.fetch(cursor).await?;
 
     let total = fetched.items.len();
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
-    for item in fetched.items {
+    for mut item in fetched.items {
+        // Scheduler is authoritative for tenant — overwrite whatever the
+        // adapter set (adapters use a placeholder).
+        item.tenant_id = tenant_id.clone();
         match filter.evaluate(&item).await {
             Decision::Accept => {
                 accepted += 1;
@@ -134,7 +144,7 @@ async fn run_once(
     }
 
     if let Some(c) = fetched.next_cursor {
-        storage.put_source_cursor(adapter.name(), &c).await?;
+        storage.put_source_cursor(tenant_id, adapter.name(), &c).await?;
     }
     tracing::info!(
         adapter = adapter.name(),

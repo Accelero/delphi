@@ -10,18 +10,21 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
+use surrealdb::RecordId;
 use tokio::time::sleep;
 
+use delphi::auth::resolve_default_tenant;
 use delphi::filter::{Decision, IngestFilter, NoopFilter};
 use delphi::ingestion::{IngestRequest, IngestSink};
 use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{Storage, SurrealStorage};
+use delphi::storage::{RequestDbPool, Storage, SystemDb};
 
 use crate::common::fake_sink::CountingSink;
 use crate::common::fake_source::FakeAdapter;
 
 fn req(canonical_id: &str) -> IngestRequest {
     IngestRequest {
+        tenant_id: RecordId::from(("tenant", "scheduler-placeholder")),
         canonical_id: canonical_id.into(),
         source_type: "fake".into(),
         source_uri: format!("https://fake.example/{canonical_id}"),
@@ -47,33 +50,39 @@ impl IngestFilter for RejectAllFilter {
     }
 }
 
-async fn fresh_storage() -> Arc<dyn Storage> {
-    let storage = Arc::new(
-        SurrealStorage::in_memory("filter_test", "main")
+async fn fresh_storage() -> (Arc<dyn Storage>, RecordId) {
+    let system = Arc::new(
+        SystemDb::in_memory("filter_test", "main")
             .await
             .expect("connect"),
     );
-    storage.init_schema().await.expect("init schema");
-    storage
+    system.init_schema().await.expect("init schema");
+    let tenant = resolve_default_tenant(&system, "test").await.expect("tenant");
+    let pool: Arc<dyn Storage> = Arc::new(RequestDbPool::from_system(&system));
+    // Leak system handle into the pool's underlying connection (Arc-counted).
+    let _ = system;
+    (pool, tenant)
 }
 
 #[tokio::test]
 async fn noop_filter_lets_everything_through() {
-    let storage = fresh_storage().await;
+    let (storage, tenant) = fresh_storage().await;
     let counting = Arc::new(CountingSink::new());
     let sink: Arc<dyn IngestSink> = counting.clone();
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
 
-    let adapter = Arc::new(FakeAdapter::new(
-        "noop-test",
-        Duration::from_millis(50),
-        vec![vec![req("a"), req("b"), req("c")]],
-    )
-    .with_next_cursor(json!({ "x": 1 })));
+    let adapter = Arc::new(
+        FakeAdapter::new(
+            "noop-test",
+            Duration::from_millis(50),
+            vec![vec![req("a"), req("b"), req("c")]],
+        )
+        .with_next_cursor(json!({ "x": 1 })),
+    );
     let mut registry = AdapterRegistry::new();
     registry.register(adapter);
 
-    let handle = run_scheduler(sink, filter, storage, registry);
+    let handle = run_scheduler(sink, filter, storage, tenant, registry);
     sleep(Duration::from_millis(150)).await;
     handle.shutdown().await;
 
@@ -83,7 +92,7 @@ async fn noop_filter_lets_everything_through() {
 
 #[tokio::test]
 async fn reject_all_filter_blocks_every_item() {
-    let storage = fresh_storage().await;
+    let (storage, tenant) = fresh_storage().await;
     let counting = Arc::new(CountingSink::new());
     let sink: Arc<dyn IngestSink> = counting.clone();
     let filter: Arc<dyn IngestFilter> = Arc::new(RejectAllFilter);
@@ -96,7 +105,7 @@ async fn reject_all_filter_blocks_every_item() {
     let mut registry = AdapterRegistry::new();
     registry.register(adapter);
 
-    let handle = run_scheduler(sink, filter, storage, registry);
+    let handle = run_scheduler(sink, filter, storage, tenant, registry);
     sleep(Duration::from_millis(150)).await;
     handle.shutdown().await;
 

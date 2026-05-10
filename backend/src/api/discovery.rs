@@ -13,8 +13,14 @@
 //! `{key}` is the bare SurrealDB record key (everything after
 //! `document:`), so the URL path stays free of the table prefix and
 //! survives client-side URL handling.
+//!
+//! All handlers scope to `auth.tenant_id`. The SSE handler also filters
+//! the broadcast stream against the connecting user's tenant and
+//! force-closes after ~1h with jitter so reconnects pick up any
+//! tenant/role/revocation changes (browser EventSource auto-reconnects).
 
 use std::convert::Infallible;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -23,18 +29,25 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use surrealdb::{Datetime, RecordId};
+use surrealdb::RecordId;
 use tokio::sync::broadcast;
 
 use crate::auth::AuthContext;
 use crate::ingestion::NewDocumentEvent;
 use crate::state::AppState;
-use crate::storage::{FeedCursor, FeedItem};
+use crate::storage::{FeedCursor, FeedItem, Storage};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
+
+/// SSE connection lifetime: backend closes the stream after this and
+/// relies on EventSource's auto-reconnect to drive a fresh auth round.
+/// Plus jitter so a server restart doesn't trigger a herd reconnect.
+const SSE_LIFETIME: Duration = Duration::from_secs(3600);
+const SSE_JITTER: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Deserialize)]
 pub struct FeedQuery {
@@ -77,8 +90,6 @@ pub async fn feed(
     Query(q): Query<FeedQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-    // Only one sort algorithm today; the field is part of the wire so
-    // future sorts (`relevance`, `score`) drop in without an API change.
     let _sort = q.sort.as_deref().unwrap_or("recency");
     let cursor = match q.cursor.as_deref() {
         Some(s) => match decode_cursor(s) {
@@ -91,12 +102,15 @@ pub async fn feed(
         None => None,
     };
 
-    let items = match state.storage.list_feed(&auth.user_id, cursor, limit).await {
+    let items = match state
+        .db
+        .list_feed(&auth.tenant_id, &auth.user_id, cursor, limit)
+        .await
+    {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "feed query failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "feed query failed")
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, "feed query failed").into_response();
         }
     };
 
@@ -104,7 +118,7 @@ pub async fn feed(
         items.last().and_then(|item| {
             let ts = item.document.ingested_at.as_ref()?;
             let id = item.document.id.as_ref()?;
-            Some(encode_cursor(ts.clone(), id.clone()))
+            Some(encode_cursor(*ts, id.clone()))
         })
     } else {
         None
@@ -123,7 +137,11 @@ pub async fn mark_read(
     Path(key): Path<String>,
 ) -> Response {
     let doc_id = RecordId::from(("document", key.as_str()));
-    match state.storage.mark_read(&auth.user_id, &doc_id).await {
+    match state
+        .db
+        .mark_read(&auth.tenant_id, &auth.user_id, &doc_id)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "mark_read failed");
@@ -138,7 +156,11 @@ pub async fn mark_unread(
     Path(key): Path<String>,
 ) -> Response {
     let doc_id = RecordId::from(("document", key.as_str()));
-    match state.storage.mark_unread(&auth.user_id, &doc_id).await {
+    match state
+        .db
+        .mark_unread(&auth.tenant_id, &auth.user_id, &doc_id)
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             tracing::error!(error = %e, "mark_unread failed");
@@ -148,54 +170,77 @@ pub async fn mark_unread(
 }
 
 /// Subscribes to the new-document broadcast and emits one
-/// `event: new_document` SSE record per incoming event. Drops on
-/// `Lagged` (slow consumer); ends on `Closed` (channel torn down).
+/// `event: new_document` SSE record per incoming event whose tenant
+/// matches the caller's. Drops on `Lagged` (slow consumer); ends on
+/// `Closed`. Force-closes after `SSE_LIFETIME ± SSE_JITTER` so the
+/// browser auto-reconnects through fresh auth.
 ///
 /// `KeepAlive::default()` injects a comment line periodically so
 /// idle connections stay open through proxies.
 pub async fn events(
     State(state): State<AppState>,
-    _auth: AuthContext,
+    auth: AuthContext,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.events.subscribe();
-    Sse::new(broadcast_to_sse(rx)).keep_alive(KeepAlive::default())
+    let deadline = tokio::time::Instant::now() + sse_lifetime_with_jitter();
+    Sse::new(broadcast_to_sse(rx, auth.tenant_id, deadline)).keep_alive(KeepAlive::default())
+}
+
+fn sse_lifetime_with_jitter() -> Duration {
+    // Cheap "jitter": derive ± offset from a 64-bit nanosecond clock
+    // sample. Spreads reconnects across a 5-minute window after a
+    // restart without pulling in a full RNG dependency.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let offset_ms = now_ns % (SSE_JITTER.as_millis() as u64 * 2);
+    let signed_offset = offset_ms as i64 - SSE_JITTER.as_millis() as i64;
+    let base = SSE_LIFETIME.as_millis() as i64;
+    Duration::from_millis((base + signed_offset).max(60_000) as u64)
 }
 
 fn broadcast_to_sse(
     rx: broadcast::Receiver<NewDocumentEvent>,
+    tenant: RecordId,
+    deadline: tokio::time::Instant,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    futures::stream::unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    // `json_data` only fails if the value can't be
-                    // serialized — `NewDocumentEvent` derives Serialize
-                    // and contains no exotic types, so the unwrap is
-                    // sound. If it ever isn't, we'd rather see the panic
-                    // in tests than silently drop events.
-                    let sse = Event::default()
-                        .event("new_document")
-                        .json_data(&event)
-                        .expect("NewDocumentEvent must serialize");
-                    return Some((Ok(sse), rx));
+    futures::stream::unfold(
+        (rx, tenant, deadline),
+        |(mut rx, tenant, deadline)| async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => return None,
+                    recv = rx.recv() => match recv {
+                        Ok(event) if event.tenant_id == tenant => {
+                            // `json_data` only fails if the value can't be
+                            // serialized — `NewDocumentEvent` derives Serialize
+                            // and contains no exotic types, so the unwrap is
+                            // sound. If it ever isn't, we'd rather see the panic
+                            // in tests than silently drop events.
+                            let sse = Event::default()
+                                .event("new_document")
+                                .json_data(&event)
+                                .expect("NewDocumentEvent must serialize");
+                            return Some((Ok(sse), (rx, tenant, deadline)));
+                        }
+                        Ok(_) => continue, // event for a different tenant — drop
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(missed = n, "discovery SSE client lagged");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
                 }
-                // Slow client missed N events — skip the gap, keep going.
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!(missed = n, "discovery SSE client lagged");
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => return None,
             }
-        }
-    })
+        },
+    )
 }
 
-fn encode_cursor(ingested_at: Datetime, id: RecordId) -> String {
-    // surrealdb::Datetime's Display is not RFC3339; round-trip via the
-    // inner core type, which exposes Into<DateTime<Utc>>.
-    let chrono_dt: chrono::DateTime<chrono::Utc> = ingested_at.into_inner().into();
+fn encode_cursor(ingested_at: DateTime<Utc>, id: RecordId) -> String {
     let wire = CursorWire {
-        p: chrono_dt.to_rfc3339(),
+        p: ingested_at.to_rfc3339(),
         i: id.key().to_string(),
     };
     let json = serde_json::to_vec(&wire).expect("CursorWire serialize");
@@ -206,9 +251,9 @@ fn decode_cursor(s: &str) -> std::result::Result<FeedCursor, CursorError> {
     let bytes = URL_SAFE_NO_PAD.decode(s).map_err(|_| CursorError)?;
     let wire: CursorWire = serde_json::from_slice(&bytes).map_err(|_| CursorError)?;
     let parsed = chrono::DateTime::parse_from_rfc3339(&wire.p).map_err(|_| CursorError)?;
-    let utc = parsed.with_timezone(&chrono::Utc);
+    let utc = parsed.with_timezone(&Utc);
     Ok(FeedCursor {
-        ingested_at: Datetime::from(utc),
+        ingested_at: utc,
         id: RecordId::from(("document", wire.i.as_str())),
     })
 }
@@ -224,13 +269,11 @@ mod tests {
     #[test]
     fn cursor_roundtrip() {
         let id = RecordId::from(("document", "abc123"));
-        let now = chrono::Utc::now();
-        let ts = Datetime::from(now);
-        let encoded = encode_cursor(ts, id);
+        let now = Utc::now();
+        let encoded = encode_cursor(now, id);
         let decoded = decode_cursor(&encoded).expect("decode");
         assert_eq!(decoded.id.key().to_string(), "abc123");
-        let decoded_chrono: chrono::DateTime<chrono::Utc> = decoded.ingested_at.into_inner().into();
-        assert_eq!(decoded_chrono, now);
+        assert_eq!(decoded.ingested_at, now);
     }
 
     #[test]

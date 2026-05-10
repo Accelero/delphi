@@ -28,7 +28,7 @@ use delphi::auth::{
 use delphi::ingestion::Pipeline;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
-use delphi::storage::{Storage, SurrealStorage};
+use delphi::storage::{RequestDbPool, Storage, SystemDb};
 
 use crate::common::fake_llm::FakeLlmClient;
 
@@ -37,7 +37,8 @@ use crate::common::fake_llm::FakeLlmClient;
 /// inspection / seeding outside the HTTP path.
 pub struct TestApp {
     pub router: Router,
-    pub storage: Arc<SurrealStorage>,
+    pub system: Arc<SystemDb>,
+    pub db: Arc<RequestDbPool>,
     pub object_store: Arc<dyn ObjectStore>,
     pub default_tenant_id: RecordId,
     pub default_tenant_slug: String,
@@ -52,29 +53,24 @@ impl TestApp {
     /// created, header-mode auth, fake LLM. Each call is independent — no
     /// shared state between tests.
     pub async fn build() -> Self {
-        // Unique namespace per test process so parallel `cargo test` runs
-        // can't see each other (the in-memory engine is process-local
-        // anyway, but this keeps things explicit).
-        let storage = Arc::new(
-            SurrealStorage::in_memory("delphi_test", "main")
+        let system = Arc::new(
+            SystemDb::in_memory("delphi_test", "main")
                 .await
                 .expect("connect in-memory surreal"),
         );
 
-        // Same code path the real backend takes on startup: applies the
-        // canonical schema. `IF NOT EXISTS` everywhere — safe to re-run.
-        storage
+        system
             .init_schema()
             .await
             .expect("init schema in test db");
 
         let default_tenant_slug = "test".to_string();
-        let default_tenant_id = auth::resolve_default_tenant(storage.db(), &default_tenant_slug)
+        let default_tenant_id = auth::resolve_default_tenant(&system, &default_tenant_slug)
             .await
             .expect("resolve default tenant");
 
         let identity_deps = IdentityDeps {
-            db: storage.db().clone(),
+            system: system.clone(),
             default_tenant_slug: default_tenant_slug.clone(),
             default_tenant_id: default_tenant_id.clone(),
         };
@@ -85,15 +81,17 @@ impl TestApp {
 
         let extractor: Arc<dyn ClaimsExtractor> = Arc::new(HeaderClaimsExtractor::new());
 
-        let trait_storage: Arc<dyn Storage> = storage.clone();
+        let request_pool = Arc::new(RequestDbPool::from_system(&system));
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
+        let pipeline_storage: Arc<dyn Storage> = request_pool.clone();
         let pipeline: Arc<dyn delphi::ingestion::IngestSink> =
-            Arc::new(Pipeline::new(trait_storage.clone()));
-        let sink: Arc<dyn delphi::ingestion::IngestSink> =
-            Arc::new(delphi::ingestion::NotifyingSink::new(pipeline, events_tx.clone()));
+            Arc::new(Pipeline::new(pipeline_storage));
+        let sink: Arc<dyn delphi::ingestion::IngestSink> = Arc::new(
+            delphi::ingestion::NotifyingSink::new(pipeline, events_tx.clone()),
+        );
         let state = AppState {
-            storage: trait_storage,
+            db: request_pool.clone(),
             llm: Arc::new(FakeLlmClient::default()),
             sink,
             object_store: object_store.clone(),
@@ -104,7 +102,8 @@ impl TestApp {
 
         TestApp {
             router,
-            storage,
+            system,
+            db: request_pool,
             object_store,
             default_tenant_id,
             default_tenant_slug,

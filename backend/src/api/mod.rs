@@ -18,29 +18,28 @@ use tracing::info;
 use crate::auth::{
     self, AuthConfig, AuthMode, ClaimsExtractor, HeaderClaimsExtractor, IdentityDeps,
 };
+use crate::config::system_db_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
 use crate::ingestion::{self, NotifyingSink, Pipeline, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
 use crate::object_store::{self, ObjectStore};
 use crate::sources;
 use crate::state::AppState;
-use crate::storage::{surreal_from_env, Storage};
+use crate::storage::{RequestDbPool, Storage};
 
 pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let auth_cfg = AuthConfig::from_env().context("loading auth config")?;
     auth::enforce_production_guard(&auth_cfg.mode).context("auth guard")?;
     auth::print_banner(&auth_cfg.mode);
 
-    let surreal = surreal_from_env()
+    let system = system_db_from_env()
         .await
-        .context("constructing storage backend")?;
+        .context("constructing system DB handle")?;
 
-    // Apply schema on every startup. `schema.surql` is `IF NOT EXISTS`-only,
-    // so this is a no-op when the schema is current and a one-time setup
-    // when it isn't. The day we need a destructive migration this stops
-    // being safe and we'll graduate to numbered migrations + a
-    // `schema_version` table; not before.
-    surreal
+    // Apply schema on every startup. `schema.surql` is `IF NOT EXISTS`-only
+    // (with a few `REMOVE … IF EXISTS` for fields/indexes superseded by
+    // tenancy), so this is a no-op when the schema is current.
+    system
         .init_schema()
         .await
         .context("applying schema on startup")?;
@@ -52,13 +51,13 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     // here so the first request finds them already in place.
     let default_tenant_slug = auth_cfg.default_tenant_slug().to_string();
     let default_tenant_id =
-        auth::resolve_default_tenant(surreal.db(), &default_tenant_slug)
+        auth::resolve_default_tenant(&system, &default_tenant_slug)
             .await
             .context("resolving default tenant")?;
 
     #[cfg(feature = "dev-auth")]
     if let AuthMode::Dev(dev) = &auth_cfg.mode {
-        auth::seed_dev_world(surreal.db(), dev)
+        auth::seed_dev_world(&system, dev)
             .await
             .context("seeding dev tenant/user")?;
     }
@@ -70,31 +69,36 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     );
 
     let identity_deps = IdentityDeps {
-        db: surreal.db().clone(),
+        system: system.clone(),
         default_tenant_slug,
-        default_tenant_id,
+        default_tenant_id: default_tenant_id.clone(),
     };
 
-    let storage: Arc<dyn Storage> = surreal.clone();
+    let request_pool = Arc::new(RequestDbPool::from_system(&system));
+
     let (events_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
+
     // Wrap the canonical Pipeline in NotifyingSink so every successful
     // first-time ingest fans out to Discovery-feed SSE subscribers.
     // Both ingest paths (HTTP + scheduler) share this exact sink, so
     // there is no codepath that creates a document silently.
-    let pipeline: Arc<dyn ingestion::IngestSink> = Arc::new(Pipeline::new(storage.clone()));
+    let pipeline_storage: Arc<dyn Storage> = request_pool.clone();
+    let pipeline: Arc<dyn ingestion::IngestSink> = Arc::new(Pipeline::new(pipeline_storage));
     let sink: Arc<dyn ingestion::IngestSink> =
         Arc::new(NotifyingSink::new(pipeline, events_tx.clone()));
+
     let object_store: Arc<dyn ObjectStore> = object_store::from_url(
         &std::env::var("OBJECT_STORE_URL")
             .unwrap_or_else(|_| "file:///var/lib/delphi/originals".into()),
     )
     .context("constructing object store")?;
+
     // Slice 2 ships NoopFilter; the real semantic filter is a future
     // drop-in implementing the same `IngestFilter` trait.
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
 
     let state = AppState {
-        storage: storage.clone(),
+        db: request_pool.clone(),
         llm,
         sink: sink.clone(),
         object_store: object_store.clone(),
@@ -103,18 +107,34 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     // Source-adapter scheduler runs alongside the HTTP server. It shares
     // the same `IngestSink` the HTTP handler uses — internal and external
-    // ingestion paths converge on one method. The filter sits between
-    // adapter output and `sink.ingest`; HTTP pushes deliberately bypass
-    // it.
+    // ingestion paths converge on one method. Scheduler ingest is pinned
+    // to the tenant identified by `SOURCES_DEFAULT_TENANT_SLUG` (defaults
+    // to the auth default tenant).
     let sources_enabled = std::env::var("SOURCES_ENABLED").as_deref() == Ok("true");
     let scheduler = if sources_enabled {
+        let scheduler_tenant_slug = std::env::var("SOURCES_DEFAULT_TENANT_SLUG")
+            .unwrap_or_else(|_| auth_cfg.default_tenant_slug().to_string());
+        let scheduler_tenant_id = auth::resolve_default_tenant(&system, &scheduler_tenant_slug)
+            .await
+            .context("resolving scheduler tenant")?;
+
         let registry = sources::default_registry(object_store.clone());
         if registry.is_empty() {
             info!("SOURCES_ENABLED=true but no adapters configured; scheduler idle");
             None
         } else {
-            info!("starting source-adapter scheduler");
-            Some(sources::run_scheduler(sink, filter, storage, registry))
+            info!(
+                tenant = %scheduler_tenant_slug,
+                "starting source-adapter scheduler"
+            );
+            let scheduler_storage: Arc<dyn Storage> = request_pool.clone();
+            Some(sources::run_scheduler(
+                sink,
+                filter,
+                scheduler_storage,
+                scheduler_tenant_id,
+                registry,
+            ))
         }
     } else {
         info!("SOURCES_ENABLED is not 'true'; source-adapter scheduler disabled");

@@ -1,17 +1,15 @@
-//! Construct a [`Storage`] from environment variables.
+//! Construct backend services from environment variables.
 //!
-//! Centralizing this here means the rest of the codebase never imports a
-//! concrete backend; everything goes through [`storage_from_env`].
+//! Today the only thing here is the storage factory — kept centralized so
+//! the rest of the codebase never imports a concrete backend.
 
 use std::sync::Arc;
 
-use crate::error::{Error, Result};
-use crate::storage::{surreal_from_env, Storage};
+use crate::error::Result;
+use crate::storage::SystemDb;
 
-pub async fn storage_from_env() -> Result<Arc<dyn Storage>> {
-    let backend = std::env::var("STORAGE_BACKEND").unwrap_or_else(|_| "surreal".into());
-    match backend.as_str() {
-        "surreal" => Ok(surreal_from_env().await?),
-        other => Err(Error::UnknownBackend(other.into())),
-    }
+/// Construct the privileged [`SystemDb`] from environment. Used by the
+/// bin (`api::serve`) and the admin CLI.
+pub async fn system_db_from_env() -> Result<Arc<SystemDb>> {
+    Ok(Arc::new(SystemDb::from_env().await?))
 }
