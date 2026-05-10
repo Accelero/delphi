@@ -7,10 +7,11 @@
 //!   on every request. The backend reads those headers via
 //!   [`super::HeaderClaimsExtractor`] — no token validation here.
 //! - [`AuthMode::Dev`]: local-dev convenience. A small middleware (gated by
-//!   the `dev-auth` cargo feature) synthesises the same `X-Auth-*` headers
-//!   so the production identity middleware runs unchanged. **Only compiled
-//!   in when `dev-auth` is on** — release builds literally don't contain
-//!   the bypass code.
+//!   the `dev-auth` cargo feature) mints a dev JWT and writes it as
+//!   `Authorization: Bearer <jwt>` — the same shape the production IdP
+//!   would emit, so the downstream identity middleware runs unchanged.
+//!   **Only compiled in when `dev-auth` is on** — release builds literally
+//!   don't contain the bypass code.
 
 use anyhow::{bail, Result};
 

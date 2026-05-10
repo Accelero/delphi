@@ -218,7 +218,7 @@ fn compute_content_hash(req: &IngestRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{RequestDbPool, SystemDb};
+    use crate::storage::SystemDb;
 
     async fn fresh_pipeline() -> (Pipeline, RecordId) {
         let system = SystemDb::in_memory("ingestion_test", "main")
@@ -238,11 +238,10 @@ mod tests {
         let row: Option<IdRow> = r.take(0).unwrap();
         let tenant = row.unwrap().id;
 
-        let pool: Arc<dyn Storage> = Arc::new(RequestDbPool::from_system(&system));
-        // `system` drops here. The Surreal<Any> clone inside the pool keeps
-        // the underlying connection alive (Surreal<Any> is Arc-internally).
-        let _ = system;
-        (Pipeline::new(pool), tenant)
+        // Pipeline doesn't care about RBAC; SystemStorage is the privileged
+        // path the scheduler uses in production, and that's what we test.
+        let storage: Arc<dyn Storage> = system.storage();
+        (Pipeline::new(storage), tenant)
     }
 
     fn req(tenant: &RecordId, canonical_id: &str, raw_text: Option<&str>) -> IngestRequest {

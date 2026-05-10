@@ -21,9 +21,9 @@ use serde::de::DeserializeOwned;
 use surrealdb::RecordId;
 use tower::ServiceExt;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use serde_json::json;
+
+use jsonwebtoken::{encode, EncodingKey, Header};
 
 use delphi::api;
 use delphi::auth::{
@@ -32,7 +32,13 @@ use delphi::auth::{
 use delphi::ingestion::Pipeline;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
-use delphi::storage::{RequestDbPool, Storage, SystemDb};
+use delphi::storage::{
+    JwtAccessConfig, JwtAccessKind, RequestDbPool, Storage, SystemDb,
+};
+
+/// HS512 secret shared between the test JWT signer and SurrealDB's
+/// `app_session` access method. Test-only — not used in production builds.
+pub const TEST_JWT_SECRET: &str = "delphi-integration-test-hs512-secret-do-not-use-elsewhere";
 
 use crate::common::fake_llm::FakeLlmClient;
 
@@ -42,7 +48,6 @@ use crate::common::fake_llm::FakeLlmClient;
 pub struct TestApp {
     pub router: Router,
     pub system: Arc<SystemDb>,
-    pub db: Arc<RequestDbPool>,
     pub object_store: Arc<dyn ObjectStore>,
     pub default_tenant_id: RecordId,
     pub default_tenant_slug: String,
@@ -54,8 +59,10 @@ pub struct TestApp {
 
 impl TestApp {
     /// Build a fresh app: in-memory SurrealDB, schema applied, default tenant
-    /// created, header-mode auth, fake LLM. Each call is independent — no
-    /// shared state between tests.
+    /// created, JWT-mode auth, fake LLM, HS512 access method registered with
+    /// the test secret so `AuthRequestBuilder`'s signed JWTs authenticate
+    /// against the engine. Each call is independent — no shared state
+    /// between tests.
     pub async fn build() -> Self {
         let system = Arc::new(
             SystemDb::in_memory("delphi_test", "main")
@@ -68,13 +75,36 @@ impl TestApp {
             .await
             .expect("init schema in test db");
 
+        // Register the `app_session` RECORD access method against the same
+        // HS512 secret `AuthRequestBuilder` signs with. SurrealDB validates
+        // every per-request `db.authenticate(jwt)` against this.
+        system
+            .define_jwt_access(&JwtAccessConfig {
+                kind: JwtAccessKind::Hs512 {
+                    secret: TEST_JWT_SECRET.into(),
+                },
+                expected_issuer: None,
+                expected_audience: None,
+                session_duration_secs: Some(60),
+            })
+            .await
+            .expect("define jwt access in test db");
+
         let default_tenant_slug = "test".to_string();
         let default_tenant_id = auth::resolve_default_tenant(&system, &default_tenant_slug)
             .await
             .expect("resolve default tenant");
 
+        // RequestDbPool clones the system handle — slots share the same
+        // in-memory engine state. See `RequestDbPool::in_memory` for the
+        // shared-session caveat (fine for non-parallel tests).
+        let request_pool = RequestDbPool::in_memory(system.raw(), 4)
+            .await
+            .expect("init test request pool");
+
         let identity_deps = IdentityDeps {
             system: system.clone(),
+            pool: request_pool.clone(),
             default_tenant_slug: default_tenant_slug.clone(),
             default_tenant_id: default_tenant_id.clone(),
         };
@@ -85,17 +115,17 @@ impl TestApp {
 
         let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new());
 
-        let request_pool = Arc::new(RequestDbPool::from_system(&system));
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
-        let pipeline_storage: Arc<dyn Storage> = request_pool.clone();
+        // Scheduler / shared sink writes through the privileged
+        // SystemStorage — same as the production wiring.
+        let pipeline_storage: Arc<dyn Storage> = system.storage();
         let pipeline: Arc<dyn delphi::ingestion::IngestSink> =
             Arc::new(Pipeline::new(pipeline_storage));
         let sink: Arc<dyn delphi::ingestion::IngestSink> = Arc::new(
             delphi::ingestion::NotifyingSink::new(pipeline, events_tx.clone()),
         );
         let state = AppState {
-            db: request_pool.clone(),
             llm: Arc::new(FakeLlmClient::default()),
             sink,
             object_store: object_store.clone(),
@@ -107,7 +137,6 @@ impl TestApp {
         TestApp {
             router,
             system,
-            db: request_pool,
             object_store,
             default_tenant_id,
             default_tenant_slug,
@@ -212,12 +241,24 @@ impl AuthRequestBuilder {
     }
 
     /// Mint a JWT carrying the configured claims and attach it to the
-    /// request as `Authorization: Bearer …`.
+    /// request as `Authorization: Bearer …`. Signed HS512 with
+    /// [`TEST_JWT_SECRET`] so SurrealDB's `app_session` AUTHENTICATE
+    /// clause (defined in [`TestApp::build`]) accepts it for the
+    /// per-request `db.authenticate(jwt)` step.
     pub fn apply<B>(self, mut req: Request<B>) -> Request<B> {
         let mut payload = json!({
             "sub": self.sub,
             "iss": self.iss,
             "email": self.email,
+            // `ac` tells SurrealDB which DEFINE ACCESS method to validate
+            // against. Production IdPs won't carry this; SurrealDB falls
+            // back to "try all defined access methods" when absent. Tests
+            // set it explicitly so the engine doesn't probe.
+            "ac": "app_session",
+            "ns": "delphi_test",
+            "db": "main",
+            "iat": chrono::Utc::now().timestamp(),
+            "exp": chrono::Utc::now().timestamp() + 60,
         });
         if let Some(n) = &self.name {
             payload["preferred_username"] = json!(n);
@@ -228,20 +269,16 @@ impl AuthRequestBuilder {
         if !self.roles.is_empty() {
             payload["roles"] = json!(self.roles);
         }
-        let jwt = unsigned_jwt(&payload);
+        let jwt = encode(
+            &Header::new(jsonwebtoken::Algorithm::HS512),
+            &payload,
+            &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .expect("sign test JWT");
         req.headers_mut().insert(
             HeaderName::from_static("authorization"),
             HeaderValue::from_str(&format!("Bearer {jwt}")).unwrap(),
         );
         req
     }
-}
-
-/// `header.payload.signature` with `alg: none` and an empty signature
-/// — sufficient for the inbound extractor (which doesn't validate).
-fn unsigned_jwt(payload: &serde_json::Value) -> String {
-    let header = URL_SAFE_NO_PAD.encode(b"{\"alg\":\"none\"}");
-    let body = URL_SAFE_NO_PAD.encode(payload.to_string().as_bytes());
-    let sig = URL_SAFE_NO_PAD.encode(b"");
-    format!("{header}.{body}.{sig}")
 }

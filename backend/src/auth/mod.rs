@@ -8,14 +8,15 @@
 //! The trust boundary is the `ClaimsExtractor` trait — currently
 //! satisfied by [`JwtClaimsExtractor`]. The backend does not validate
 //! the JWT signature (the BFF already did that against Keycloak's
-//! JWKS). Defence-in-depth (backend re-validates) is a small drop-in:
-//! same trait, different impl.
+//! JWKS). Defence-in-depth (backend re-validates) is audit finding
+//! N3 — a drop-in via `jsonwebtoken::decode`.
 //!
-//! Outbound: per-request the backend mints a SurrealDB-scoped JWT
-//! from the [`AuthContext`] via [`SessionTokenSigner`] and hands it
-//! to `db.authenticate(jwt)`. SurrealDB validates the signature
+//! The same bearer token is then forwarded unchanged to SurrealDB
+//! via `db.authenticate(jwt)`. SurrealDB validates the signature
 //! against the matching `DEFINE ACCESS … TYPE RECORD WITH JWT` and
-//! enforces `PERMISSIONS` per query.
+//! the AUTHENTICATE clause resolves it to an `app_user` record;
+//! `PERMISSIONS` clauses then fire on every query. The backend
+//! does not mint any JWT of its own.
 //!
 //! Internals are private. The public surface is the items re-exported below.
 
@@ -37,7 +38,7 @@ pub use claims::{Claims, ClaimsError, ClaimsExtractor};
 pub use config::{AuthConfig, AuthMode, HeaderConfig};
 pub use context::AuthContext;
 pub use guard::{enforce_production_guard, print_banner};
-pub use jwt::{JwtClaimsExtractor, SessionTokenSigner};
+pub use jwt::JwtClaimsExtractor;
 pub use middleware::{identity_middleware, IdentityDeps};
 
 pub use bootstrap::{ensure_user, resolve_default_tenant};

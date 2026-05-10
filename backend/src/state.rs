@@ -1,9 +1,15 @@
 //! Shared application state injected into axum handlers.
 //!
-//! Note: `AppState` carries [`RequestDbPool`] — the per-request storage
-//! handle. It deliberately does **not** carry [`crate::storage::SystemDb`]
-//! (the privileged singleton used for boot, admin, and scheduler paths).
-//! Handlers physically cannot reach the system handle from here.
+//! Per-request storage is **not** here — handlers receive an
+//! [`Extension<Arc<crate::storage::AuthedDb>>`] from the identity
+//! middleware, which holds a JWT-authenticated SurrealDB session
+//! scoped to the caller. PERMISSIONS clauses fire on every query
+//! through that handle.
+//!
+//! `AppState` carries only state that is genuinely process-global:
+//! the LLM client, object store, ingestion sink (used by the
+//! scheduler — handlers ingest via their own per-request pipeline),
+//! and the SSE broadcast channel.
 
 use std::sync::Arc;
 
@@ -12,17 +18,15 @@ use tokio::sync::broadcast;
 use crate::ingestion::{IngestSink, NewDocumentEvent};
 use crate::llm::LlmClient;
 use crate::object_store::ObjectStore;
-use crate::storage::RequestDbPool;
 
 #[derive(Clone)]
 pub struct AppState {
-    /// Per-request storage handle. Phase 1: thin wrapper over the shared
-    /// service-user connection. Phase 2: pool of per-request
-    /// JWT-authenticated connections.
-    pub db: Arc<RequestDbPool>,
     pub llm: Arc<dyn LlmClient>,
     /// The single contract every ingestion path (HTTP endpoint and
     /// in-process scheduler alike) calls. See [`crate::ingestion`].
+    /// Backed by `SystemStorage` — handlers needing to ingest under
+    /// the caller's identity construct their own per-request pipeline
+    /// off `AuthedDb` instead.
     pub sink: Arc<dyn IngestSink>,
     /// Where original artefacts (PDFs, …) are stashed. Adapters use it
     /// directly; HTTP handlers can dereference `Document.storage_uri`

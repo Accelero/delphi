@@ -27,8 +27,8 @@ mod system;
 pub use models::{
     Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
 };
-pub use request::{AuthenticatedDb, RequestDbPool};
-pub use system::{Counts, JwtAccessConfig, JwtAccessKind, SystemDb};
+pub use request::{AuthedDb, RequestDbPool};
+pub use system::{Counts, JwtAccessConfig, JwtAccessKind, SystemDb, SystemStorage};
 
 use async_trait::async_trait;
 use surrealdb::RecordId;

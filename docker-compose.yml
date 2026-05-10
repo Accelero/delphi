@@ -58,6 +58,11 @@ services:
       SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:-root}
       SURREAL_NS: delphi
       SURREAL_DB: main
+      # Tier 1: SurrealDB validates the dev JWT with an HS512 shared
+      # secret. The (currently-broken, audit finding N1) dev injector
+      # will sign with the same secret once it is restored.
+      SURREAL_JWT_MODE: hs512
+      SURREAL_JWT_SECRET: ${SURREAL_JWT_SECRET:-tier1-dev-jwt-secret-not-for-production}
       # Tenant the scheduler-driven adapters write to (single-tenant v1).
       SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-dev}
       BIND_ADDR: 0.0.0.0:8081

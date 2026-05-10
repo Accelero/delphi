@@ -18,7 +18,7 @@ use delphi::auth::resolve_default_tenant;
 use delphi::filter::{IngestFilter, NoopFilter};
 use delphi::ingestion::{IngestRequest, IngestSink, Pipeline};
 use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{RequestDbPool, Storage, SystemDb};
+use delphi::storage::{Storage, SystemDb};
 
 use crate::common::fake_source::FakeAdapter;
 use crate::common::{AuthRequestBuilder, TestApp};
@@ -73,7 +73,8 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     assert_eq!(http_outcome["outcome"], "created");
     assert_eq!(http_outcome["version"], 1);
     let http_doc = app_http
-        .db
+        .system
+        .storage()
         .get_document_by_canonical(&app_http.default_tenant_id, "sym-1")
         .await
         .unwrap()
@@ -90,8 +91,7 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     let tenant_b = resolve_default_tenant(&system_b, "test")
         .await
         .expect("tenant");
-    let pool_b = Arc::new(RequestDbPool::from_system(&system_b));
-    let trait_storage_b: Arc<dyn Storage> = pool_b.clone();
+    let trait_storage_b: Arc<dyn Storage> = system_b.storage();
     let sink_b: Arc<dyn IngestSink> = Arc::new(Pipeline::new(trait_storage_b.clone()));
 
     let item = build_request(&tenant_b, "sym-1");

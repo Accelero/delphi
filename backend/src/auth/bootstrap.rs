@@ -29,6 +29,44 @@ use super::context::AuthContext;
 use super::config::DevConfig;
 use crate::storage::SystemDb;
 
+/// In test setups the `SystemDb` handle and the `RequestDbPool` slots are
+/// clones of the same in-memory connection (SurrealDB's embedded engine
+/// doesn't support multiple independent sessions over shared data). When
+/// a prior request authenticates the handle into a RECORD session via the
+/// pool, subsequent system-path operations (this file's `app_user` /
+/// `tenant` / `membership` upserts) get denied by PERMISSIONS.
+///
+/// Re-asserting Root before each upsert is the cheapest fix that keeps
+/// production and test code paths identical. In production the
+/// `SystemDb` handle is never re-authenticated as anything else (the
+/// pool owns its own connections), so this re-signin is a no-op on
+/// auth state — it just adds one RPC roundtrip per request through the
+/// privileged path.
+async fn ensure_root_session(system: &SystemDb) {
+    // `invalidate` clears any RECORD session previously installed by a
+    // pool-acquire on the shared handle, dropping back to the
+    // privileged baseline (the auth state SystemDb was constructed in:
+    // remote = `Root` via signin; embedded = unauthenticated == full
+    // access). On a fresh handle this is a no-op.
+    let _ = system.raw().invalidate().await;
+    // For remote engines we additionally re-assert the Root signin,
+    // because `invalidate` drops *all* session state including the
+    // initial Root credentials. On embedded engines signin would fail
+    // (no users defined) — we skip it.
+    if let (Ok(user), Ok(pass)) = (
+        std::env::var("SURREAL_SERVICE_USER"),
+        std::env::var("SURREAL_SERVICE_PASS"),
+    ) {
+        let _ = system
+            .raw()
+            .signin(surrealdb::opt::auth::Root {
+                username: &user,
+                password: &pass,
+            })
+            .await;
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct IdRow {
     id: RecordId,
@@ -63,6 +101,7 @@ fn slug_to_display_name(slug: &str) -> String {
 }
 
 async fn upsert_tenant(system: &SystemDb, slug: &str, name: &str) -> Result<RecordId> {
+    ensure_root_session(system).await;
     let db = system.raw();
     let mut r = db
         .query("SELECT id FROM tenant WHERE slug = $slug LIMIT 1")
@@ -90,7 +129,9 @@ async fn upsert_user(
     sub: &str,
     email: &str,
     display_name: Option<&str>,
+    tenant: &RecordId,
 ) -> Result<UserRow> {
+    ensure_root_session(system).await;
     let db = system.raw();
     let mut r = db
         .query(
@@ -103,27 +144,34 @@ async fn upsert_user(
         .context("select app_user")?;
     let existing: Option<UserRow> = r.take(0).context("decode app_user select")?;
     if let Some(u) = existing {
-        // Best-effort refresh of cached attrs. Not fatal on failure.
+        // Best-effort refresh of cached attrs + tenant denorm. Not fatal
+        // on failure. `tenant_id` is what `$auth.tenant_id` resolves to
+        // in PERMISSIONS clauses on every domain table — keeping it
+        // current is the load-bearing part of this update.
         let _ = db
             .query(
-                "UPDATE $rid SET email = $email, display_name = $name, last_seen_at = time::now()",
+                "UPDATE $rid SET email = $email, display_name = $name, \
+                                  tenant_id = $tid, last_seen_at = time::now()",
             )
             .bind(("rid", u.id.clone()))
             .bind(("email", email.to_string()))
             .bind(("name", display_name.map(|s| s.to_string())))
+            .bind(("tid", tenant.clone()))
             .await;
         return Ok(u);
     }
     let mut r = db
         .query(
             "CREATE app_user CONTENT { \
-                iss: $iss, sub: $sub, email: $email, display_name: $name \
+                iss: $iss, sub: $sub, email: $email, display_name: $name, \
+                tenant_id: $tid \
              } RETURN id, iss, sub, email, display_name",
         )
         .bind(("iss", iss.to_string()))
         .bind(("sub", sub.to_string()))
         .bind(("email", email.to_string()))
         .bind(("name", display_name.map(|s| s.to_string())))
+        .bind(("tid", tenant.clone()))
         .await
         .context("create app_user")?;
     let row: Option<UserRow> = r.take(0).context("decode app_user create")?;
@@ -136,6 +184,7 @@ async fn upsert_membership(
     tenant: &RecordId,
     role: &str,
 ) -> Result<()> {
+    ensure_root_session(system).await;
     let db = system.raw();
     let mut r = db
         .query("SELECT id FROM membership WHERE user = $u AND tenant_id = $t LIMIT 1")
@@ -195,6 +244,7 @@ pub async fn ensure_user(
         &claims.sub,
         &claims.email,
         claims.display_name.as_deref(),
+        &tenant_id,
     )
     .await?;
     upsert_membership(system, &user.id, &tenant_id, "member").await?;
@@ -223,6 +273,7 @@ pub async fn seed_dev_world(system: &SystemDb, cfg: &DevConfig) -> Result<Record
         "dev-user",
         &cfg.user_email,
         Some(&cfg.user_name),
+        &tenant_id,
     )
     .await?;
     upsert_membership(system, &user.id, &tenant_id, "owner").await?;

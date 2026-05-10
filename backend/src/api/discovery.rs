@@ -22,11 +22,13 @@
 use std::convert::Infallible;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -38,7 +40,7 @@ use tokio::sync::broadcast;
 use crate::auth::AuthContext;
 use crate::ingestion::NewDocumentEvent;
 use crate::state::AppState;
-use crate::storage::{FeedCursor, FeedItem, Storage};
+use crate::storage::{AuthedDb, FeedCursor, FeedItem, Storage};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -85,7 +87,7 @@ struct CursorWire {
 }
 
 pub async fn feed(
-    State(state): State<AppState>,
+    Extension(db): Extension<Arc<AuthedDb>>,
     auth: AuthContext,
     Query(q): Query<FeedQuery>,
 ) -> Response {
@@ -102,8 +104,7 @@ pub async fn feed(
         None => None,
     };
 
-    let items = match state
-        .db
+    let items = match db
         .list_feed(&auth.tenant_id, &auth.user_id, cursor, limit)
         .await
     {
@@ -132,13 +133,12 @@ pub async fn feed(
 }
 
 pub async fn mark_read(
-    State(state): State<AppState>,
+    Extension(db): Extension<Arc<AuthedDb>>,
     auth: AuthContext,
     Path(key): Path<String>,
 ) -> Response {
     let doc_id = RecordId::from(("document", key.as_str()));
-    match state
-        .db
+    match db
         .mark_read(&auth.tenant_id, &auth.user_id, &doc_id)
         .await
     {
@@ -151,13 +151,12 @@ pub async fn mark_read(
 }
 
 pub async fn mark_unread(
-    State(state): State<AppState>,
+    Extension(db): Extension<Arc<AuthedDb>>,
     auth: AuthContext,
     Path(key): Path<String>,
 ) -> Response {
     let doc_id = RecordId::from(("document", key.as_str()));
-    match state
-        .db
+    match db
         .mark_unread(&auth.tenant_id, &auth.user_id, &doc_id)
         .await
     {

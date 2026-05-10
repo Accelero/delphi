@@ -17,7 +17,7 @@ use delphi::auth::resolve_default_tenant;
 use delphi::filter::{Decision, IngestFilter, NoopFilter};
 use delphi::ingestion::{IngestRequest, IngestSink};
 use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{RequestDbPool, Storage, SystemDb};
+use delphi::storage::{Storage, SystemDb};
 
 use crate::common::fake_sink::CountingSink;
 use crate::common::fake_source::FakeAdapter;
@@ -58,10 +58,11 @@ async fn fresh_storage() -> (Arc<dyn Storage>, RecordId) {
     );
     system.init_schema().await.expect("init schema");
     let tenant = resolve_default_tenant(&system, "test").await.expect("tenant");
-    let pool: Arc<dyn Storage> = Arc::new(RequestDbPool::from_system(&system));
-    // Leak system handle into the pool's underlying connection (Arc-counted).
-    let _ = system;
-    (pool, tenant)
+    // Tests below exercise the application-layer pipeline, not the
+    // engine-RBAC path — `SystemStorage` (privileged) is the right
+    // surface here. PERMISSIONS clauses don't fire on this handle.
+    let storage: Arc<dyn Storage> = system.storage();
+    (storage, tenant)
 }
 
 #[tokio::test]

@@ -15,7 +15,7 @@ use delphi::auth::resolve_default_tenant;
 use delphi::filter::{IngestFilter, NoopFilter};
 use delphi::ingestion::{IngestRequest, IngestSink, Pipeline};
 use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{RequestDbPool, Storage, SystemDb};
+use delphi::storage::{Storage, SystemDb};
 
 use crate::common::fake_source::FakeAdapter;
 
@@ -49,8 +49,9 @@ async fn scheduler_persists_and_advances_cursor() {
         .await
         .expect("seed tenant");
 
-    let pool = Arc::new(RequestDbPool::from_system(&system));
-    let trait_storage: Arc<dyn Storage> = pool.clone();
+    // Scheduler runs against the privileged path in production —
+    // the test mirrors that wiring rather than the per-request path.
+    let trait_storage: Arc<dyn Storage> = system.storage();
     let sink: Arc<dyn IngestSink> = Arc::new(Pipeline::new(trait_storage.clone()));
 
     let adapter = Arc::new(

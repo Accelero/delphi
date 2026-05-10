@@ -19,12 +19,21 @@
 //! its own connections authenticated per-request via IdP JWT, and
 //! `SystemDb` stays as the small contained escape hatch above.
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde::Deserialize;
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
 use surrealdb::{RecordId, Surreal};
 
 use crate::error::{Error, Result};
+
+use super::surreal::SurrealStorage;
+use super::{
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
+    Storage,
+};
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
 
@@ -119,15 +128,29 @@ impl SystemDb {
     }
 
     /// Borrow the underlying handle. Used by `auth/bootstrap.rs` (which
-    /// runs raw SurrealQL upserts on `app_user` / `tenant` / `membership`),
-    /// [`crate::storage::RequestDbPool::from_system`], and integration
-    /// tests that drive the engine directly to verify PERMISSIONS
-    /// enforcement.
+    /// runs raw SurrealQL upserts on `app_user` / `tenant` / `membership`)
+    /// and integration tests that drive the engine directly to verify
+    /// PERMISSIONS enforcement.
     ///
     /// Application handlers must not call this — they get the typed
-    /// `Storage`-trait surface via [`crate::storage::RequestDbPool`].
+    /// `Storage`-trait surface via [`crate::storage::AuthedDb`].
     pub fn raw(&self) -> &Surreal<Any> {
         &self.db
+    }
+
+    /// Privileged [`Storage`] view. PERMISSIONS clauses **do not fire**
+    /// on writes/reads through this handle — it runs as the service
+    /// user. Reserved for callers that legitimately need cross-tenant
+    /// or pre-auth-context access: the in-process scheduler, the ingest
+    /// pipeline-from-scheduler, and integration tests.
+    ///
+    /// Request handlers never reach this; they receive an
+    /// [`crate::storage::AuthedDb`] via middleware, which runs under a
+    /// RECORD session and therefore is subject to PERMISSIONS.
+    pub fn storage(&self) -> Arc<SystemStorage> {
+        Arc::new(SystemStorage {
+            inner: SurrealStorage::from_handle(self.db.clone()),
+        })
     }
 
     /// Apply the canonical schema. Idempotent — every statement uses
@@ -142,9 +165,15 @@ impl SystemDb {
     /// `db.authenticate(jwt)` has no access definition to validate
     /// against.
     ///
-    /// `$auth` is resolved from the JWT's `ID` claim directly (no
-    /// AUTHENTICATE override). The backend's pre-flight `ensure_user`
-    /// guarantees the row exists before minting.
+    /// The AUTHENTICATE clause maps the IdP JWT's `(iss, sub)` claims to
+    /// the local `app_user` record id, so PERMISSIONS clauses can read
+    /// `$auth.tenant_id` etc. The backend's pre-flight `ensure_user`
+    /// (run on `SystemDb` *before* `db.authenticate` fires) guarantees
+    /// the row exists, otherwise authentication fails closed.
+    ///
+    /// Optional `expected_issuer` / `expected_audience` checks throw
+    /// from inside the clause — defence-in-depth even though the BFF
+    /// already validated.
     ///
     /// Re-applies cleanly via `OVERWRITE` so a key/JWKS rotation doesn't
     /// require a schema migration.
@@ -161,15 +190,39 @@ impl SystemDb {
 
         let session_secs = cfg.session_duration_secs.unwrap_or(1800);
 
-        // Unused for now — kept on the config surface for when we wire
-        // an AUTHENTICATE clause to enforce these claims (upstream-JWT
-        // mode). Silenced via `let _ =`.
-        let _ = &cfg.expected_issuer;
-        let _ = &cfg.expected_audience;
+        let mut checks = String::new();
+        if let Some(iss) = &cfg.expected_issuer {
+            checks.push_str(&format!(
+                "IF $token.iss != '{}' {{ THROW 'unexpected issuer'; }};",
+                escape_surrealql_string(iss)
+            ));
+        }
+        if let Some(aud) = &cfg.expected_audience {
+            let aud_esc = escape_surrealql_string(aud);
+            // `aud` may be a string OR an array per RFC 7519; handle both.
+            checks.push_str(&format!(
+                "IF (type::is::array($token.aud) AND !($token.aud CONTAINS '{aud}')) \
+                 OR (type::is::string($token.aud) AND $token.aud != '{aud}') \
+                 {{ THROW 'unexpected audience'; }};",
+                aud = aud_esc
+            ));
+        }
 
+        // The AUTHENTICATE clause is what gives us a meaningful `$auth`
+        // record (resolved from the IdP-claimed identity). Without it,
+        // SurrealDB falls back to `$auth = $token.ID` — and IdP tokens
+        // don't carry an `ID` claim, so engine-side PERMISSIONS that
+        // read `$auth.tenant_id` would all see NONE.
         let stmt = format!(
             "DEFINE ACCESS OVERWRITE app_session ON DATABASE TYPE RECORD \
              WITH JWT {validator} \
+             AUTHENTICATE {{ \
+                {checks} \
+                LET $u = (SELECT * FROM app_user \
+                          WHERE iss = $token.iss AND sub = $token.sub LIMIT 1)[0]; \
+                IF $u IS NONE {{ THROW 'unknown user'; }}; \
+                RETURN $u; \
+             }} \
              DURATION FOR SESSION {session_secs}s;"
         );
         self.db.query(stmt).await?.check()?;
@@ -254,6 +307,121 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn env_required(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| Error::EnvMissing(key.into()))
+}
+
+/// Privileged [`Storage`] view obtained via [`SystemDb::storage`]. Wraps
+/// the service-user [`SurrealStorage`]; **PERMISSIONS clauses do not
+/// fire on calls through this handle**.
+///
+/// Used by:
+/// - the in-process source-adapter scheduler (cross-tenant by design),
+/// - the ingest pipeline when driven by the scheduler,
+/// - integration tests that need above-RBAC seeding.
+pub struct SystemStorage {
+    inner: SurrealStorage,
+}
+
+#[async_trait]
+impl Storage for SystemStorage {
+    async fn upsert_document(&self, tenant: &RecordId, doc: &Document) -> Result<DocId> {
+        self.inner.upsert_document(tenant, doc).await
+    }
+    async fn get_document(&self, tenant: &RecordId, id: &DocId) -> Result<Option<Document>> {
+        self.inner.get_document(tenant, id).await
+    }
+    async fn get_document_by_canonical(
+        &self,
+        tenant: &RecordId,
+        canonical_id: &str,
+    ) -> Result<Option<Document>> {
+        self.inner.get_document_by_canonical(tenant, canonical_id).await
+    }
+    async fn delete_document(&self, tenant: &RecordId, id: &DocId) -> Result<()> {
+        self.inner.delete_document(tenant, id).await
+    }
+    async fn upsert_content(
+        &self,
+        tenant: &RecordId,
+        doc_id: &DocId,
+        content: &Content,
+    ) -> Result<()> {
+        self.inner.upsert_content(tenant, doc_id, content).await
+    }
+    async fn get_content(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Option<Content>> {
+        self.inner.get_content(tenant, doc_id).await
+    }
+    async fn upsert_chunks(
+        &self,
+        tenant: &RecordId,
+        doc_id: &DocId,
+        chunks: &[Chunk],
+    ) -> Result<Vec<ChunkId>> {
+        self.inner.upsert_chunks(tenant, doc_id, chunks).await
+    }
+    async fn list_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Vec<Chunk>> {
+        self.inner.list_chunks(tenant, doc_id).await
+    }
+    async fn delete_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<()> {
+        self.inner.delete_chunks(tenant, doc_id).await
+    }
+    async fn search_vector(
+        &self,
+        tenant: &RecordId,
+        query: &[f32],
+        top_k: usize,
+        filters: &Filters,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        self.inner.search_vector(tenant, query, top_k, filters).await
+    }
+    async fn search_keyword(
+        &self,
+        tenant: &RecordId,
+        query: &str,
+        top_k: usize,
+        filters: &Filters,
+    ) -> Result<Vec<ChunkSearchResult>> {
+        self.inner.search_keyword(tenant, query, top_k, filters).await
+    }
+    async fn get_source_cursor(
+        &self,
+        tenant: &RecordId,
+        adapter: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        self.inner.get_source_cursor(tenant, adapter).await
+    }
+    async fn put_source_cursor(
+        &self,
+        tenant: &RecordId,
+        adapter: &str,
+        cursor: &serde_json::Value,
+    ) -> Result<()> {
+        self.inner.put_source_cursor(tenant, adapter, cursor).await
+    }
+    async fn list_feed(
+        &self,
+        tenant: &RecordId,
+        user_id: &RecordId,
+        cursor: Option<FeedCursor>,
+        limit: usize,
+    ) -> Result<Vec<FeedItem>> {
+        self.inner.list_feed(tenant, user_id, cursor, limit).await
+    }
+    async fn mark_read(
+        &self,
+        tenant: &RecordId,
+        user_id: &RecordId,
+        doc_id: &DocId,
+    ) -> Result<()> {
+        self.inner.mark_read(tenant, user_id, doc_id).await
+    }
+    async fn mark_unread(
+        &self,
+        tenant: &RecordId,
+        user_id: &RecordId,
+        doc_id: &DocId,
+    ) -> Result<()> {
+        self.inner.mark_unread(tenant, user_id, doc_id).await
+    }
 }
 
 #[cfg(test)]

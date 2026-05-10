@@ -132,6 +132,12 @@ services:
       SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:-root}
       SURREAL_NS: delphi
       SURREAL_DB: main
+      # Per-request SurrealDB authentication: the IdP JWT (forwarded
+      # by oauth2-proxy as `Authorization: Bearer …`) is validated
+      # engine-side against Keycloak's JWKS, then PERMISSIONS clauses
+      # on every domain table enforce tenant isolation.
+      SURREAL_JWT_MODE: jwks
+      SURREAL_JWT_JWKS_URL: ${SURREAL_JWT_JWKS_URL:-http://keycloak:8080/realms/delphi/protocol/openid-connect/certs}
       SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-tenant-a}
       BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug

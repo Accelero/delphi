@@ -103,7 +103,8 @@ async fn ingest_200_creates_then_unchanged_then_versioned() {
 
     // Direct DB inspection: the document persisted and its version is current.
     let doc = app
-        .db
+        .system
+        .storage()
         .get_document_by_canonical(&app.default_tenant_id, "doc-1")
         .await
         .unwrap()

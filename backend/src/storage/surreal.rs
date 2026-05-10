@@ -704,14 +704,16 @@ mod feed_query_tests {
         row.unwrap().id
     }
 
-    async fn create_user(system: &SystemDb, sub: &str) -> RecordId {
+    async fn create_user(system: &SystemDb, sub: &str, tenant: &RecordId) -> RecordId {
         let mut r = system
             .raw()
             .query(
                 "CREATE app_user CONTENT \
-                 { iss: 'test', sub: $sub, email: 'u@example.com' } RETURN id",
+                 { iss: 'test', sub: $sub, email: 'u@example.com', tenant_id: $tid } \
+                 RETURN id",
             )
             .bind(("sub", sub.to_string()))
+            .bind(("tid", tenant.clone()))
             .await
             .unwrap();
         let row: Option<IdRow> = r.take(0).unwrap();
@@ -741,7 +743,7 @@ mod feed_query_tests {
     #[tokio::test]
     async fn list_feed_returns_empty_when_no_documents() {
         let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1").await;
+        let user = create_user(&system, "u1", &tenant).await;
         let items = storage.list_feed(&tenant, &user, None, 50).await.unwrap();
         assert!(items.is_empty());
     }
@@ -749,7 +751,7 @@ mod feed_query_tests {
     #[tokio::test]
     async fn list_feed_orders_newest_first_and_marks_read() {
         let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1").await;
+        let user = create_user(&system, "u1", &tenant).await;
 
         let mut ids = Vec::new();
         for (i, c) in ["a", "b", "c"].iter().enumerate() {
@@ -782,7 +784,7 @@ mod feed_query_tests {
     #[tokio::test]
     async fn list_feed_paginates_with_cursor() {
         let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1").await;
+        let user = create_user(&system, "u1", &tenant).await;
 
         for i in 0..5 {
             let id = storage
@@ -824,7 +826,7 @@ mod feed_query_tests {
     #[tokio::test]
     async fn mark_read_is_idempotent_and_unread_removes() {
         let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1").await;
+        let user = create_user(&system, "u1", &tenant).await;
         let id = storage.upsert_document(&tenant, &doc(&tenant, "x")).await.unwrap();
 
         storage.mark_read(&tenant, &user, &id).await.unwrap();
@@ -842,7 +844,7 @@ mod feed_query_tests {
     async fn list_feed_isolates_per_tenant() {
         let (system, storage, tenant_a) = fresh().await;
         let tenant_b = create_tenant(&system, "tenant-b").await;
-        let alice = create_user(&system, "alice").await;
+        let alice = create_user(&system, "alice", &tenant_a).await;
 
         // Same canonical_id in two tenants → two distinct rows (per-tenant
         // canonical UNIQUE index).

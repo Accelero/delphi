@@ -18,7 +18,7 @@ use tracing::info;
 use crate::auth::{
     self, AuthConfig, AuthMode, ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
-use crate::config::system_db_from_env;
+use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::filter::{IngestFilter, NoopFilter};
 use crate::ingestion::{self, NotifyingSink, Pipeline, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
@@ -44,6 +44,16 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         .await
         .context("applying schema on startup")?;
 
+    // Define the `app_session` RECORD access method that SurrealDB will
+    // use to validate the IdP JWT on every per-request `db.authenticate`.
+    // Configured by env: JWKS URL for production (real IdP) or HS512
+    // shared secret for tier-1 dev and tests.
+    let jwt_access = jwt_access_from_env().context("loading JWT access config")?;
+    system
+        .define_jwt_access(&jwt_access)
+        .await
+        .context("defining JWT access on startup")?;
+
     let llm = llm_from_env().context("constructing llm client")?;
 
     // Resolve the default tenant once at startup so the per-request hot
@@ -68,24 +78,29 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         "auth ready"
     );
 
+    let request_pool = RequestDbPool::from_env_default()
+        .await
+        .context("constructing request DB pool")?;
+
     let identity_deps = IdentityDeps {
         system: system.clone(),
+        pool: request_pool.clone(),
         default_tenant_slug,
         default_tenant_id: default_tenant_id.clone(),
     };
 
-    let request_pool = Arc::new(RequestDbPool::from_system(&system));
-
     let (events_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
 
-    // Wrap the canonical Pipeline in NotifyingSink so every successful
-    // first-time ingest fans out to Discovery-feed SSE subscribers.
-    // Both ingest paths (HTTP + scheduler) share this exact sink, so
-    // there is no codepath that creates a document silently.
-    let pipeline_storage: Arc<dyn Storage> = request_pool.clone();
-    let pipeline: Arc<dyn ingestion::IngestSink> = Arc::new(Pipeline::new(pipeline_storage));
+    // Scheduler / in-process ingest writes through the privileged
+    // `SystemStorage` — it operates above-RBAC by design (cross-tenant
+    // by configuration, no user JWT in scope). HTTP ingestion that runs
+    // under a user's identity must construct its own per-request
+    // pipeline off the `AuthedDb` from the middleware.
+    let scheduler_storage: Arc<dyn Storage> = system.storage();
+    let scheduler_pipeline: Arc<dyn ingestion::IngestSink> =
+        Arc::new(Pipeline::new(scheduler_storage.clone()));
     let sink: Arc<dyn ingestion::IngestSink> =
-        Arc::new(NotifyingSink::new(pipeline, events_tx.clone()));
+        Arc::new(NotifyingSink::new(scheduler_pipeline, events_tx.clone()));
 
     let object_store: Arc<dyn ObjectStore> = object_store::from_url(
         &std::env::var("OBJECT_STORE_URL")
@@ -98,7 +113,6 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
 
     let state = AppState {
-        db: request_pool.clone(),
         llm,
         sink: sink.clone(),
         object_store: object_store.clone(),
@@ -127,11 +141,10 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
                 tenant = %scheduler_tenant_slug,
                 "starting source-adapter scheduler"
             );
-            let scheduler_storage: Arc<dyn Storage> = request_pool.clone();
             Some(sources::run_scheduler(
                 sink,
                 filter,
-                scheduler_storage,
+                scheduler_storage.clone(),
                 scheduler_tenant_id,
                 registry,
             ))

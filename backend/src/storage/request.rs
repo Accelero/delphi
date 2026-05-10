@@ -1,107 +1,256 @@
-//! [`RequestDbPool`] — the per-request storage handle handlers receive.
+//! Per-request, JWT-authenticated SurrealDB handles.
 //!
-//! Phase 1 (this file): a thin wrapper around the shared SurrealDB
-//! connection that implements [`Storage`] by delegation. Tenant
-//! isolation is application-layer — every method takes
-//! `tenant: &RecordId` and the implementation writes / filters by it.
+//! The pool holds a fixed set of pre-connected SurrealDB clients. On every
+//! protected request the identity middleware acquires one from the pool,
+//! calls `db.authenticate(<idp-jwt>)` so the session becomes a RECORD
+//! session under `app_session` (see
+//! [`crate::storage::SystemDb::define_jwt_access`]), and attaches the
+//! resulting [`AuthedDb`] to the request via `Extension`.
 //!
-//! Phase 2 (future): a pool of N WebSocket connections to SurrealDB,
-//! each authenticated per-request via the IdP-issued JWT so SurrealDB
-//! record-level rules enforce isolation engine-side. The trait surface
-//! handlers see does not change between phases — only the internals of
-//! how queries reach the engine do.
+//! From that point engine-side `PERMISSIONS` clauses enforce tenant
+//! isolation on every query: a handler that builds the wrong `WHERE`
+//! clause cannot leak across tenants because SurrealDB itself refuses.
+//!
+//! The pool is bounded — `acquire()` waits when all connections are in
+//! flight. Dropping [`AuthedDb`] returns the connection to the pool;
+//! the next acquirer re-authenticates with its own JWT (SurrealDB
+//! simply overwrites the session).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use surrealdb::RecordId;
+use surrealdb::engine::any::{self, Any};
+use surrealdb::opt::auth::Root;
+use surrealdb::{RecordId, Surreal};
+use tokio::sync::{mpsc, Mutex};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::surreal::SurrealStorage;
-use super::system::SystemDb;
+use super::system::engine_requires_auth;
 use super::{
     Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
     Storage,
 };
 
-/// Per-request storage handle. Cloneable cheaply — internals are
-/// `Arc`-counted.
+/// Default pool size. Sized to comfortably saturate typical inbound
+/// concurrency without holding an absurd number of WebSocket sessions
+/// open against SurrealDB at idle.
+const DEFAULT_POOL_SIZE: usize = 16;
+
+/// Pool of pre-connected SurrealDB clients. Cloneable cheaply — internals
+/// are `Arc`-counted. One pool per backend process.
 #[derive(Clone)]
 pub struct RequestDbPool {
-    inner: Arc<SurrealStorage>,
+    inner: Arc<RequestDbPoolInner>,
+}
+
+struct RequestDbPoolInner {
+    /// Receiver side of the available-connections queue. `acquire` does
+    /// `recv().await`, which yields the next free connection (or waits
+    /// if all are in flight).
+    rx: Mutex<mpsc::Receiver<Surreal<Any>>>,
+    /// Sender side — `AuthedDb`'s `Drop` impl posts back to this so the
+    /// connection returns to the pool.
+    tx: mpsc::Sender<Surreal<Any>>,
 }
 
 impl RequestDbPool {
-    /// Phase 1: borrow the same connection [`SystemDb`] uses. Phase 2:
-    /// initialise an independent pool of authenticated connections.
-    pub fn from_system(system: &SystemDb) -> Self {
-        Self {
-            inner: Arc::new(SurrealStorage::from_handle(system.raw().clone())),
+    /// Construct a pool by opening `size` independent SurrealDB
+    /// connections. Each is signed in as the service user up-front so
+    /// `use_ns` / `use_db` are set; per-request `authenticate(jwt)`
+    /// then transitions the session into a RECORD scope.
+    ///
+    /// The service-user credential is loaded from the same env vars
+    /// `SystemDb` uses (`SURREAL_SERVICE_USER` / `SURREAL_SERVICE_PASS`)
+    /// so we don't introduce a second credential surface.
+    pub async fn from_env(size: usize) -> Result<Self> {
+        let url = env_or("SURREAL_URL", "ws://surrealdb:8000/rpc");
+        let user = env_required("SURREAL_SERVICE_USER")?;
+        let password = env_required("SURREAL_SERVICE_PASS")?;
+        let namespace = env_or("SURREAL_NS", "delphi");
+        let database = env_or("SURREAL_DB", "main");
+
+        let (tx, rx) = mpsc::channel(size);
+        for _ in 0..size {
+            let db = any::connect(&url).await?;
+            if engine_requires_auth(&url) {
+                db.signin(Root {
+                    username: &user,
+                    password: &password,
+                })
+                .await?;
+            }
+            db.use_ns(&namespace).use_db(&database).await?;
+            tx.send(db)
+                .await
+                .map_err(|_| Error::InvalidConfig("pool init: send to own channel".into()))?;
+        }
+
+        Ok(Self {
+            inner: Arc::new(RequestDbPoolInner {
+                rx: Mutex::new(rx),
+                tx,
+            }),
+        })
+    }
+
+    /// Default-sized pool. Most callers want this.
+    pub async fn from_env_default() -> Result<Self> {
+        Self::from_env(DEFAULT_POOL_SIZE).await
+    }
+
+    /// Test-only convenience: build a pool sharing a pre-connected
+    /// in-memory `Surreal<Any>`. All slots reference the same engine
+    /// instance (SurrealDB clones are internally `Arc`-shared), so
+    /// tests see consistent state regardless of which slot was
+    /// acquired.
+    #[doc(hidden)]
+    pub async fn in_memory(
+        seed: &Surreal<Any>,
+        size: usize,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(size);
+        for _ in 0..size {
+            tx.send(seed.clone())
+                .await
+                .map_err(|_| Error::InvalidConfig("test pool init".into()))?;
+        }
+        Ok(Self {
+            inner: Arc::new(RequestDbPoolInner {
+                rx: Mutex::new(rx),
+                tx,
+            }),
+        })
+    }
+
+    /// Acquire a connection, authenticate it with `bearer`, and return
+    /// an [`AuthedDb`] guard. The guard releases on drop.
+    pub async fn acquire(&self, bearer: &str) -> Result<AuthedDb> {
+        let db = {
+            let mut rx = self.inner.rx.lock().await;
+            rx.recv()
+                .await
+                .ok_or_else(|| Error::InvalidConfig("request DB pool closed".into()))?
+        };
+        // SurrealDB's `authenticate` validates against the `app_session`
+        // RECORD access method (its `WITH JWT URL '<jwks>'` form fetches
+        // the IdP's public keys; the `KEY '<secret>' ALGORITHM HS512`
+        // form validates symmetrically). On success the session
+        // transitions into a RECORD scope and PERMISSIONS clauses fire.
+        if let Err(e) = db.authenticate(bearer).await {
+            // Return the connection to the pool even though we couldn't
+            // use it — otherwise a burst of bad tokens drains the pool.
+            let _ = self.inner.tx.send(db).await;
+            return Err(Error::Surreal(e));
+        }
+        Ok(AuthedDb {
+            inner: Some(AuthedDbInner {
+                db: db.clone(),
+                storage: SurrealStorage::from_handle(db),
+            }),
+            tx: self.inner.tx.clone(),
+        })
+    }
+}
+
+/// A pool-borrowed, JWT-authenticated SurrealDB handle. Implements
+/// [`Storage`]; on drop the underlying connection returns to the pool.
+///
+/// `Clone` is intentionally not implemented — that would split the
+/// release path across copies. Pass `&AuthedDb` around, or use
+/// [`AuthedDb::as_storage`] to hand a shared `Arc<dyn Storage>` to
+/// short-lived consumers (e.g. an ingest pipeline within one request).
+pub struct AuthedDb {
+    /// `Option` so `Drop` can take ownership of the connection without
+    /// requiring `AuthedDb: !Sized`. Always `Some(_)` while alive.
+    inner: Option<AuthedDbInner>,
+    tx: mpsc::Sender<Surreal<Any>>,
+}
+
+struct AuthedDbInner {
+    db: Surreal<Any>,
+    storage: SurrealStorage,
+}
+
+impl AuthedDb {
+    fn storage(&self) -> &SurrealStorage {
+        &self.inner.as_ref().expect("AuthedDb used after drop").storage
+    }
+
+    /// Share this connection with a short-lived consumer (typically
+    /// the ingest pipeline). The returned `Arc<dyn Storage>` references
+    /// the same authenticated session but does not participate in the
+    /// pool-release path — this [`AuthedDb`] retains ownership.
+    pub fn as_storage(&self) -> Arc<dyn Storage> {
+        let db = self
+            .inner
+            .as_ref()
+            .expect("AuthedDb used after drop")
+            .db
+            .clone();
+        Arc::new(SurrealStorage::from_handle(db))
+    }
+}
+
+impl Drop for AuthedDb {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            // Best-effort release. If the receiver is gone (process
+            // shutdown), the connection is dropped — fine.
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(inner.db).await;
+            });
         }
     }
 }
 
-/// Reserved for Phase 2: a per-request authenticated handle returned by a
-/// pool acquire. In Phase 1 this type does not yet exist as a distinct
-/// runtime construct; handlers use [`RequestDbPool`] directly via the
-/// [`Storage`] trait. The type alias is kept here so that callers writing
-/// code that anticipates Phase 2 (e.g., test helpers) have a stable name
-/// to reach for.
-pub type AuthenticatedDb = RequestDbPool;
-
 #[async_trait]
-impl Storage for RequestDbPool {
+impl Storage for AuthedDb {
     async fn upsert_document(&self, tenant: &RecordId, doc: &Document) -> Result<DocId> {
-        self.inner.upsert_document(tenant, doc).await
+        self.storage().upsert_document(tenant, doc).await
     }
-
     async fn get_document(&self, tenant: &RecordId, id: &DocId) -> Result<Option<Document>> {
-        self.inner.get_document(tenant, id).await
+        self.storage().get_document(tenant, id).await
     }
-
     async fn get_document_by_canonical(
         &self,
         tenant: &RecordId,
         canonical_id: &str,
     ) -> Result<Option<Document>> {
-        self.inner.get_document_by_canonical(tenant, canonical_id).await
+        self.storage()
+            .get_document_by_canonical(tenant, canonical_id)
+            .await
     }
-
     async fn delete_document(&self, tenant: &RecordId, id: &DocId) -> Result<()> {
-        self.inner.delete_document(tenant, id).await
+        self.storage().delete_document(tenant, id).await
     }
-
     async fn upsert_content(
         &self,
         tenant: &RecordId,
         doc_id: &DocId,
         content: &Content,
     ) -> Result<()> {
-        self.inner.upsert_content(tenant, doc_id, content).await
+        self.storage().upsert_content(tenant, doc_id, content).await
     }
-
     async fn get_content(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Option<Content>> {
-        self.inner.get_content(tenant, doc_id).await
+        self.storage().get_content(tenant, doc_id).await
     }
-
     async fn upsert_chunks(
         &self,
         tenant: &RecordId,
         doc_id: &DocId,
         chunks: &[Chunk],
     ) -> Result<Vec<ChunkId>> {
-        self.inner.upsert_chunks(tenant, doc_id, chunks).await
+        self.storage().upsert_chunks(tenant, doc_id, chunks).await
     }
-
     async fn list_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Vec<Chunk>> {
-        self.inner.list_chunks(tenant, doc_id).await
+        self.storage().list_chunks(tenant, doc_id).await
     }
-
     async fn delete_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<()> {
-        self.inner.delete_chunks(tenant, doc_id).await
+        self.storage().delete_chunks(tenant, doc_id).await
     }
-
     async fn search_vector(
         &self,
         tenant: &RecordId,
@@ -109,9 +258,10 @@ impl Storage for RequestDbPool {
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        self.inner.search_vector(tenant, query, top_k, filters).await
+        self.storage()
+            .search_vector(tenant, query, top_k, filters)
+            .await
     }
-
     async fn search_keyword(
         &self,
         tenant: &RecordId,
@@ -119,26 +269,25 @@ impl Storage for RequestDbPool {
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        self.inner.search_keyword(tenant, query, top_k, filters).await
+        self.storage()
+            .search_keyword(tenant, query, top_k, filters)
+            .await
     }
-
     async fn get_source_cursor(
         &self,
         tenant: &RecordId,
         adapter: &str,
     ) -> Result<Option<serde_json::Value>> {
-        self.inner.get_source_cursor(tenant, adapter).await
+        self.storage().get_source_cursor(tenant, adapter).await
     }
-
     async fn put_source_cursor(
         &self,
         tenant: &RecordId,
         adapter: &str,
         cursor: &serde_json::Value,
     ) -> Result<()> {
-        self.inner.put_source_cursor(tenant, adapter, cursor).await
+        self.storage().put_source_cursor(tenant, adapter, cursor).await
     }
-
     async fn list_feed(
         &self,
         tenant: &RecordId,
@@ -146,24 +295,30 @@ impl Storage for RequestDbPool {
         cursor: Option<FeedCursor>,
         limit: usize,
     ) -> Result<Vec<FeedItem>> {
-        self.inner.list_feed(tenant, user_id, cursor, limit).await
+        self.storage().list_feed(tenant, user_id, cursor, limit).await
     }
-
     async fn mark_read(
         &self,
         tenant: &RecordId,
         user_id: &RecordId,
         doc_id: &DocId,
     ) -> Result<()> {
-        self.inner.mark_read(tenant, user_id, doc_id).await
+        self.storage().mark_read(tenant, user_id, doc_id).await
     }
-
     async fn mark_unread(
         &self,
         tenant: &RecordId,
         user_id: &RecordId,
         doc_id: &DocId,
     ) -> Result<()> {
-        self.inner.mark_unread(tenant, user_id, doc_id).await
+        self.storage().mark_unread(tenant, user_id, doc_id).await
     }
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
+}
+
+fn env_required(key: &str) -> std::result::Result<String, Error> {
+    std::env::var(key).map_err(|_| Error::EnvMissing(key.into()))
 }

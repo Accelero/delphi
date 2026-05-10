@@ -101,7 +101,7 @@ impl IngestSink for NotifyingSink {
 mod tests {
     use super::*;
     use crate::ingestion::Pipeline;
-    use crate::storage::{RequestDbPool, Storage, SystemDb};
+    use crate::storage::{Storage, SystemDb};
 
     async fn fresh_sink() -> (NotifyingSink, broadcast::Receiver<NewDocumentEvent>, RecordId) {
         let system = SystemDb::in_memory("notifier_test", "main")
@@ -120,9 +120,8 @@ mod tests {
         let row: Option<IdRow> = r.take(0).unwrap();
         let tenant = row.unwrap().id;
 
-        let pool: Arc<dyn Storage> = Arc::new(RequestDbPool::from_system(&system));
-        let _ = system;
-        let inner: Arc<dyn IngestSink> = Arc::new(Pipeline::new(pool));
+        let storage: Arc<dyn Storage> = system.storage();
+        let inner: Arc<dyn IngestSink> = Arc::new(Pipeline::new(storage));
         let (tx, rx) = broadcast::channel(8);
         (NotifyingSink::new(inner, tx), rx, tenant)
     }

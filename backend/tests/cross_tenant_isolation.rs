@@ -13,9 +13,9 @@
 
 mod common;
 
+use jsonwebtoken::{encode, EncodingKey, Header};
 use surrealdb::RecordId;
 
-use delphi::auth::{AuthContext, SessionTokenSigner};
 use delphi::storage::{JwtAccessConfig, JwtAccessKind, SystemDb};
 
 const TEST_SECRET: &str = "test-only-secret-do-not-use-anywhere-real-please";
@@ -27,13 +27,37 @@ struct IdRow {
 
 struct World {
     system: SystemDb,
+    ns: String,
     tenant_a: RecordId,
     tenant_b: RecordId,
     alice: RecordId, // app_user in tenant_a
-    bob: RecordId,   // app_user in tenant_b
+    #[allow(dead_code)]
+    bob: RecordId, // app_user in tenant_b — referenced only by the mint_jwt sub name
     doc_a: RecordId, // document in tenant_a
     doc_b: RecordId, // document in tenant_b
-    signer: SessionTokenSigner,
+}
+
+/// Mint an HS512-signed JWT carrying the claims the `app_session` access
+/// method validates: `iss` / `sub` (resolved by AUTHENTICATE to an
+/// `app_user`), plus `ac` / `ns` / `db` so SurrealDB routes the token
+/// to the right access definition.
+fn mint_jwt(iss: &str, sub: &str, ns: &str) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let payload = serde_json::json!({
+        "iss": iss,
+        "sub": sub,
+        "ac": "app_session",
+        "ns": ns,
+        "db": "main",
+        "iat": now,
+        "exp": now + 60,
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS512),
+        &payload,
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .expect("sign HS512 test JWT")
 }
 
 async fn build_world(ns: &str) -> World {
@@ -55,8 +79,8 @@ async fn build_world(ns: &str) -> World {
 
     let tenant_a = create_tenant(&system, "tenant-a", "Tenant A").await;
     let tenant_b = create_tenant(&system, "tenant-b", "Tenant B").await;
-    let alice = create_user(&system, "https://idp.test/", "alice", "alice@a.test").await;
-    let bob = create_user(&system, "https://idp.test/", "bob", "bob@b.test").await;
+    let alice = create_user(&system, "https://idp.test/", "alice", "alice@a.test", &tenant_a).await;
+    let bob = create_user(&system, "https://idp.test/", "bob", "bob@b.test", &tenant_b).await;
     create_membership(&system, &alice, &tenant_a, "member").await;
     create_membership(&system, &bob, &tenant_b, "member").await;
 
@@ -72,17 +96,15 @@ async fn build_world(ns: &str) -> World {
         .unwrap();
     assert_eq!(count, Some(2), "Root sees both tenants' docs");
 
-    let signer = SessionTokenSigner::new(TEST_SECRET.as_bytes().to_vec(), ns, "main");
-
     World {
         system,
+        ns: ns.to_string(),
         tenant_a,
         tenant_b,
         alice,
         bob,
         doc_a,
         doc_b,
-        signer,
     }
 }
 
@@ -98,16 +120,24 @@ async fn create_tenant(system: &SystemDb, slug: &str, name: &str) -> RecordId {
     row.unwrap().id
 }
 
-async fn create_user(system: &SystemDb, iss: &str, sub: &str, email: &str) -> RecordId {
+async fn create_user(
+    system: &SystemDb,
+    iss: &str,
+    sub: &str,
+    email: &str,
+    tenant: &RecordId,
+) -> RecordId {
     let mut r = system
         .raw()
         .query(
             "CREATE app_user CONTENT \
-             { iss: $iss, sub: $sub, email: $email } RETURN id",
+             { iss: $iss, sub: $sub, email: $email, tenant_id: $tid } \
+             RETURN id",
         )
         .bind(("iss", iss.to_string()))
         .bind(("sub", sub.to_string()))
         .bind(("email", email.to_string()))
+        .bind(("tid", tenant.clone()))
         .await
         .unwrap();
     let row: Option<IdRow> = r.take(0).unwrap();
@@ -166,24 +196,11 @@ async fn create_document(
     row.unwrap().id
 }
 
-fn auth_ctx(user: &RecordId, tenant: &RecordId, sub: &str) -> AuthContext {
-    AuthContext {
-        user_id: user.clone(),
-        tenant_id: tenant.clone(),
-        email: format!("{sub}@test"),
-        display_name: Some(sub.into()),
-        iss: "https://idp.test/".into(),
-        sub: sub.into(),
-        roles: vec!["member".into()],
-        is_dev: false,
-    }
-}
 
 #[tokio::test]
 async fn alice_cannot_read_bobs_documents() {
     let w = build_world("xtenant_read").await;
-    let alice_ctx = auth_ctx(&w.alice, &w.tenant_a, "alice");
-    let token = w.signer.sign(&alice_ctx).expect("sign");
+    let token = mint_jwt("https://idp.test/", "alice", &w.ns);
 
     w.system
         .raw()
@@ -211,8 +228,7 @@ async fn alice_cannot_read_bobs_documents() {
 #[tokio::test]
 async fn alice_cannot_read_bobs_document_by_id() {
     let w = build_world("xtenant_read_by_id").await;
-    let alice_ctx = auth_ctx(&w.alice, &w.tenant_a, "alice");
-    let token = w.signer.sign(&alice_ctx).expect("sign");
+    let token = mint_jwt("https://idp.test/", "alice", &w.ns);
 
     w.system
         .raw()
@@ -241,8 +257,7 @@ async fn alice_cannot_read_bobs_document_by_id() {
 #[tokio::test]
 async fn alice_cannot_create_doc_in_bobs_tenant() {
     let w = build_world("xtenant_create").await;
-    let alice_ctx = auth_ctx(&w.alice, &w.tenant_a, "alice");
-    let token = w.signer.sign(&alice_ctx).expect("sign");
+    let token = mint_jwt("https://idp.test/", "alice", &w.ns);
 
     w.system
         .raw()
@@ -277,8 +292,7 @@ async fn alice_cannot_create_doc_in_bobs_tenant() {
 
     // Re-authenticate as a tenant_b session to verify nothing was
     // created.
-    let bob_ctx = auth_ctx(&w.bob, &w.tenant_b, "bob");
-    let bob_token = w.signer.sign(&bob_ctx).expect("sign bob");
+    let bob_token = mint_jwt("https://idp.test/", "bob", &w.ns);
     w.system.raw().authenticate(&bob_token).await.expect("auth bob");
 
     let docs: Vec<serde_json::Value> = w
@@ -298,8 +312,7 @@ async fn alice_cannot_create_doc_in_bobs_tenant() {
 #[tokio::test]
 async fn alice_cannot_mark_bobs_doc_read() {
     let w = build_world("xtenant_feedread").await;
-    let alice_ctx = auth_ctx(&w.alice, &w.tenant_a, "alice");
-    let token = w.signer.sign(&alice_ctx).expect("sign");
+    let token = mint_jwt("https://idp.test/", "alice", &w.ns);
 
     w.system
         .raw()
@@ -325,8 +338,7 @@ async fn alice_cannot_mark_bobs_doc_read() {
         .await;
 
     // Verify nothing landed.
-    let bob_ctx = auth_ctx(&w.bob, &w.tenant_b, "bob");
-    let bob_token = w.signer.sign(&bob_ctx).expect("sign bob");
+    let bob_token = mint_jwt("https://idp.test/", "bob", &w.ns);
     w.system.raw().authenticate(&bob_token).await.expect("auth bob");
 
     let rows: Vec<serde_json::Value> = w
@@ -343,8 +355,7 @@ async fn alice_cannot_mark_bobs_doc_read() {
 #[tokio::test]
 async fn alice_can_read_and_mark_her_own_document() {
     let w = build_world("xtenant_happy").await;
-    let alice_ctx = auth_ctx(&w.alice, &w.tenant_a, "alice");
-    let token = w.signer.sign(&alice_ctx).expect("sign");
+    let token = mint_jwt("https://idp.test/", "alice", &w.ns);
 
     w.system
         .raw()

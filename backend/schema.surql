@@ -16,10 +16,19 @@
 -- 1. Application layer (Phase 1): every `Storage` method takes
 --    `tenant: &RecordId` and writes / filters by it.
 -- 2. Engine layer (Phase 2): `PERMISSIONS` clauses on each domain
---    table reference `$token.tenant_id` from the JWT minted per-request
---    by the backend. A request that authenticates as a record user
---    via `DEFINE ACCESS … TYPE RECORD WITH JWT` cannot read or write
+--    table reference `$auth.tenant_id` — the tenant the authenticated
+--    user belongs to, materialized onto `app_user` by `ensure_user`.
+--    A request that authenticates as a record user via
+--    `DEFINE ACCESS … TYPE RECORD WITH JWT` cannot read or write
 --    cross-tenant — engine refuses.
+--
+-- Why `$auth.tenant_id` not `$token.tenant_id`: the JWT's `tenant_id`
+-- claim is a slug emitted by the IdP (e.g. `tenant-a`). Comparing it
+-- to a record link requires either a `type::thing()` cast (only safe
+-- if the IdP emits the full `tenant:slug` form) or a subquery per row.
+-- Denormalizing the user's tenant onto `app_user.tenant_id` lets us
+-- compare record-to-record directly and keeps the IdP unaware of
+-- SurrealDB's record-id formatting.
 --
 -- System users (`Root` / NS / DB owner-editor) bypass `PERMISSIONS`
 -- entirely. The backend's `SystemDb` connection is a system user, so
@@ -52,7 +61,7 @@ DEFINE ANALYZER IF NOT EXISTS text_en
 -- role/billing fields cleanly. Listed first so domain tables can FK to it.
 -- ===========================================================================
 DEFINE TABLE IF NOT EXISTS tenant SCHEMAFULL
-    PERMISSIONS FOR select WHERE id = $token.tenant_id;
+    PERMISSIONS FOR select WHERE id = $auth.tenant_id;
 DEFINE FIELD IF NOT EXISTS slug               ON tenant TYPE string
     ASSERT string::len($value) > 0 AND $value = string::lowercase($value);
 DEFINE FIELD IF NOT EXISTS name               ON tenant TYPE string;
@@ -63,12 +72,18 @@ DEFINE FIELD IF NOT EXISTS created_at         ON tenant TYPE datetime DEFAULT ti
 DEFINE FIELD IF NOT EXISTS metadata           ON tenant FLEXIBLE TYPE object DEFAULT {};
 DEFINE INDEX IF NOT EXISTS tenant_slug        ON tenant FIELDS slug UNIQUE;
 
+-- `tenant_id` is denormalized from `membership` so PERMISSIONS clauses on
+-- other tables can compare to `$auth.tenant_id` without a subquery. Set by
+-- `ensure_user` on every login. v1 enforces single-tenant per user at the
+-- application layer; if/when multi-tenant lands, the model becomes
+-- "active tenant" with a token claim selecting which membership to bind.
 DEFINE TABLE IF NOT EXISTS app_user SCHEMAFULL
     PERMISSIONS FOR select WHERE id = $auth.id;
 DEFINE FIELD IF NOT EXISTS iss          ON app_user TYPE string;
 DEFINE FIELD IF NOT EXISTS sub          ON app_user TYPE string;
 DEFINE FIELD IF NOT EXISTS email        ON app_user TYPE string;
 DEFINE FIELD IF NOT EXISTS display_name ON app_user TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS tenant_id    ON app_user TYPE record<tenant>;
 DEFINE FIELD IF NOT EXISTS created_at   ON app_user TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS last_seen_at ON app_user TYPE option<datetime>;
 DEFINE INDEX IF NOT EXISTS app_user_identity ON app_user FIELDS iss, sub UNIQUE;
@@ -77,7 +92,7 @@ DEFINE INDEX IF NOT EXISTS app_user_email    ON app_user FIELDS email;
 -- membership: which tenant(s) does an app_user belong to.
 -- v1 enforces single-membership at the API; schema permits multi.
 DEFINE TABLE IF NOT EXISTS membership SCHEMAFULL
-    PERMISSIONS FOR select WHERE user = $auth.id AND tenant_id = type::thing($token.tenant_id);
+    PERMISSIONS FOR select WHERE user = $auth.id AND tenant_id = $auth.tenant_id;
 DEFINE FIELD IF NOT EXISTS user      ON membership TYPE record<app_user>;
 -- legacy `tenant` field (pre-tenancy schema) — drop on apply if present.
 REMOVE FIELD IF EXISTS tenant ON membership;
@@ -98,8 +113,8 @@ DEFINE INDEX IF NOT EXISTS membership_tenant_id      ON membership FIELDS tenant
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS document SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id)
-        FOR create WHERE tenant_id = type::thing($token.tenant_id);
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id
+        FOR create WHERE tenant_id = $auth.tenant_id;
 
 DEFINE FIELD IF NOT EXISTS tenant_id    ON document TYPE record<tenant>
     ASSERT $value != NONE;
@@ -137,8 +152,8 @@ DEFINE INDEX IF NOT EXISTS document_content_hash     ON document FIELDS content_
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS document_content SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id)
-        FOR create WHERE tenant_id = type::thing($token.tenant_id);
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id
+        FOR create WHERE tenant_id = $auth.tenant_id;
 
 DEFINE FIELD IF NOT EXISTS tenant_id    ON document_content TYPE record<tenant>
     ASSERT $value != NONE;
@@ -158,8 +173,8 @@ DEFINE INDEX IF NOT EXISTS document_content_text      ON document_content FIELDS
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS chunk SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id)
-        FOR create WHERE tenant_id = type::thing($token.tenant_id);
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id
+        FOR create WHERE tenant_id = $auth.tenant_id;
 
 DEFINE FIELD IF NOT EXISTS tenant_id       ON chunk TYPE record<tenant>
     ASSERT $value != NONE;
@@ -186,8 +201,8 @@ DEFINE INDEX IF NOT EXISTS chunk_embedding ON chunk FIELDS embedding HNSW DIMENS
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS document_version SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id)
-        FOR create WHERE tenant_id = type::thing($token.tenant_id);
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id
+        FOR create WHERE tenant_id = $auth.tenant_id;
 
 DEFINE FIELD IF NOT EXISTS tenant_id      ON document_version TYPE record<tenant>
     ASSERT $value != NONE;
@@ -208,8 +223,8 @@ DEFINE INDEX IF NOT EXISTS document_version_tenant_id ON document_version FIELDS
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS source_state SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id)
-        FOR create WHERE tenant_id = type::thing($token.tenant_id);
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id
+        FOR create WHERE tenant_id = $auth.tenant_id;
 
 DEFINE FIELD IF NOT EXISTS tenant_id  ON source_state TYPE record<tenant>
     ASSERT $value != NONE;
@@ -228,8 +243,8 @@ DEFINE INDEX IF NOT EXISTS source_state_tenant_adapter ON source_state FIELDS te
 -- ---------------------------------------------------------------------------
 DEFINE TABLE IF NOT EXISTS feed_read SCHEMAFULL
     PERMISSIONS
-        FOR select, delete WHERE tenant_id = type::thing($token.tenant_id) AND user = $auth.id
-        FOR create WHERE tenant_id = type::thing($token.tenant_id) AND user = $auth.id;
+        FOR select, delete WHERE tenant_id = $auth.tenant_id AND user = $auth.id
+        FOR create WHERE tenant_id = $auth.tenant_id AND user = $auth.id;
 DEFINE FIELD IF NOT EXISTS tenant_id ON feed_read TYPE record<tenant>
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS user      ON feed_read TYPE record<app_user>;
@@ -254,8 +269,8 @@ DEFINE INDEX IF NOT EXISTS feed_read_tenant_id ON feed_read FIELDS tenant_id;
 -- ===========================================================================
 DEFINE TABLE IF NOT EXISTS conversation SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id) AND user = $auth.id
-        FOR create WHERE tenant_id = type::thing($token.tenant_id) AND user = $auth.id;
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id AND user = $auth.id
+        FOR create WHERE tenant_id = $auth.tenant_id AND user = $auth.id;
 REMOVE FIELD IF EXISTS tenant ON conversation;
 DEFINE FIELD IF NOT EXISTS tenant_id  ON conversation TYPE record<tenant>
     ASSERT $value != NONE;
@@ -270,8 +285,8 @@ DEFINE INDEX IF NOT EXISTS conversation_updated_at  ON conversation FIELDS updat
 
 DEFINE TABLE IF NOT EXISTS message SCHEMAFULL
     PERMISSIONS
-        FOR select, update, delete WHERE tenant_id = type::thing($token.tenant_id)
-        FOR create WHERE tenant_id = type::thing($token.tenant_id);
+        FOR select, update, delete WHERE tenant_id = $auth.tenant_id
+        FOR create WHERE tenant_id = $auth.tenant_id;
 REMOVE FIELD IF EXISTS tenant ON message;
 DEFINE FIELD IF NOT EXISTS conversation   ON message TYPE record<conversation>;
 DEFINE FIELD IF NOT EXISTS tenant_id      ON message TYPE record<tenant>
