@@ -6,10 +6,10 @@ name: delphi-full
 #   browser → traefik (:80) → frontend (Vite)
 #                           → backend (:8081)        [forward-auth required]
 #                           → oauth2-proxy (:4180)   [/oauth2/*]
-#   browser → dex (:5556)                            [login UI, host-exposed]
+#   browser → keycloak (:8088)                       [login UI, host-exposed]
 #
 #   backend                 → surrealdb
-#   oauth2-proxy            → dex                    [token redemption]
+#   oauth2-proxy            → keycloak               [token redemption]
 #                           → redis                  [session store]
 #
 # Goal: validate the auth perimeter end-to-end against the same primitives
@@ -33,7 +33,7 @@ services:
       - --configFile=/etc/traefik/traefik.yml
     ports:
       - "80:80"
-      - "8088:8080"   # Traefik dashboard
+      - "8089:8080"   # Traefik dashboard (Keycloak owns 8088)
     volumes:
       - ./ops/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./ops/traefik/dynamic:/etc/traefik/dynamic:ro
@@ -42,19 +42,36 @@ services:
       - backend
       - frontend
 
-  dex:
-    image: dexidp/dex:v2.39.1
-    container_name: delphi-full-dex
-    command: ["dex", "serve", "/etc/dex/config.yaml"]
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0.6
+    container_name: delphi-full-keycloak
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      # The issuer URL emitted in token claims. Browser must be able to
+      # reach this URL; oauth2-proxy reaches the same Keycloak via the
+      # docker network using overrides below.
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: "8088"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_BACKCHANNEL: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
     volumes:
-      - ./ops/dex/config.yaml:/etc/dex/config.yaml:ro
+      - ./ops/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
     ports:
-      # Exposed on host so the browser can hit Dex directly during the
-      # OIDC redirect dance — see ops/dex/config.yaml for the URL split.
-      - "5556:5556"
+      # Browser hits Keycloak directly during the OIDC redirect dance
+      # at this host port.
+      - "8088:8080"
 
   oauth2-proxy:
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+    # Pinned to v7.4.0: v7.6 tightened alpha-config to forbid overlap
+    # with legacy cfg keys (provider/upstream/server), which forced an
+    # all-or-nothing migration that the rest of the stack didn't need.
+    # Sticking with v7.4 keeps the legacy-cfg + injectRequestHeaders-only
+    # alpha split working.
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.4.0
     container_name: delphi-full-oauth2-proxy
     command:
       - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
@@ -64,11 +81,11 @@ services:
       - ./ops/oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
     extra_hosts:
       # Lets the in-container `localhost` of the issuer URL resolve to the
-      # docker host, so oauth2-proxy can reach Dex on the host-exposed port
-      # if it falls back to the issuer URL during validation.
+      # docker host, so oauth2-proxy can reach Keycloak on the host-exposed
+      # port if it falls back to the issuer URL during validation.
       - "host.docker.internal:host-gateway"
     depends_on:
-      - dex
+      - keycloak
       - redis
 
   redis:
@@ -108,18 +125,22 @@ services:
     environment:
       STORAGE_BACKEND: surreal
       SURREAL_URL: ws://surrealdb:8000/rpc
-      # Service-account credentials. Production guard rejects 'root' / unset
-      # under RUST_ENV=production — operator must provide real values.
-      SURREAL_SERVICE_USER: ${SURREAL_SERVICE_USER:?required for tier-2 stack}
-      SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:?required for tier-2 stack}
+      # Service-account credentials. Defaults are 'root' for the dev
+      # bring-up; production guard refuses these defaults when
+      # RUST_ENV=production, so a real prod deployment must override.
+      SURREAL_SERVICE_USER: ${SURREAL_SERVICE_USER:-root}
+      SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:-root}
       SURREAL_NS: delphi
       SURREAL_DB: main
-      SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-default}
+      SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-tenant-a}
       BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
       AUTH_MODE: header
-      RUST_ENV: production
-      DEFAULT_TENANT_SLUG: default
+      # Default to development for tier-2 dev. Set RUST_ENV=production
+      # for a real deployment — the runtime guard then refuses to
+      # start with default Surreal credentials.
+      RUST_ENV: ${RUST_ENV:-development}
+      DEFAULT_TENANT_SLUG: ${DEFAULT_TENANT_SLUG:-tenant-a}
       LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
       LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}

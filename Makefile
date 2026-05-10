@@ -31,11 +31,12 @@ ps: ## Tier 1: show service status
 
 # ----- Tier 2: full prod-shape stack ---------------------------------------
 # surrealdb + backend (header mode, no dev-auth) + frontend +
-# traefik + dex (OIDC IdP) + oauth2-proxy (BFF) + redis (session store).
+# traefik + keycloak (OIDC IdP) + oauth2-proxy (BFF) + redis (session store).
 full-up: ## Tier 2: full prod-shape stack
 	docker compose -f docker-compose.full.yml up -d --build
-	@echo "open http://localhost  (login: alice@delphi.test / alice)"
-	@echo "traefik dashboard: http://localhost:8088    dex: http://localhost:5556"
+	@echo "open http://localhost  (login: alice / alice  or  bob / bob)"
+	@echo "keycloak admin: http://localhost:8088  (admin/admin)"
+	@echo "traefik dashboard: http://localhost:8089"
 
 full-down: ## Tier 2: stop services (keep volumes)
 	docker compose -f docker-compose.full.yml down

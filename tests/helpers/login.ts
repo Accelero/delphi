@@ -1,29 +1,41 @@
 /**
- * OIDC login helper for Tier 2. Drives Dex's login form once at the start
- * of a test, then Playwright's storage-state takes over and subsequent
- * navigations are pre-authenticated.
+ * OIDC login helper for Tier 2. Drives Keycloak's login form once at the
+ * start of a test, then Playwright's storage-state takes over and
+ * subsequent navigations are pre-authenticated.
  *
- * The credentials match the static-password user defined in
- * `ops/dex/config.yaml`. If you change one, update the other.
+ * The credentials match users defined in `ops/keycloak/realm-export.json`.
+ * Two seeded users:
+ *   - alice@delphi.test  (tenant-a, roles: member, owner)
+ *   - bob@delphi.test    (tenant-b, roles: member)
  */
 
 import type { Page } from "@playwright/test";
 
-export const DEX_USER = {
-  email: "alice@delphi.test",
-  password: "alice",
+export const KEYCLOAK_USERS = {
+  alice: { username: "alice", password: "alice", tenant: "tenant-a" },
+  bob:   { username: "bob",   password: "bob",   tenant: "tenant-b" },
 } as const;
 
-export async function loginViaDex(page: Page): Promise<void> {
-  // Hitting any protected URL kicks off the OIDC chain → Dex login form.
-  await page.goto("/api/auth/me");
+export type KeycloakUser = keyof typeof KEYCLOAK_USERS;
 
-  // Dex's static-password connector form fields.
-  await page.getByLabel(/email/i).fill(DEX_USER.email);
-  await page.getByLabel(/password/i).fill(DEX_USER.password);
-  await page.getByRole("button", { name: /login/i }).click();
+export async function loginViaKeycloak(
+  page: Page,
+  who: KeycloakUser = "alice",
+): Promise<void> {
+  const user = KEYCLOAK_USERS[who];
+
+  // /oauth2/sign_in (with skip_provider_button=true) redirects straight
+  // to the Keycloak login form. Going through /api/auth/me would just
+  // 401 with no redirect — the SPA navigates on 401, but Playwright
+  // page.goto doesn't.
+  await page.goto("/oauth2/sign_in");
+
+  // Keycloak's default login form has `username` and `password` inputs.
+  await page.locator("#username").fill(user.username);
+  await page.locator("#password").fill(user.password);
+  await page.locator("#kc-login").click();
 
   // After callback we should land on the SPA. `waitForURL` covers the
-  // brief redirect chain (Dex → oauth2-proxy callback → original URL).
+  // redirect chain (Keycloak → oauth2-proxy callback → original URL).
   await page.waitForURL(/^http:\/\/localhost\/(api\/)?/);
 }

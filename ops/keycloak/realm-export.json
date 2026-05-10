@@ -1,0 +1,116 @@
+{
+  "realm": "delphi",
+  "enabled": true,
+  "displayName": "Delphi (dev)",
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 1800,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+
+  "roles": {
+    "realm": [
+      { "name": "member", "description": "Standard tenant member" },
+      { "name": "owner",  "description": "Tenant owner — can ingest, admin within tenant" },
+      { "name": "ingester", "description": "Service account allowed to POST /api/ingestion/documents" }
+    ]
+  },
+
+  "groups": [
+    { "name": "tenant-a" },
+    { "name": "tenant-b" }
+  ],
+
+  "users": [
+    {
+      "username": "alice",
+      "email": "alice@delphi.test",
+      "emailVerified": true,
+      "firstName": "Alice",
+      "lastName": "Test",
+      "enabled": true,
+      "credentials": [
+        { "type": "password", "value": "alice", "temporary": false }
+      ],
+      "realmRoles": ["member", "owner"],
+      "groups": ["tenant-a"],
+      "attributes": {
+        "tenant_id": ["tenant-a"]
+      }
+    },
+    {
+      "username": "bob",
+      "email": "bob@delphi.test",
+      "emailVerified": true,
+      "firstName": "Bob",
+      "lastName": "Test",
+      "enabled": true,
+      "credentials": [
+        { "type": "password", "value": "bob", "temporary": false }
+      ],
+      "realmRoles": ["member"],
+      "groups": ["tenant-b"],
+      "attributes": {
+        "tenant_id": ["tenant-b"]
+      }
+    }
+  ],
+
+  "clients": [
+    {
+      "clientId": "delphi-dev",
+      "name": "Delphi dev client",
+      "enabled": true,
+      "publicClient": false,
+      "secret": "keycloak-app-secret-please-change",
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost/oauth2/callback",
+        "http://localhost/*"
+      ],
+      "webOrigins": [
+        "http://localhost"
+      ],
+      "protocol": "openid-connect",
+      "attributes": {
+        "access.token.lifespan": "1800"
+      },
+      "protocolMappers": [
+        {
+          "name": "tenant_id-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "config": {
+            "user.attribute": "tenant_id",
+            "claim.name": "tenant_id",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "multivalued": "false"
+          }
+        },
+        {
+          "name": "roles-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "multivalued": "true"
+          }
+        }
+      ]
+    }
+  ]
+}

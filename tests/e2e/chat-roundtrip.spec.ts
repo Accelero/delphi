@@ -1,7 +1,7 @@
 /**
  * Smoke test: load the SPA, verify the chat surface mounts and the user
  * is authenticated. Runs in both tiers — the difference is who issued
- * identity (the dev injector vs Dex via oauth2-proxy).
+ * identity (the dev injector vs Keycloak via oauth2-proxy).
  *
  * Untagged: tier1 (grepInvert `/@tier2/`) and tier2 (no filter) both run it.
  * Add `@tier2` to a test title to scope it to the full-stack project only.
@@ -13,7 +13,7 @@
 
 import { test, expect } from "@playwright/test";
 
-import { loginViaDex } from "../helpers/login";
+import { loginViaKeycloak } from "../helpers/login";
 
 test("chat surface is reachable and user is signed in", async ({
   page,
@@ -21,7 +21,7 @@ test("chat surface is reachable and user is signed in", async ({
 }) => {
   // Tier 2 needs a login dance; Tier 1 auto-authenticates via dev-auth.
   if (baseURL && new URL(baseURL).port !== "5173") {
-    await loginViaDex(page);
+    await loginViaKeycloak(page);
   }
 
   await page.goto("/");

@@ -1,15 +1,43 @@
-# oauth2-proxy alpha-config: maps verified JWT claims to the canonical
-# `X-Auth-*` headers the backend reads.
+# oauth2-proxy alpha-config (single source of truth).
 #
-# Why a separate config: the legacy CLI flags (`--set-xauthrequest`) only
-# emit a fixed set of `X-Auth-Request-*` names. The backend's contract
-# (per docs/ARCH.md) is `X-Auth-*` without the `Request` infix, so we use
-# the alpha-config `injectRequestHeaders` block to control names exactly.
-#
-# Each header maps to a JWT claim. Missing claims produce no header → the
-# backend's `HeaderClaimsExtractor` treats it as absent (and either falls
-# back to defaults or 401s, depending on whether the header is required).
+# v7.4+ when --alpha-config is provided, the alpha schema covers every
+# config block. We can't split with the legacy cfg anymore — alpha
+# claims ownership of all overlapping keys and rejects them in legacy.
+# So this file holds the full provider / upstream / server / header
+# configuration. Cookie / session / domain options pass via legacy cfg.
 
+server:
+  BindAddress: 0.0.0.0:4180
+
+providers:
+  - id: keycloak-dev
+    name: "Keycloak (dev)"
+    provider: oidc
+    clientID: delphi-dev
+    clientSecret: keycloak-app-secret-please-change
+    loginURL: http://localhost:8088/realms/delphi/protocol/openid-connect/auth
+    redeemURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/token
+    profileURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/userinfo
+    oidcConfig:
+      issuerURL: http://localhost:8088/realms/delphi
+      skipDiscovery: true
+      jwksURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
+      emailClaim: email
+      userIDClaim: sub
+      audienceClaims: [aud]
+      insecureSkipNonce: true
+
+# Forward-auth mode: oauth2-proxy proxies nothing of its own. Traefik
+# calls /oauth2/auth per request; static://202 keeps oauth2-proxy
+# happy without a real upstream.
+upstreamConfig:
+  upstreams:
+    - id: static
+      path: /
+      static: true
+      staticCode: 202
+
+# Custom header names — what the backend's HeaderClaimsExtractor reads.
 injectRequestHeaders:
   - name: X-Auth-User-Id
     values:
@@ -23,14 +51,13 @@ injectRequestHeaders:
   - name: X-Auth-Name
     values:
       - claim: preferred_username
-  # Tenant: we map the OIDC `groups` claim — the convention is that each
-  # user's first group is the tenant slug. With Dex's static-password
-  # connector there are no groups today, so this header is absent in dev
-  # and the backend falls back to DEFAULT_TENANT_SLUG. Swap Dex for an IdP
-  # with real groups and the multi-tenant path lights up.
+  # Tenant: Keycloak emits this from a user-attribute mapper (see
+  # ops/keycloak/realm-export.json).
   - name: X-Auth-Tenant-Id
     values:
-      - claim: groups
+      - claim: tenant_id
+  # Roles: realm-role mapper produces a top-level `roles` array.
+  # oauth2-proxy joins arrays with commas; the backend splits.
   - name: X-Auth-Roles
     values:
       - claim: roles
