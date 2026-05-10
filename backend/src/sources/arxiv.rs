@@ -1,17 +1,45 @@
 //! arXiv adapter.
 //!
-//! Polls the arXiv search API (Atom XML, sorted desc by submittedDate),
-//! downloads each new paper's PDF into the configured `ObjectStore`,
-//! shells out to `pdftotext` for body extraction, and yields fully-formed
-//! `IngestRequest`s for the scheduler to filter + ingest.
+//! Polls the arXiv search API (Atom XML) for papers submitted strictly
+//! after a per-adapter cursor, downloads each new paper's PDF into the
+//! configured `ObjectStore`, shells out to `pdftotext` for body
+//! extraction, and yields fully-formed `IngestRequest`s for the
+//! scheduler to filter + ingest.
 //!
-//! Cursor shape: `{ "last_published": "<RFC3339>" }`. arXiv's API has no
-//! `since` filter, so we rely on the desc sort + client-side cutoff.
+//! ## Incremental polling
+//!
+//! arXiv's `search_query` accepts a `submittedDate:[X+TO+Y]` range
+//! filter (minute-precision GMT). We append that to the user's query
+//! using the cursor as the lower bound and sort `submittedDate`
+//! ascending — so each cycle returns the **N oldest papers newer than
+//! the cursor**. The newest `published` we see becomes the next cursor.
+//!
+//! Cursor shape: `{ "last_published": "<RFC3339>" }`. Per cycle the
+//! lower bound is `max(cursor, now - ARXIV_MAX_STALENESS_SECS)` —
+//! `ARXIV_MAX_STALENESS_SECS` (default 7 days) guarantees the discovered
+//! content is never older than that. Concretely:
+//!
+//! - First start (no cursor) → fetch from `now - max_staleness`.
+//! - Healthy steady-state → fetch from the persisted cursor.
+//! - Returning from extended downtime → cursor is older than the
+//!   floor, so we clamp to `now - max_staleness` and skip the older
+//!   gap. Content stays bounded by the configured staleness, no
+//!   thundering-herd backfill.
+//!
+//! After each poll the cursor is set to the newest `published` we
+//! actually saw. With a bounded `ARXIV_PAGE_SIZE` (default 50) we
+//! cannot guarantee we caught up to "now" in one cycle, so the newest
+//! paper *we observed* is the only point we can safely advance to;
+//! subsequent cycles continue forward from there.
+//!
+//! Note: `submittedDate` is inclusive on both ends, so the boundary
+//! paper from the previous cycle re-appears each poll. The pipeline's
+//! content-hash dedup swallows it as `Unchanged` — cheap and correct.
 //!
 //! Slice-2 simplifications:
-//! - One page per cycle (no pagination loop). With a 6 h cadence and
-//!   page size 50, that's 200 papers/day — sufficient for live ingest.
-//!   Initial backfill of an old query is a future one-shot tool.
+//! - One page per cycle (no pagination loop). The cursor advances each
+//!   cycle, so any backlog drains over successive polls at `page_size`
+//!   per cycle.
 //! - PDF fetch failures are logged and the paper falls through with
 //!   `raw_text = None` — metadata still lands.
 //! - `pdftotext` extraction failures likewise just suppress the body;
@@ -38,8 +66,12 @@ use super::{Fetched, SourceAdapter};
 const ADAPTER_NAME: &str = "arxiv";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 21_600; // 6 h
 const DEFAULT_PAGE_SIZE: usize = 50;
+const DEFAULT_MAX_STALENESS_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 const ENDPOINT: &str = "https://export.arxiv.org/api/query";
 const PDF_FETCH_DELAY: Duration = Duration::from_secs(3);
+/// Open-ended upper bound for the `submittedDate` filter — far enough in
+/// the future that "newer than cursor" is the only effective constraint.
+const ARXIV_DATE_MAX: &str = "999912312359";
 /// arXiv asks API consumers to put a contact email in the User-Agent so
 /// they can reach out before rate-limiting an offending client. The
 /// `ARXIV_CONTACT_EMAIL` env var fills the address; if unset we fall
@@ -51,6 +83,11 @@ pub struct ArxivAdapter {
     query: String,
     poll_interval: Duration,
     page_size: usize,
+    /// Maximum age of auto-discovered content. Floors the lower bound
+    /// of every poll at `now - max_staleness`; cursor values older than
+    /// this (no cursor on first start, or a long downtime) get clamped
+    /// instead of triggering an unbounded backfill.
+    max_staleness: Duration,
     http: Client,
     object_store: Arc<dyn ObjectStore>,
 }
@@ -67,6 +104,12 @@ impl ArxivAdapter {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_PAGE_SIZE);
+        let max_staleness = Duration::from_secs(
+            std::env::var("ARXIV_MAX_STALENESS_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_MAX_STALENESS_SECS),
+        );
         let user_agent = match std::env::var("ARXIV_CONTACT_EMAIL").ok() {
             Some(email) if !email.trim().is_empty() => format!(
                 "delphi-backend/0.1 (https://github.com/Accelero/delphi; mailto:{})",
@@ -79,6 +122,7 @@ impl ArxivAdapter {
             query,
             poll_interval: Duration::from_secs(poll_interval),
             page_size,
+            max_staleness,
             http,
             object_store,
         })
@@ -143,19 +187,44 @@ impl SourceAdapter for ArxivAdapter {
         self.poll_interval
     }
     async fn fetch(&self, cursor: Option<Value>) -> Result<Fetched> {
-        let last_published = cursor
+        let cursor_ts = cursor
             .as_ref()
             .and_then(|c| c.get("last_published"))
             .and_then(|v| v.as_str())
             .and_then(parse_rfc3339);
 
+        let now = Utc::now();
+        let staleness_floor = now - self.max_staleness;
+        // Lower bound = max(cursor, staleness_floor). Both first-start
+        // (no cursor) and post-downtime (stale cursor) collapse to
+        // "fetch from staleness_floor", capping content age at the
+        // configured max staleness without backfilling further.
+        let lower_bound = cursor_ts
+            .map(|ts| ts.max(staleness_floor))
+            .unwrap_or(staleness_floor);
+        if cursor_ts.map_or(true, |ts| ts < staleness_floor) {
+            tracing::info!(
+                cursor = ?cursor_ts.map(|t| t.to_rfc3339()),
+                lower_bound = %lower_bound.to_rfc3339(),
+                max_staleness_secs = self.max_staleness.as_secs(),
+                "arxiv: cursor missing or older than max staleness — clamped to staleness floor"
+            );
+        }
+
+        let scoped_query = format!(
+            "{} AND submittedDate:[{} TO {}]",
+            self.query,
+            format_arxiv_date(lower_bound),
+            ARXIV_DATE_MAX,
+        );
+
         let resp = self
             .http
             .get(ENDPOINT)
             .query(&[
-                ("search_query", self.query.as_str()),
+                ("search_query", scoped_query.as_str()),
                 ("sortBy", "submittedDate"),
-                ("sortOrder", "descending"),
+                ("sortOrder", "ascending"),
                 ("start", "0"),
                 ("max_results", &self.page_size.to_string()),
             ])
@@ -187,19 +256,17 @@ impl SourceAdapter for ArxivAdapter {
         let entries = parse_atom_feed(&xml)?;
 
         let mut items = Vec::with_capacity(entries.len());
-        let mut newest = last_published;
+        // Cursor advances to the newest paper actually observed. If the
+        // page is empty we leave the cursor untouched — next poll will
+        // recompute the lower bound from the same (now slightly older)
+        // base, naturally moving forward as `now` advances.
+        let mut newest: Option<DateTime<Utc>> = None;
 
         for (idx, entry) in entries.into_iter().enumerate() {
             let Some(published) = parse_rfc3339(&entry.published) else {
                 tracing::warn!(id = %entry.id, ts = %entry.published, "unparseable arxiv date, skipping");
                 continue;
             };
-            if let Some(cutoff) = last_published {
-                if published <= cutoff {
-                    // sorted desc — once we hit something we've seen, the rest are older too
-                    break;
-                }
-            }
             newest = Some(newest.map_or(published, |n| n.max(published)));
 
             // arXiv courtesy: pace PDF fetches. Don't sleep before the first
@@ -336,6 +403,12 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s.trim())
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// arXiv's `submittedDate` filter wants `YYYYMMDDhhmm` GMT (minute
+/// precision).
+fn format_arxiv_date(dt: DateTime<Utc>) -> String {
+    dt.format("%Y%m%d%H%M").to_string()
 }
 
 /// Honour an HTTP `Retry-After` header: either an integer number of
@@ -487,5 +560,11 @@ to particular tasks or domains. We propose Low-Rank Adaptation, or LoRA.</summar
     fn parses_published_timestamp() {
         let dt = parse_rfc3339("2021-06-17T17:37:18Z").unwrap();
         assert_eq!(dt.to_rfc3339(), "2021-06-17T17:37:18+00:00");
+    }
+
+    #[test]
+    fn formats_date_for_arxiv_submitted_date_filter() {
+        let dt = parse_rfc3339("2021-06-17T17:37:18Z").unwrap();
+        assert_eq!(format_arxiv_date(dt), "202106171737");
     }
 }
