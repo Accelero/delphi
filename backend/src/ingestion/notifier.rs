@@ -1,5 +1,5 @@
 //! [`NotifyingSink`]: an [`IngestSink`] middleware that broadcasts a
-//! `NewDocumentEvent` after every successful first-time ingest.
+//! [`FeedItemEvent`] after every successful first-time ingest.
 //!
 //! Composed around the canonical [`Pipeline`] in `api::serve`; both the
 //! HTTP `/api/ingestion/documents` handler and the in-process scheduler
@@ -10,41 +10,44 @@
 //! Only the `Created` outcome fires an event. `Unchanged` and
 //! `Versioned` deliberately don't.
 //!
+//! Payload is the **same `FeedItem`** shape `/api/discovery/feed`
+//! returns. SPA receivers prepend it directly into the React Query
+//! cache — no extra refetch, no risk of drift between SSE and feed
+//! responses, because there's only one wire shape.
+//!
 //! Best-effort by design. The broadcast channel is bounded; if a slow
 //! SSE client falls behind, it drops events rather than blocking
 //! ingestion.
 //!
-//! Multi-tenancy: `NewDocumentEvent` carries `tenant_id`. SSE handlers
-//! filter their stream against the connection's tenant — closes audit
-//! finding C2 (no cross-tenant event leakage).
+//! Multi-tenancy: `FeedItemEvent` carries the `tenant_id` inside its
+//! [`FeedItem`] payload (under `item.document.tenant_id`). SSE
+//! handlers filter their stream against the connection's tenant —
+//! closes audit finding C2 (no cross-tenant event leakage).
 //!
 //! [`Pipeline`]: super::Pipeline
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use surrealdb::RecordId;
+use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::error::Result;
-use crate::storage::DocId;
+use crate::storage::{FeedItem, Storage};
 
 use super::{IngestOutcome, IngestRequest, IngestSink};
 
 /// Event payload broadcast by [`NotifyingSink`] on each `Created`
-/// outcome. Consumers (the SSE endpoint) re-serialize to JSON for the
-/// wire — `tenant_id` stays in the payload so the consumer can filter
-/// on it before sending to a client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewDocumentEvent {
-    pub id: DocId,
-    pub tenant_id: RecordId,
-    pub canonical_id: String,
-    pub source_type: String,
-    pub title: Option<String>,
-    pub ingested_at: DateTime<Utc>,
+/// outcome. `item` is the same [`FeedItem`] shape `/api/discovery/feed`
+/// emits — clients prepend it into their cache directly.
+///
+/// `read` inside the item is invariant `false` for any newly-created
+/// document: the row didn't exist before this ingest, so no user could
+/// have marked it read. Same payload for every subscriber — read state
+/// only diverges per-user *after* the doc enters the feed.
+#[derive(Debug, Clone, Serialize)]
+pub struct FeedItemEvent {
+    pub item: FeedItem,
 }
 
 /// Default channel capacity. Sized so even a momentary ingest burst
@@ -53,44 +56,68 @@ pub struct NewDocumentEvent {
 /// error.
 pub const DEFAULT_BROADCAST_CAPACITY: usize = 256;
 
-/// Wraps an inner [`IngestSink`] and broadcasts a [`NewDocumentEvent`]
-/// after every `Created` outcome.
+/// Wraps an inner [`IngestSink`] and broadcasts a [`FeedItemEvent`]
+/// after every `Created` outcome. Needs the [`Storage`] handle to read
+/// back the canonical `Document` (with engine-stamped `id` and
+/// `ingested_at`) before broadcasting — this guarantees the SSE event
+/// shape matches what `/api/discovery/feed` would return.
 #[derive(Clone)]
 pub struct NotifyingSink {
     inner: Arc<dyn IngestSink>,
-    tx: broadcast::Sender<NewDocumentEvent>,
+    storage: Arc<dyn Storage>,
+    tx: broadcast::Sender<FeedItemEvent>,
 }
 
 impl NotifyingSink {
-    pub fn new(inner: Arc<dyn IngestSink>, tx: broadcast::Sender<NewDocumentEvent>) -> Self {
-        Self { inner, tx }
+    pub fn new(
+        inner: Arc<dyn IngestSink>,
+        storage: Arc<dyn Storage>,
+        tx: broadcast::Sender<FeedItemEvent>,
+    ) -> Self {
+        Self { inner, storage, tx }
     }
 }
 
 #[async_trait]
 impl IngestSink for NotifyingSink {
     async fn ingest(&self, req: IngestRequest) -> Result<IngestOutcome> {
-        // Snapshot the bits we need for the event before `req` moves
-        // into the inner sink.
+        // Snapshot tenant before `req` moves into the inner sink — we
+        // need it to read the doc back below.
         let tenant_id = req.tenant_id.clone();
-        let canonical_id = req.canonical_id.clone();
-        let source_type = req.source_type.clone();
-        let title = req.title.clone();
 
         let outcome = self.inner.ingest(req).await?;
 
         if let IngestOutcome::Created { id, .. } = &outcome {
-            let event = NewDocumentEvent {
-                id: id.clone(),
-                tenant_id,
-                canonical_id,
-                source_type,
-                title,
-                ingested_at: Utc::now(),
-            };
-            // SendError just means "no subscribers" — fine in headless
-            // deployments and in tests with no SSE client connected.
-            let _ = self.tx.send(event);
+            // Read back the canonical row so the broadcast carries the
+            // engine-stamped `id` and `ingested_at`. Cost: one extra
+            // small read on first-time ingests only (Unchanged /
+            // Versioned skip this branch).
+            match self.storage.get_document(&tenant_id, id).await {
+                Ok(Some(doc)) => {
+                    let item = FeedItem {
+                        document: doc,
+                        read: false,
+                    };
+                    // SendError just means "no subscribers" — fine in
+                    // headless deployments and in tests with no SSE
+                    // client connected.
+                    let _ = self.tx.send(FeedItemEvent { item });
+                }
+                Ok(None) => {
+                    // Race against an external delete between upsert
+                    // and read. Skip the broadcast — the doc isn't
+                    // there to show.
+                    tracing::warn!(
+                        ?id,
+                        "ingested document vanished before broadcast read-back"
+                    );
+                }
+                Err(e) => {
+                    // Read failures shouldn't kill ingest; just skip the
+                    // SSE fan-out for this row.
+                    tracing::warn!(error = %e, ?id, "broadcast read-back failed");
+                }
+            }
         }
 
         Ok(outcome)
@@ -101,9 +128,10 @@ impl IngestSink for NotifyingSink {
 mod tests {
     use super::*;
     use crate::ingestion::Pipeline;
-    use crate::storage::{Storage, SystemDb};
+    use crate::storage::SystemDb;
+    use surrealdb::RecordId;
 
-    async fn fresh_sink() -> (NotifyingSink, broadcast::Receiver<NewDocumentEvent>, RecordId) {
+    async fn fresh_sink() -> (NotifyingSink, broadcast::Receiver<FeedItemEvent>, RecordId) {
         let system = SystemDb::in_memory("notifier_test", "main")
             .await
             .unwrap();
@@ -121,9 +149,9 @@ mod tests {
         let tenant = row.unwrap().id;
 
         let storage: Arc<dyn Storage> = system.storage();
-        let inner: Arc<dyn IngestSink> = Arc::new(Pipeline::new(storage));
+        let inner: Arc<dyn IngestSink> = Arc::new(Pipeline::new(storage.clone()));
         let (tx, rx) = broadcast::channel(8);
-        (NotifyingSink::new(inner, tx), rx, tenant)
+        (NotifyingSink::new(inner, storage, tx), rx, tenant)
     }
 
     fn req(tenant: &RecordId, canonical_id: &str) -> IngestRequest {
@@ -148,9 +176,12 @@ mod tests {
         let (sink, mut rx, t) = fresh_sink().await;
         sink.ingest(req(&t, "doc-1")).await.unwrap();
         let event = rx.try_recv().expect("event delivered");
-        assert_eq!(event.canonical_id, "doc-1");
-        assert_eq!(event.source_type, "test");
-        assert_eq!(event.tenant_id, t);
+        assert_eq!(event.item.document.canonical_id, "doc-1");
+        assert_eq!(event.item.document.source_type, "test");
+        assert_eq!(event.item.document.tenant_id, t);
+        assert!(event.item.document.id.is_some(), "id stamped from DB");
+        assert!(event.item.document.ingested_at.is_some(), "ingested_at stamped from DB");
+        assert!(!event.item.read, "newly created doc cannot be read");
     }
 
     #[tokio::test]

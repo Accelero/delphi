@@ -255,6 +255,15 @@ Mark items as `[x]` once a fix has been merged and verified.
   External callers go through `SystemDb` (system path) or
   `RequestDbPool` (request path) instead._
 
+- [ ] **L12.** Discovery feed: the "new" glow / chip on a freshly-arrived
+  card fades after the card has been ≥50% in view for 1s
+  (`useNewnessFade` in `frontend/src/components/discovery/Feed.tsx`).
+  Should instead persist until the user actually engages with the card
+  — fade on `mouseenter` / focus, not on dwell. Dwell-fade can clear
+  the highlight off-screen-but-rendered cards (e.g. a doc that lands
+  near the top while the user is reading further down) before they
+  ever see it.
+
 ---
 
 ## Module-structure / coupling notes

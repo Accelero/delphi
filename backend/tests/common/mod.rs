@@ -55,7 +55,7 @@ pub struct TestApp {
     /// Shared with the Discovery SSE endpoint and `NotifyingSink`. Tests
     /// can `subscribe()` to verify ingest fan-out without parsing the
     /// SSE stream.
-    pub events: tokio::sync::broadcast::Sender<delphi::ingestion::NewDocumentEvent>,
+    pub events: tokio::sync::broadcast::Sender<delphi::ingestion::FeedItemEvent>,
 }
 
 impl TestApp {
@@ -126,10 +126,13 @@ impl TestApp {
         // SystemStorage — same as the production wiring.
         let pipeline_storage: Arc<dyn Storage> = system.storage();
         let pipeline: Arc<dyn delphi::ingestion::IngestSink> =
-            Arc::new(Pipeline::new(pipeline_storage));
-        let sink: Arc<dyn delphi::ingestion::IngestSink> = Arc::new(
-            delphi::ingestion::NotifyingSink::new(pipeline, events_tx.clone()),
-        );
+            Arc::new(Pipeline::new(pipeline_storage.clone()));
+        let sink: Arc<dyn delphi::ingestion::IngestSink> =
+            Arc::new(delphi::ingestion::NotifyingSink::new(
+                pipeline,
+                pipeline_storage,
+                events_tx.clone(),
+            ));
         let state = AppState {
             llm: Arc::new(FakeLlmClient::default()),
             sink,

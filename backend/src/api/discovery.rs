@@ -38,7 +38,7 @@ use surrealdb::RecordId;
 use tokio::sync::broadcast;
 
 use crate::auth::AuthContext;
-use crate::ingestion::NewDocumentEvent;
+use crate::ingestion::FeedItemEvent;
 use crate::state::AppState;
 use crate::storage::{AuthedDb, FeedCursor, FeedItem, Storage};
 
@@ -200,7 +200,7 @@ fn sse_lifetime_with_jitter() -> Duration {
 }
 
 fn broadcast_to_sse(
-    rx: broadcast::Receiver<NewDocumentEvent>,
+    rx: broadcast::Receiver<FeedItemEvent>,
     tenant: RecordId,
     deadline: tokio::time::Instant,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
@@ -212,16 +212,16 @@ fn broadcast_to_sse(
                     biased;
                     _ = tokio::time::sleep_until(deadline) => return None,
                     recv = rx.recv() => match recv {
-                        Ok(event) if event.tenant_id == tenant => {
-                            // `json_data` only fails if the value can't be
-                            // serialized — `NewDocumentEvent` derives Serialize
-                            // and contains no exotic types, so the unwrap is
-                            // sound. If it ever isn't, we'd rather see the panic
-                            // in tests than silently drop events.
+                        Ok(event) if event.item.document.tenant_id == tenant => {
+                            // Send the FeedItem itself — same wire shape as
+                            // /api/discovery/feed items, so SPA receivers
+                            // can prepend it directly into the cache without
+                            // a refetch. `json_data` only fails on non-
+                            // serializable values; FeedItem is plain data.
                             let sse = Event::default()
                                 .event("new_document")
-                                .json_data(&event)
-                                .expect("NewDocumentEvent must serialize");
+                                .json_data(&event.item)
+                                .expect("FeedItem must serialize");
                             return Some((Ok(sse), (rx, tenant, deadline)));
                         }
                         Ok(_) => continue, // event for a different tenant — drop

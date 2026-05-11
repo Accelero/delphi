@@ -300,6 +300,7 @@ async fn ingest_broadcasts_new_document_event() {
         .await
         .expect("event should arrive within 1s")
         .expect("channel still open");
-    assert_eq!(event.canonical_id, "broadcast-doc");
-    assert_eq!(event.source_type, "test");
+    assert_eq!(event.item.document.canonical_id, "broadcast-doc");
+    assert_eq!(event.item.document.source_type, "test");
+    assert!(!event.item.read, "newly created doc cannot be read");
 }

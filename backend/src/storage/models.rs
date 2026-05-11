@@ -6,10 +6,63 @@ use surrealdb::RecordId;
 pub type DocId = RecordId;
 pub type ChunkId = RecordId;
 
+/// Serde adapter that puts an `Option<RecordId>` on the wire as the
+/// canonical `"table:key"` string instead of SurrealDB's structured
+/// form (`{tb, id: {String}}`). Symmetric — deserialize accepts both
+/// the new string form and the legacy structured form so older
+/// payloads (or direct SurrealDB query responses going through this
+/// type) keep working.
+///
+/// Storage code does *not* go through this adapter — the
+/// `DocumentWire` shape inside `storage/surreal.rs` is what touches
+/// the engine. This only affects the public-facing JSON wire (the
+/// `/api/discovery/feed` response and the SSE event payload), where
+/// emitting the structured form leaks SurrealDB internals across the
+/// boundary and breaks string-based identity comparison on the client.
+pub mod opt_record_id_str {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use surrealdb::RecordId;
+
+    pub fn serialize<S: Serializer>(v: &Option<RecordId>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(id) => s.serialize_some(&id.to_string()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<RecordId>, D::Error> {
+        // Accept either a string ("table:key") or the legacy structured
+        // form, so that data round-tripped via either shape still parses.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Str(String),
+            Structured(RecordId),
+        }
+        let parsed: Option<Wire> = Option::deserialize(d)?;
+        Ok(parsed.map(|w| match w {
+            Wire::Str(s) => match s.split_once(':') {
+                Some((tb, key)) => RecordId::from((tb, key)),
+                // Bare key without table prefix — implausible from any
+                // current producer, but be tolerant: synthesise as a
+                // `document` id (the only id-bearing public model that
+                // uses this adapter).
+                None => RecordId::from(("document", s.as_str())),
+            },
+            Wire::Structured(rid) => rid,
+        }))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     /// Populated by the backend on read; ignored on write.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Wire format: `"document:<key>"` string. See [`opt_record_id_str`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_record_id_str"
+    )]
     pub id: Option<RecordId>,
 
     /// Multi-tenancy: every domain row carries the tenant it belongs to.

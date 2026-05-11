@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::ingestion::{IngestSink, NewDocumentEvent};
+use crate::ingestion::{FeedItemEvent, IngestSink};
 use crate::llm::LlmClient;
 use crate::object_store::ObjectStore;
 
@@ -35,5 +35,5 @@ pub struct AppState {
     /// Fan-out channel for "new document accepted" events. The Discovery
     /// SSE handler subscribes per request; `NotifyingSink` (wrapping the
     /// canonical `Pipeline`) publishes on the `Created` outcome.
-    pub events: broadcast::Sender<NewDocumentEvent>,
+    pub events: broadcast::Sender<FeedItemEvent>,
 }

@@ -100,8 +100,16 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let scheduler_storage: Arc<dyn Storage> = system.storage();
     let scheduler_pipeline: Arc<dyn ingestion::IngestSink> =
         Arc::new(Pipeline::new(scheduler_storage.clone()));
-    let sink: Arc<dyn ingestion::IngestSink> =
-        Arc::new(NotifyingSink::new(scheduler_pipeline, events_tx.clone()));
+    // NotifyingSink reads back the canonical Document on `Created` so
+    // its broadcast carries the same `FeedItem` shape /api/discovery/feed
+    // returns. Hand it the same SystemStorage handle the inner pipeline
+    // uses — read path crosses no permission boundary (no user JWT in
+    // scope here).
+    let sink: Arc<dyn ingestion::IngestSink> = Arc::new(NotifyingSink::new(
+        scheduler_pipeline,
+        scheduler_storage.clone(),
+        events_tx.clone(),
+    ));
 
     let object_store: Arc<dyn ObjectStore> = object_store::from_url(
         &std::env::var("OBJECT_STORE_URL")

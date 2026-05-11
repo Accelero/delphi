@@ -37,7 +37,7 @@ import {
 } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { PaperCard } from "@/components/discovery/PaperCard";
-import { api, type FeedPage, type FeedSort } from "@/lib/api";
+import { api, type FeedDocument, type FeedPage, type FeedSort } from "@/lib/api";
 import { useFeedEvents } from "@/hooks/useFeedEvents";
 
 const PAGE_LIMIT = 50;
@@ -81,12 +81,15 @@ export function Feed() {
     });
   };
 
-  // SSE arrival → mark id as new + refetch first page so the full
-  // record (with summary, authors, etc.) lands. Refetching only the
-  // first page keeps load-more state intact.
-  useFeedEvents((event) => {
-    setNewSet((prev) => new Set(prev).add(event.id));
-    void queryClient.invalidateQueries({ queryKey, exact: true });
+  // SSE arrival → prepend the FeedItem directly into the cache. The
+  // event payload IS a FeedDocument (same wire shape /api/discovery/feed
+  // returns), so no refetch is needed. Dedup by id covers the rare race
+  // where the initial page-fetch already includes the doc.
+  useFeedEvents((item) => {
+    setNewSet((prev) => new Set(prev).add(item.id));
+    queryClient.setQueryData<InfiniteData<FeedPage>>(queryKey, (old) =>
+      prependItem(old, item),
+    );
   });
 
   // Mark-read / unread mutations: optimistic, with rollback on error.
@@ -211,6 +214,24 @@ function rollbackReadFlip(
   ctx: ReadFlipCtx | undefined,
 ) {
   if (ctx?.prev) qc.setQueryData(queryKey, ctx.prev);
+}
+
+/** Prepend a freshly-arrived `FeedDocument` to the first page of the
+ *  cached infinite-feed. Dedups by id so an SSE arrival that races the
+ *  initial page-fetch doesn't double-render. Returns `old` unchanged if
+ *  the cache hasn't been seeded yet (the initial query will then load
+ *  the first page including this item, no prepend needed). */
+function prependItem(
+  old: InfiniteData<FeedPage> | undefined,
+  item: FeedDocument,
+): InfiniteData<FeedPage> | undefined {
+  if (!old || old.pages.length === 0) return old;
+  const [first, ...rest] = old.pages;
+  if (first.items.some((it) => it.id === item.id)) return old;
+  return {
+    ...old,
+    pages: [{ ...first, items: [item, ...first.items] }, ...rest],
+  };
 }
 
 /** Tracks the app's scroll container (`#app-scroll` in __root.tsx).

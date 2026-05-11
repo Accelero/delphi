@@ -1,10 +1,14 @@
 /**
  * Subscribe to the Discovery feed's SSE stream.
  *
- * Opens one `EventSource` per mount and forwards `new_document` records
- * to the supplied handler. Uses the standard "ref-stable handler" idiom
- * so consumers can pass an inline callback without recreating the
- * EventSource on every render.
+ * Opens one `EventSource` per mount and forwards each `new_document`
+ * payload to the supplied handler. The wire shape **is** a
+ * `FeedDocument` — same as what `/api/discovery/feed` returns — so the
+ * caller can prepend it directly into the React Query cache without an
+ * extra refetch.
+ *
+ * Uses the standard "ref-stable handler" idiom so consumers can pass an
+ * inline callback without recreating the EventSource on every render.
  *
  * Browser auto-reconnects on transient drops. We don't surface
  * connection state in v1; if the stream stays down the user just won't
@@ -12,18 +16,9 @@
  */
 import { useEffect, useRef } from "react";
 
-import { api } from "@/lib/api";
+import { api, type FeedDocument } from "@/lib/api";
 
-/** Wire shape mirrors `ingestion::NewDocumentEvent` on the backend. */
-export type NewDocumentEvent = {
-  id: string;
-  canonical_id: string;
-  source_type: string;
-  title: string | null;
-  ingested_at: string;
-};
-
-export function useFeedEvents(onNewDocument: (e: NewDocumentEvent) => void): void {
+export function useFeedEvents(onNewDocument: (item: FeedDocument) => void): void {
   const handlerRef = useRef(onNewDocument);
   handlerRef.current = onNewDocument;
 
@@ -31,8 +26,8 @@ export function useFeedEvents(onNewDocument: (e: NewDocumentEvent) => void): voi
     const es = new EventSource(api.discovery.eventsUrl);
     const listener = (ev: MessageEvent) => {
       try {
-        const data = JSON.parse(ev.data) as NewDocumentEvent;
-        handlerRef.current(data);
+        const item = JSON.parse(ev.data) as FeedDocument;
+        handlerRef.current(item);
       } catch (err) {
         // Don't crash the page over a malformed event; log and skip.
         // eslint-disable-next-line no-console
