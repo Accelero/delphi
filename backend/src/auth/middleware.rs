@@ -71,7 +71,7 @@ pub async fn identity_middleware(
     {
         Ok(a) => a,
         Err(e) => {
-            tracing::error!(error = %e, "user upsert failed");
+            tracing::error!(error = ?e, "user upsert failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, "auth setup failed").into_response();
         }
     };

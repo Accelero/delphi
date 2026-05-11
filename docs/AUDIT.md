@@ -316,52 +316,37 @@ Mark items as `[x]` once a fix has been merged and verified.
   has documented the cookie/session/server fields more clearly, and
   collapse to a single config file.
 
-- [ ] **N5.** Tier-2 e2e regression: `db.authenticate` against
-  Keycloak's JWKS fails with a generic `surrealdb: There was a
-  problem with the database: There was a problem with authentication`
-  on every request. Both Playwright tier-2 specs
-  (`chat-roundtrip`, `tenant-isolation @tier2`) fail in a 401-redirect
-  loop. **Tier-2 was reported passing at commit `131b93c` (Phase 2
-  wiring), but reproduces as failing at that exact commit now** —
-  so this is environmental drift the audit didn't catch, not a
-  regression introduced by N1.
+- [x] **N5.** Tier-2 e2e regression: `db.authenticate` against
+  Keycloak's JWKS failed with a generic "There was a problem with
+  authentication" on every request.
 
-  What's confirmed working independently:
-  - SurrealDB can reach the JWKS endpoint inside the compose network
-    (`http::get('http://keycloak:8080/.../certs')` returns the keyset).
-  - Keycloak emits a valid RS256-signed JWT with a `kid` matching
-    the signing key in JWKS.
-  - The backend's `JwtClaimsExtractor` decodes the payload fine
-    (it doesn't validate signatures).
-  - Tier-1 (HS512, same `define_jwt_access` code path) works
-    end-to-end, including the AUTHENTICATE clause.
+  _Resolved: two distinct bugs were stacked._
 
-  Candidate causes left to investigate (in rough order of likelihood):
-  1. SurrealDB 2.1.4's JWKS handling picking the wrong key when
-     multiple `use` values are present (Keycloak emits both an
-     `enc` and a `sig` key — kid-matching ought to disambiguate
-     but maybe doesn't).
-  2. The AUTHENTICATE clause throwing because the `app_user` row
-     isn't yet in the namespace SurrealDB validates against (NS
-     mismatch between `ensure_user`'s SystemDb context and the
-     RECORD-session context).
-  3. Default `--allow-net=none` blocking the JWKS fetch (compose
-     now passes `--allow-net=keycloak:8080`; included as a precaution
-     in this commit but not confirmed as the root cause).
-  4. A token claim SurrealDB requires that Keycloak doesn't emit
-     by default (`ac`, `ns`, `db` — present in our HS512 test path
-     because we add them manually).
+  _**Bug 1 — missing routing claims.** SurrealDB's `db.authenticate(jwt)`
+  uses `ac` (and `ns` / `db`) claims to route to the right access
+  method. Our HS512 paths (`auth/dev.rs::mint_dev_jwt`,
+  `tests/cross_tenant_isolation.rs::mint_jwt`, `tests/common/mod.rs`)
+  all inject them manually; vanilla Keycloak tokens carry none. Fix:
+  added three `oidc-hardcoded-claim-mapper` entries to
+  `ops/keycloak/realm-export.json` so the access token now emits
+  `ac: "app_session"`, `ns: "delphi"`, `db: "main"` alongside the
+  normal claims._
 
-  Workarounds available today:
-  - **Tier-1 stack** is fully functional (HS512 + dev injector).
-  - **Integration tests** exercise the engine-RBAC path directly
-    via `backend/tests/cross_tenant_isolation.rs` (HS512 + manual
-    `db.authenticate`). All 5 cases pass.
+  _**Bug 2 — SystemDb session race.** Phase 2 wiring's
+  `ensure_root_session` did `invalidate()` + `signin(Root)` on every
+  system-path upsert. In production the SystemDb owns its own
+  connection nothing else touches, so the sequence is unnecessary
+  and races with concurrent requests (A's signin clobbered by B's
+  invalidate before A's query runs). Tier-2's two parallel
+  Playwright workers exposed it as 500s with "IAM error: Not enough
+  permissions". Fix: added a `shared_engine` flag on `SystemDb`
+  (true only for embedded engines that share session state with the
+  pool's clones, i.e. tests); `ensure_root_session` is a no-op when
+  false._
 
-  Until N5 lands the C1 closure note still holds: PERMISSIONS
-  clauses fire on every request-path query through `AuthedDb` in
-  tier 1 and in unit tests. It's just the tier-2 Keycloak chain
-  that doesn't get to that point.
+  _Both tier-2 specs pass (`chat-roundtrip`, `tenant-isolation
+  @tier2`); tier-1 still green; full backend suite still green in
+  both feature configs._
 
 ---
 
@@ -372,11 +357,7 @@ Mark items as `[x]` once a fix has been merged and verified.
 3. ~~C3 — drop X-Auth headers, full JWT path.~~ ✓
 4. ~~C4 — fail-closed on default Surreal credentials.~~ ✓
 5. ~~N1 — tier-1 dev (JWT-minting dev injector).~~ ✓
-6. **N5 — tier-2 `db.authenticate` against Keycloak JWKS fails;
-   tier-2 e2e suite is non-functional. Without this the production
-   path is unverified and the engine-PERMISSIONS claim doesn't hold
-   end-to-end. Top priority because it gates every other tier-2 /
-   prod-shape change.**
+6. ~~N5 — tier-2 `db.authenticate` against Keycloak JWKS.~~ ✓
 7. **N3 — backend signature validation (small defence-in-depth, big posture win).**
 8. H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).
 9. H3, L2 — body size limit and per-user rate limit.

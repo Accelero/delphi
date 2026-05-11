@@ -29,42 +29,30 @@ use super::context::AuthContext;
 use super::config::DevConfig;
 use crate::storage::SystemDb;
 
-/// In test setups the `SystemDb` handle and the `RequestDbPool` slots are
-/// clones of the same in-memory connection (SurrealDB's embedded engine
-/// doesn't support multiple independent sessions over shared data). When
-/// a prior request authenticates the handle into a RECORD session via the
-/// pool, subsequent system-path operations (this file's `app_user` /
-/// `tenant` / `membership` upserts) get denied by PERMISSIONS.
+/// Reset the SystemDb session to the privileged baseline.
 ///
-/// Re-asserting Root before each upsert is the cheapest fix that keeps
-/// production and test code paths identical. In production the
-/// `SystemDb` handle is never re-authenticated as anything else (the
-/// pool owns its own connections), so this re-signin is a no-op on
-/// auth state — it just adds one RPC roundtrip per request through the
-/// privileged path.
+/// Needed **only** when the SystemDb handle shares its underlying engine
+/// with the [`crate::storage::RequestDbPool`]'s connections — i.e.
+/// embedded test mode. A prior `db.authenticate(jwt)` on a pool clone
+/// has put the shared session into RECORD mode, so the system-path
+/// upserts on `tenant` / `app_user` / `membership` would otherwise get
+/// denied by PERMISSIONS.
+///
+/// In production (remote engine) the SystemDb owns its own connection
+/// that nothing else touches; the session stays at Root from
+/// construction onwards, and `invalidate` + `signin` would just create
+/// a cross-request race where two concurrent calls clobber each
+/// other's authentication mid-query. So we skip the whole sequence
+/// when `system.shared_engine()` is `false`.
 async fn ensure_root_session(system: &SystemDb) {
-    // `invalidate` clears any RECORD session previously installed by a
-    // pool-acquire on the shared handle, dropping back to the
-    // privileged baseline (the auth state SystemDb was constructed in:
-    // remote = `Root` via signin; embedded = unauthenticated == full
-    // access). On a fresh handle this is a no-op.
-    let _ = system.raw().invalidate().await;
-    // For remote engines we additionally re-assert the Root signin,
-    // because `invalidate` drops *all* session state including the
-    // initial Root credentials. On embedded engines signin would fail
-    // (no users defined) — we skip it.
-    if let (Ok(user), Ok(pass)) = (
-        std::env::var("SURREAL_SERVICE_USER"),
-        std::env::var("SURREAL_SERVICE_PASS"),
-    ) {
-        let _ = system
-            .raw()
-            .signin(surrealdb::opt::auth::Root {
-                username: &user,
-                password: &pass,
-            })
-            .await;
+    if !system.shared_engine() {
+        return;
     }
+    // Embedded engine, shared session: drop any RECORD session installed
+    // by a pool-acquire so the privileged baseline (full access on
+    // in-memory/rocksdb) is restored. Signin is intentionally skipped
+    // because embedded engines have no Root user defined.
+    let _ = system.raw().invalidate().await;
 }
 
 #[derive(Debug, Deserialize)]

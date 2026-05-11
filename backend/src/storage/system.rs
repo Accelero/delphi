@@ -84,9 +84,23 @@ fn escape_surrealql_string(s: &str) -> String {
 
 /// Privileged SurrealDB handle. Wraps `Surreal<Any>` and exposes only the
 /// system-level operations.
+///
+/// `shared_engine` is `true` when the underlying connection is an embedded
+/// engine (`memory:`, `rocksdb:`, ...) whose session state is shared with
+/// the [`RequestDbPool`]'s clones — i.e. test-mode. In that case the
+/// system path must reset the session back to privileged baseline before
+/// each upsert, because a prior `db.authenticate(jwt)` on a pool clone
+/// has transitioned the shared session into RECORD mode.
+///
+/// In production (`ws://` / `wss://`) the SystemDb owns its own
+/// connection that nothing else touches, so this flag is `false` and the
+/// reset path is skipped — that avoids the cross-request race where
+/// concurrent `invalidate`+`signin` on a single shared handle clobbers
+/// each other.
 #[derive(Clone)]
 pub struct SystemDb {
     db: Surreal<Any>,
+    shared_engine: bool,
 }
 
 impl SystemDb {
@@ -111,7 +125,8 @@ impl SystemDb {
         database: &str,
     ) -> Result<Self> {
         let db = surrealdb::engine::any::connect(url).await?;
-        if engine_requires_auth(url) {
+        let requires_auth = engine_requires_auth(url);
+        if requires_auth {
             db.signin(Root {
                 username: user,
                 password,
@@ -119,12 +134,22 @@ impl SystemDb {
             .await?;
         }
         db.use_ns(namespace).use_db(database).await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            shared_engine: !requires_auth,
+        })
     }
 
     /// Spin up an embedded in-memory SurrealDB. **Test-only convenience.**
     pub async fn in_memory(namespace: &str, database: &str) -> Result<Self> {
         Self::connect("memory", "", "", namespace, database).await
+    }
+
+    /// True when the underlying engine is shared with pool clones (tests).
+    /// `auth/bootstrap.rs` reads this to decide whether to reset the
+    /// session to the privileged baseline before each upsert.
+    pub fn shared_engine(&self) -> bool {
+        self.shared_engine
     }
 
     /// Borrow the underlying handle. Used by `auth/bootstrap.rs` (which

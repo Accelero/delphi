@@ -109,6 +109,45 @@
             "userinfo.token.claim": "true",
             "multivalued": "true"
           }
+        },
+        {
+          "name": "surreal-ac-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "ac",
+            "claim.value": "app_session",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "surreal-ns-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "ns",
+            "claim.value": "delphi",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "surreal-db-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "db",
+            "claim.value": "main",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
         }
       ]
     }
