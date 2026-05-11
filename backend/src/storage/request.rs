@@ -12,9 +12,11 @@
 //! clause cannot leak across tenants because SurrealDB itself refuses.
 //!
 //! The pool is bounded — `acquire()` waits when all connections are in
-//! flight. Dropping [`AuthedDb`] returns the connection to the pool;
-//! the next acquirer re-authenticates with its own JWT (SurrealDB
-//! simply overwrites the session).
+//! flight. Dropping [`AuthedDb`] **automatically logs the session out**
+//! (`db.invalidate()`) before returning the connection to the pool, so
+//! a connection idle in the channel is never in a leftover RECORD
+//! session. There is no public release/logout method — the scope guard
+//! is the API.
 
 use std::sync::Arc;
 
@@ -33,10 +35,11 @@ use super::{
     Storage,
 };
 
-/// Default pool size. Sized to comfortably saturate typical inbound
-/// concurrency without holding an absurd number of WebSocket sessions
-/// open against SurrealDB at idle.
-const DEFAULT_POOL_SIZE: usize = 16;
+/// Default pool size when `REQUEST_DB_POOL_SIZE` is unset. Sized to
+/// cover typical inbound concurrency without holding many idle
+/// WebSocket sessions against SurrealDB. Override via env for
+/// deployments that need more (or fewer) physical connections.
+const DEFAULT_POOL_SIZE: usize = 8;
 
 /// Pool of pre-connected SurrealDB clients. Cloneable cheaply — internals
 /// are `Arc`-counted. One pool per backend process.
@@ -45,6 +48,20 @@ pub struct RequestDbPool {
     inner: Arc<RequestDbPoolInner>,
 }
 
+/// Implementation note: `mpsc` is *multi-producer, single-consumer*, but a
+/// pool naturally wants multi-consumer (every concurrent request pulls a
+/// connection out). We work around that by wrapping the receiver in a
+/// `Mutex` — acquirers lock, `recv().await`, unlock. Functionally fine
+/// at our scale (small N, modest concurrency), but it serialises the
+/// "wait for a free connection" path through a mutex rather than letting
+/// many consumers `recv` in parallel.
+///
+/// **Future upgrade path** if contention ever shows up: replace this with
+/// a real connection-pool crate (`deadpool`, `bb8`, `mobc`) for
+/// production-grade features (health checks, max-lifetime, broken-
+/// connection eviction, acquire timeouts), or switch to `async-channel`
+/// for a drop-in multi-consumer queue without the `Mutex`. The
+/// surrounding `AuthedDb` / Drop semantics would carry over unchanged.
 struct RequestDbPoolInner {
     /// Receiver side of the available-connections queue. `acquire` does
     /// `recv().await`, which yields the next free connection (or waits
@@ -95,9 +112,23 @@ impl RequestDbPool {
         })
     }
 
-    /// Default-sized pool. Most callers want this.
+    /// Pool size taken from `REQUEST_DB_POOL_SIZE` (default
+    /// [`DEFAULT_POOL_SIZE`]). Most callers want this.
     pub async fn from_env_default() -> Result<Self> {
-        Self::from_env(DEFAULT_POOL_SIZE).await
+        let size = match std::env::var("REQUEST_DB_POOL_SIZE") {
+            Ok(s) => s.parse::<usize>().map_err(|_| {
+                Error::InvalidConfig(format!(
+                    "REQUEST_DB_POOL_SIZE must be a positive integer; got {s:?}"
+                ))
+            })?,
+            Err(_) => DEFAULT_POOL_SIZE,
+        };
+        if size == 0 {
+            return Err(Error::InvalidConfig(
+                "REQUEST_DB_POOL_SIZE must be > 0".into(),
+            ));
+        }
+        Self::from_env(size).await
     }
 
     /// Test-only convenience: build a pool sharing a pre-connected
@@ -196,10 +227,19 @@ impl AuthedDb {
 impl Drop for AuthedDb {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
-            // Best-effort release. If the receiver is gone (process
-            // shutdown), the connection is dropped — fine.
+            // Two-step scope cleanup, fired automatically:
+            //   1. `invalidate()` — log the RECORD session out, so the
+            //      connection returns to the pool in a known clean
+            //      state (no leftover user identity on the wire).
+            //   2. `send(db)` — release back into the channel for the
+            //      next acquirer.
+            // Both are best-effort: if invalidate fails the next
+            // acquirer's `authenticate(jwt)` overwrites the session
+            // anyway, and if the receiver is gone (process shutdown)
+            // we drop the connection — fine.
             let tx = self.tx.clone();
             tokio::spawn(async move {
+                let _ = inner.db.invalidate().await;
                 let _ = tx.send(inner.db).await;
             });
         }

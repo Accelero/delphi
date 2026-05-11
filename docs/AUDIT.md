@@ -348,6 +348,30 @@ Mark items as `[x]` once a fix has been merged and verified.
   @tier2`); tier-1 still green; full backend suite still green in
   both feature configs._
 
+- [x] **N6.** Per-request connection lifecycle hardening
+  (`storage/request.rs`). Three improvements done together:
+
+  1. **Auto-logout on scope exit.** `AuthedDb::drop` now calls
+     `db.invalidate()` *before* returning the connection to the pool's
+     mpsc channel. A connection idle in the channel is therefore
+     always in a logged-out state — the previous user's RECORD session
+     never lingers. No public `release()` / `logout()` method exists;
+     the scope guard is the API.
+
+  2. **Configurable pool size.** `RequestDbPool::from_env_default`
+     reads `REQUEST_DB_POOL_SIZE` (default `8`, was a hard-coded
+     `16`). Validates `> 0`. Documented in `.env.example`.
+
+  3. **Documented future upgrade path.** Doc-comment on
+     `RequestDbPoolInner` flags the `mpsc + Mutex<Receiver>` shape as
+     a documented workaround for multi-consumer semantics, with
+     `deadpool` / `bb8` / `mobc` or `async-channel` named as
+     drop-in replacements if contention or pool features ever matter.
+
+  _Resolved: tier-2 e2e green with the new Drop semantics; full
+  backend test suite green (both feature configs); tier-1 spec also
+  green._
+
 ---
 
 ## Priority order (highest leverage first)
