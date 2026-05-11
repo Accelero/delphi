@@ -27,7 +27,8 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 
 use delphi::api;
 use delphi::auth::{
-    self, AuthMode, ClaimsExtractor, HeaderConfig, IdentityDeps, JwtClaimsExtractor,
+    self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
+    JwtClaimsExtractor, JwtValidator,
 };
 use delphi::ingestion::Pipeline;
 use delphi::object_store::{MemObjectStore, ObjectStore};
@@ -113,7 +114,11 @@ impl TestApp {
             default_tenant_slug: default_tenant_slug.clone(),
         });
 
-        let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new());
+        // Same secret SurrealDB's `app_session` access method validates
+        // against above — backend and engine agree on the key material.
+        let validator: Arc<dyn JwtValidator> =
+            Arc::new(Hs512Validator::new(TEST_JWT_SECRET, None, None));
+        let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new(validator));
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
@@ -184,9 +189,11 @@ impl TestResponse {
 /// identity in the default tenant — mutate with `.tenant()` /
 /// `.roles()` before calling `.apply()`.
 ///
-/// Tokens are unsigned (`alg: none`, empty signature). The backend's
-/// `JwtClaimsExtractor` doesn't validate signatures — that's the
-/// BFF's job in production — so unsigned is sufficient for tests.
+/// Tokens are HS512-signed with [`TEST_JWT_SECRET`]. The backend's
+/// `JwtClaimsExtractor` re-validates the signature in-process (audit
+/// finding N3); SurrealDB's `app_session` AUTHENTICATE clause then
+/// re-validates again on the per-request `db.authenticate(jwt)`.
+/// Both layers consult the same secret, set up in [`TestApp::build`].
 pub struct AuthRequestBuilder {
     sub: String,
     iss: String,

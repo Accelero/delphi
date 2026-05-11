@@ -16,7 +16,8 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use crate::auth::{
-    self, AuthConfig, AuthMode, ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
+    self, validator_from_jwt_access, AuthConfig, AuthMode, ClaimsExtractor, IdentityDeps,
+    JwtClaimsExtractor,
 };
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::filter::{IngestFilter, NoopFilter};
@@ -154,10 +155,13 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         None
     };
 
-    // Today there's only one production extractor. When we want
-    // defence-in-depth (backend re-validates the JWT signature against
-    // the IdP's JWKS), the choice happens here based on `auth_cfg`.
-    let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new());
+    // Defence-in-depth: re-validate every inbound JWT in-process
+    // against the same key material SurrealDB validates against.
+    // `validator_from_jwt_access` consumes the same `JwtAccessConfig`
+    // we already passed to `define_jwt_access` above — one knob, one
+    // policy, two enforcement points.
+    let validator = validator_from_jwt_access(&jwt_access);
+    let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new(validator));
 
     let app = build_router(
         state,

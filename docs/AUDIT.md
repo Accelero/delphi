@@ -301,13 +301,25 @@ Mark items as `[x]` once a fix has been merged and verified.
   trust assumption is worth a paragraph in `docs/ARCH.md` to make
   the dependency on IdP-side discipline explicit.
 
-- [ ] **N3.** Backend doesn't validate the JWT signature
+- [x] **N3.** Backend doesn't validate the JWT signature
   (`JwtClaimsExtractor` only decodes the payload). The BFF validates
   against Keycloak's JWKS, so this is the same trust model as before
   — but the defence-in-depth slot is now obvious and small: add a
   `jsonwebtoken::decode_header` + JWKS-cached validation step in
   `JwtClaimsExtractor::extract`. Worth doing before any deployment
   where the backend port might be exposed beyond localhost.
+
+  _Resolved: new `auth/validator.rs` defines a `JwtValidator` trait
+  with `Hs512Validator` (shared secret — tier-1 dev + tests) and
+  `JwksValidator` (fetches the IdP's JWKS, caches by `kid`, refreshes
+  on cache miss; alg pinned to the JWK's declared algorithm to block
+  alg-confusion). `JwtClaimsExtractor` now takes an
+  `Arc<dyn JwtValidator>` and validates signature + `exp` (+ optional
+  `iss` / `aud`) before lifting any claim. `validator_from_jwt_access`
+  consumes the same `JwtAccessConfig` as `SystemDb::define_jwt_access`
+  — backend and SurrealDB validate against the same key material from
+  one `SURREAL_JWT_*` env knob. Bad-signature, expired, and
+  iss-mismatch cases are now 401 at the backend boundary._
 
 - [ ] **N4.** `oauth2-proxy` config has settled on v7.4.0 (pinned in
   `docker-compose.full.yml`) because v7.6's alpha-config tightened
@@ -382,7 +394,7 @@ Mark items as `[x]` once a fix has been merged and verified.
 4. ~~C4 — fail-closed on default Surreal credentials.~~ ✓
 5. ~~N1 — tier-1 dev (JWT-minting dev injector).~~ ✓
 6. ~~N5 — tier-2 `db.authenticate` against Keycloak JWKS.~~ ✓
-7. **N3 — backend signature validation (small defence-in-depth, big posture win).**
-8. H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).
+7. ~~N3 — backend signature validation (defence-in-depth).~~ ✓
+8. **H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).**
 9. H3, L2 — body size limit and per-user rate limit.
 10. H2 — mark_read upsert race.

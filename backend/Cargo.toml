@@ -54,10 +54,11 @@ anyhow = "1"
 # LLM agent framework (provider-agnostic)
 rig-core = { version = "0.35", features = ["all"] }
 
-# auth (BFF lives in front of the backend — Traefik + oauth2-proxy. The
-# backend trusts proxy-injected `X-Auth-*` headers and does no token work
-# itself. Future: add `jsonwebtoken` here if we move to in-backend JWT
-# validation as a second `ClaimsExtractor` impl.)
+# auth: the BFF (Traefik + oauth2-proxy) hands the IdP-signed JWT to the
+# backend as `Authorization: Bearer <jwt>`. `JwtClaimsExtractor` re-validates
+# the signature in-process (HS512 in tier-1 dev/tests, JWKS-fetched in tier-2
+# and prod) — see `auth/validator.rs`. The same `jsonwebtoken` crate also
+# handles the dev injector's HS512 minting (`auth/dev.rs`).
 
 # Source-adapter HTTP fetch + content hashing. The default reqwest TLS stack
 # (native-tls) drags in OpenSSL; rustls keeps the build pure-Rust and matches

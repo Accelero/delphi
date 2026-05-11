@@ -104,8 +104,9 @@ mod tests {
     //! differs.
 
     use super::*;
-    use crate::auth::{ClaimsExtractor, JwtClaimsExtractor};
+    use crate::auth::{ClaimsExtractor, Hs512Validator, JwtClaimsExtractor, JwtValidator};
     use axum::http::HeaderMap;
+    use std::sync::Arc;
 
     fn dev_cfg() -> DevConfig {
         DevConfig {
@@ -133,7 +134,12 @@ mod tests {
         let cfg = dev_cfg();
         let headers = headers_with_dev_jwt(&cfg);
 
-        let claims = JwtClaimsExtractor::new()
+        // Same secret — the backend's defence-in-depth validator
+        // (audit N3) accepts the dev injector's signed JWT, just as
+        // SurrealDB's `app_session` does engine-side.
+        let validator: Arc<dyn JwtValidator> =
+            Arc::new(Hs512Validator::new(&cfg.jwt_secret, None, None));
+        let claims = JwtClaimsExtractor::new(validator)
             .extract(&headers)
             .await
             .expect("dev JWT must parse cleanly");
