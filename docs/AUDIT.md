@@ -276,23 +276,21 @@ Mark items as `[x]` once a fix has been merged and verified.
 
 ## New findings from the JWT cutover
 
-- [ ] **N1.** Tier-1 dev mode (`auth/dev.rs::dev_inject_middleware` +
+- [x] **N1.** Tier-1 dev mode (`auth/dev.rs::dev_inject_middleware` +
   `AuthMode::Dev`) is broken since the full-JWT cutover. The dev
   injector still writes `X-Auth-*` headers; `JwtClaimsExtractor` no
   longer reads them. Every request through the tier-1 stack 401s.
 
-  Fix shape: extend `dev_inject_middleware` to **mint a dev JWT**
-  signed with a shared dev secret (reuse `SessionTokenSigner` or an
-  equivalent) and emit it as `Authorization: Bearer …`. The same JWT
-  shape the production IdP would produce — same payload schema, same
-  extractor consumes it. `set_xauthrequest` / X-Auth-* writes go
-  away.
-
-  Workaround in the interim: integration tests construct their own
-  JWTs via `AuthRequestBuilder.apply(...)` (see
-  `backend/tests/common/mod.rs`) and skip the dev injector entirely.
-  Tier-1 `make up` and tier-1 Playwright e2e are non-functional
-  until this lands.
+  _Resolved: `dev_inject_middleware` now mints an HS512-signed JWT
+  with the same claim shape (`sub` / `iss` / `email` /
+  `preferred_username` / `tenant_id` / `roles` / `ac` / `ns` / `db` /
+  `iat` / `exp`) the production IdP would emit, signed with
+  `SURREAL_JWT_SECRET` so SurrealDB's `app_session` access method
+  validates it engine-side. The equivalence test in `auth/dev.rs`
+  round-trips the dev JWT through `JwtClaimsExtractor` to enforce
+  "dev mode is a strict subset of prod" at compile time. Tier-1
+  Playwright `chat-roundtrip` passes; backend test suite stays green
+  in both `--no-default-features` and `--features dev-auth`._
 
 - [ ] **N2.** `ensure_user` auto-provisions tenants from JWT claims
   (`upsert_tenant` on unknown slug). The architecture doc previously
@@ -318,6 +316,53 @@ Mark items as `[x]` once a fix has been merged and verified.
   has documented the cookie/session/server fields more clearly, and
   collapse to a single config file.
 
+- [ ] **N5.** Tier-2 e2e regression: `db.authenticate` against
+  Keycloak's JWKS fails with a generic `surrealdb: There was a
+  problem with the database: There was a problem with authentication`
+  on every request. Both Playwright tier-2 specs
+  (`chat-roundtrip`, `tenant-isolation @tier2`) fail in a 401-redirect
+  loop. **Tier-2 was reported passing at commit `131b93c` (Phase 2
+  wiring), but reproduces as failing at that exact commit now** —
+  so this is environmental drift the audit didn't catch, not a
+  regression introduced by N1.
+
+  What's confirmed working independently:
+  - SurrealDB can reach the JWKS endpoint inside the compose network
+    (`http::get('http://keycloak:8080/.../certs')` returns the keyset).
+  - Keycloak emits a valid RS256-signed JWT with a `kid` matching
+    the signing key in JWKS.
+  - The backend's `JwtClaimsExtractor` decodes the payload fine
+    (it doesn't validate signatures).
+  - Tier-1 (HS512, same `define_jwt_access` code path) works
+    end-to-end, including the AUTHENTICATE clause.
+
+  Candidate causes left to investigate (in rough order of likelihood):
+  1. SurrealDB 2.1.4's JWKS handling picking the wrong key when
+     multiple `use` values are present (Keycloak emits both an
+     `enc` and a `sig` key — kid-matching ought to disambiguate
+     but maybe doesn't).
+  2. The AUTHENTICATE clause throwing because the `app_user` row
+     isn't yet in the namespace SurrealDB validates against (NS
+     mismatch between `ensure_user`'s SystemDb context and the
+     RECORD-session context).
+  3. Default `--allow-net=none` blocking the JWKS fetch (compose
+     now passes `--allow-net=keycloak:8080`; included as a precaution
+     in this commit but not confirmed as the root cause).
+  4. A token claim SurrealDB requires that Keycloak doesn't emit
+     by default (`ac`, `ns`, `db` — present in our HS512 test path
+     because we add them manually).
+
+  Workarounds available today:
+  - **Tier-1 stack** is fully functional (HS512 + dev injector).
+  - **Integration tests** exercise the engine-RBAC path directly
+    via `backend/tests/cross_tenant_isolation.rs` (HS512 + manual
+    `db.authenticate`). All 5 cases pass.
+
+  Until N5 lands the C1 closure note still holds: PERMISSIONS
+  clauses fire on every request-path query through `AuthedDb` in
+  tier 1 and in unit tests. It's just the tier-2 Keycloak chain
+  that doesn't get to that point.
+
 ---
 
 ## Priority order (highest leverage first)
@@ -326,8 +371,13 @@ Mark items as `[x]` once a fix has been merged and verified.
 2. ~~H1, C2 — close ingestion/dedup and SSE leakage as part of the same fix.~~ ✓
 3. ~~C3 — drop X-Auth headers, full JWT path.~~ ✓
 4. ~~C4 — fail-closed on default Surreal credentials.~~ ✓
-5. **N1 — restore tier-1 dev (JWT-minting dev injector).**
-6. **N3 — backend signature validation (small defence-in-depth, big posture win).**
-7. H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).
-8. H3, L2 — body size limit and per-user rate limit.
-9. H2 — mark_read upsert race.
+5. ~~N1 — tier-1 dev (JWT-minting dev injector).~~ ✓
+6. **N5 — tier-2 `db.authenticate` against Keycloak JWKS fails;
+   tier-2 e2e suite is non-functional. Without this the production
+   path is unverified and the engine-PERMISSIONS claim doesn't hold
+   end-to-end. Top priority because it gates every other tier-2 /
+   prod-shape change.**
+7. **N3 — backend signature validation (small defence-in-depth, big posture win).**
+8. H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).
+9. H3, L2 — body size limit and per-user rate limit.
+10. H2 — mark_read upsert race.

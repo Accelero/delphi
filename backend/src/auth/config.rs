@@ -47,6 +47,16 @@ pub struct DevConfig {
     pub tenant_slug: String,
     pub user_email: String,
     pub user_name: String,
+    /// Shared HS512 secret. The dev injector signs with this and
+    /// SurrealDB's `app_session` access method validates against it
+    /// (registered at startup via `SystemDb::define_jwt_access`).
+    /// Loaded from `SURREAL_JWT_SECRET` so dev and storage stay in
+    /// sync on a single knob.
+    pub jwt_secret: String,
+    /// `ns` / `db` claims SurrealDB requires for routing. Default to
+    /// the same values `SystemDb` uses so they line up automatically.
+    pub surreal_ns: String,
+    pub surreal_db: String,
 }
 
 #[derive(Debug, Clone)]
@@ -89,10 +99,24 @@ fn load_dev_or_bail() -> Result<AuthMode> {
     let tenant_slug = std::env::var("DEV_TENANT_SLUG").unwrap_or_else(|_| "dev".into());
     let user_email = std::env::var("DEV_USER_EMAIL").unwrap_or_else(|_| "dev@delphi.local".into());
     let user_name = std::env::var("DEV_USER_NAME").unwrap_or_else(|_| "Dev User".into());
+    // Same env var the storage layer reads — keeps the dev injector and
+    // SurrealDB's `app_session` access method on a single knob.
+    let jwt_secret = std::env::var("SURREAL_JWT_SECRET").map_err(|_| {
+        anyhow::anyhow!(
+            "AUTH_MODE=dev requires SURREAL_JWT_SECRET (the dev injector signs \
+             with this; SurrealDB's app_session access method validates with \
+             the same secret)."
+        )
+    })?;
+    let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "delphi".into());
+    let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "main".into());
     Ok(AuthMode::Dev(DevConfig {
         tenant_slug,
         user_email,
         user_name,
+        jwt_secret,
+        surreal_ns,
+        surreal_db,
     }))
 }
 

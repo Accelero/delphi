@@ -103,6 +103,13 @@ services:
       - --pass=root
       - --bind=0.0.0.0:8000
       - --log=info
+      # Required so SurrealDB can fetch the IdP's JWKS for RECORD
+      # access methods of the `WITH JWT URL '...'` form. Without
+      # this the network sandbox blocks the outbound HTTP call and
+      # `db.authenticate(jwt)` fails closed with a generic
+      # "problem with authentication" error. Comma-separated host:port
+      # targets — the Keycloak service inside the compose network.
+      - --allow-net=keycloak:8080
       - rocksdb:/data/db
     volumes:
       - surreal_data_full:/data/db

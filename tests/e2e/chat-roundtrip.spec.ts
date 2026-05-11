@@ -30,6 +30,8 @@ test("chat surface is reachable and user is signed in", async ({
   await expect(page.getByText(/delphi/i).first()).toBeVisible();
 
   // The user-menu button is rendered when /api/auth/me succeeded.
-  await expect(page.getByRole("button", { name: /signed in|@/i }).first())
-    .toBeVisible({ timeout: 10_000 });
+  // Tier 2 surfaces the IdP email; tier 1 surfaces the dev-mode banner.
+  await expect(
+    page.getByRole("button", { name: /signed in|@|dev mode/i }).first(),
+  ).toBeVisible({ timeout: 10_000 });
 });

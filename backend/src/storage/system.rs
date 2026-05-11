@@ -213,12 +213,19 @@ impl SystemDb {
         // SurrealDB falls back to `$auth = $token.ID` — and IdP tokens
         // don't carry an `ID` claim, so engine-side PERMISSIONS that
         // read `$auth.tenant_id` would all see NONE.
+        //
+        // The clause must return the **record id** (not the full
+        // record); SurrealDB then loads it into `$auth`. The post-load
+        // PERMISSIONS check on `app_user` is bypassed by the engine
+        // when populating `$auth` from AUTHENTICATE, so the
+        // `FOR select WHERE id = $auth.id` clause on app_user is not
+        // a chicken-and-egg problem here.
         let stmt = format!(
             "DEFINE ACCESS OVERWRITE app_session ON DATABASE TYPE RECORD \
              WITH JWT {validator} \
              AUTHENTICATE {{ \
                 {checks} \
-                LET $u = (SELECT * FROM app_user \
+                LET $u = (SELECT VALUE id FROM app_user \
                           WHERE iss = $token.iss AND sub = $token.sub LIMIT 1)[0]; \
                 IF $u IS NONE {{ THROW 'unknown user'; }}; \
                 RETURN $u; \
