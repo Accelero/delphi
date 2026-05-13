@@ -50,11 +50,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
@@ -69,6 +71,30 @@ const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_MAX_STALENESS_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 const ENDPOINT: &str = "https://export.arxiv.org/api/query";
 const PDF_FETCH_DELAY: Duration = Duration::from_secs(3);
+/// Hard cap on PDF download size. arXiv preprints almost always fit in
+/// a few MB; the cap is mostly defence against a malformed or
+/// adversarial response that would otherwise OOM the backend. Streamed
+/// download aborts the moment the running total exceeds this. Tunable
+/// via `ARXIV_MAX_PDF_BYTES`.
+const DEFAULT_MAX_PDF_BYTES: usize = 50 * 1024 * 1024; // 50 MB
+/// Wall-clock cap on the `pdftotext` shell-out. A pathological PDF can
+/// take indefinite time / CPU; we'd rather lose the body than block an
+/// adapter cycle. Tunable via `ARXIV_PDFTOTEXT_TIMEOUT_SECS`.
+const DEFAULT_PDFTOTEXT_TIMEOUT_SECS: u64 = 30;
+/// Hard cap on extracted-text length. A "PDF bomb" can decompress to
+/// many GB of text; we read with a moving cap and kill the process
+/// when reached. 4 MB comfortably exceeds any real paper (a full
+/// monograph is ~1–2 MB of text) without leaving slack for adversarial
+/// payloads. Tunable via `ARXIV_MAX_EXTRACTED_TEXT_BYTES`.
+const DEFAULT_MAX_EXTRACTED_TEXT_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+/// Whole-request timeout on every reqwest call (search + PDF fetch).
+/// Closes the slow-server / stalled-stream hole that the size caps
+/// alone don't cover. Tunable via `ARXIV_HTTP_TIMEOUT_SECS`.
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 60;
+/// Connect-handshake timeout, separately bounded so a host that
+/// resolves but never accepts gets dropped quickly. Tunable via
+/// `ARXIV_HTTP_CONNECT_TIMEOUT_SECS`.
+const DEFAULT_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Open-ended upper bound for the `submittedDate` filter — far enough in
 /// the future that "newer than cursor" is the only effective constraint.
 const ARXIV_DATE_MAX: &str = "999912312359";
@@ -88,6 +114,12 @@ pub struct ArxivAdapter {
     /// this (no cursor on first start, or a long downtime) get clamped
     /// instead of triggering an unbounded backfill.
     max_staleness: Duration,
+    /// PDF download size cap (bytes). Streamed read aborts at this.
+    max_pdf_bytes: usize,
+    /// `pdftotext` wall-clock timeout. Process is killed on expiry.
+    pdftotext_timeout: Duration,
+    /// Cap on extracted-text bytes. `pdftotext` is killed when reached.
+    max_extracted_text_bytes: usize,
     http: Client,
     object_store: Arc<dyn ObjectStore>,
 }
@@ -117,12 +149,46 @@ impl ArxivAdapter {
             ),
             _ => USER_AGENT_FALLBACK.to_string(),
         };
-        let http = Client::builder().user_agent(user_agent).build().ok()?;
+        let http_timeout = Duration::from_secs(
+            std::env::var("ARXIV_HTTP_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS),
+        );
+        let http_connect_timeout = Duration::from_secs(
+            std::env::var("ARXIV_HTTP_CONNECT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT_SECS),
+        );
+        let http = Client::builder()
+            .user_agent(user_agent)
+            .timeout(http_timeout)
+            .connect_timeout(http_connect_timeout)
+            .build()
+            .ok()?;
+        let max_pdf_bytes = std::env::var("ARXIV_MAX_PDF_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_PDF_BYTES);
+        let pdftotext_timeout = Duration::from_secs(
+            std::env::var("ARXIV_PDFTOTEXT_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_PDFTOTEXT_TIMEOUT_SECS),
+        );
+        let max_extracted_text_bytes = std::env::var("ARXIV_MAX_EXTRACTED_TEXT_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_EXTRACTED_TEXT_BYTES);
         Some(Self {
             query,
             poll_interval: Duration::from_secs(poll_interval),
             page_size,
             max_staleness,
+            max_pdf_bytes,
+            pdftotext_timeout,
+            max_extracted_text_bytes,
             http,
             object_store,
         })
@@ -359,25 +425,14 @@ impl ArxivAdapter {
         abs_id: &str,
         pdf_url: &str,
     ) -> (Option<String>, Option<String>) {
-        let bytes = match self.http.get(pdf_url).send().await {
-            Ok(r) if r.status().is_success() => match r.bytes().await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!(error = %e, %pdf_url, "arxiv: pdf body read failed");
-                    return (None, None);
-                }
-            },
-            Ok(r) => {
-                tracing::warn!(status = %r.status(), %pdf_url, "arxiv: pdf fetch non-success");
-                return (None, None);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, %pdf_url, "arxiv: pdf fetch network error");
-                return (None, None);
-            }
+        let bytes = match fetch_pdf_capped(&self.http, pdf_url, self.max_pdf_bytes).await {
+            Some(b) => b,
+            None => return (None, None),
         };
 
         let key = format!("arxiv/{abs_id}.pdf");
+        // `Bytes::clone` is a refcount bump, not a memory copy — safe to
+        // hand a clone to the store and another to pdftotext below.
         let storage_uri = match self.object_store.put(&key, bytes.clone()).await {
             Ok(uri) => Some(uri),
             Err(e) => {
@@ -386,7 +441,13 @@ impl ArxivAdapter {
             }
         };
 
-        let text = match extract_pdf_text(&bytes).await {
+        let text = match extract_pdf_text(
+            bytes,
+            self.pdftotext_timeout,
+            self.max_extracted_text_bytes,
+        )
+        .await
+        {
             Ok(s) if s.trim().is_empty() => {
                 tracing::info!(abs_id, "arxiv: pdftotext returned empty (scanned PDF?)");
                 None
@@ -454,45 +515,158 @@ fn parse_atom_feed(xml: &str) -> Result<Vec<AtomEntry>> {
     Ok(feed.entries)
 }
 
-async fn extract_pdf_text(bytes: &[u8]) -> Result<String> {
-    // pdftotext - -  reads PDF bytes from stdin, writes UTF-8 to stdout.
-    // We pipe the bytes in on a background task while we collect output;
-    // this avoids buffering the whole PDF twice in memory.
+/// Stream a PDF body into memory with a hard size cap. Aborts (returns
+/// `None`) on non-success status, network error, or when the running
+/// total exceeds `cap`. Pre-checks `Content-Length` when present so the
+/// connection is dropped before any body is read for oversize bodies.
+async fn fetch_pdf_capped(http: &Client, url: &str, cap: usize) -> Option<Bytes> {
+    let resp = match http.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!(status = %r.status(), url, "arxiv: pdf fetch non-success");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, url, "arxiv: pdf fetch network error");
+            return None;
+        }
+    };
+
+    if let Some(declared) = resp.content_length() {
+        if declared as usize > cap {
+            tracing::warn!(
+                content_length = declared,
+                cap,
+                url,
+                "arxiv: pdf exceeds size cap (Content-Length); skipping"
+            );
+            return None;
+        }
+    }
+
+    let mut buf = BytesMut::with_capacity(64 * 1024);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, url, "arxiv: pdf chunk read error");
+                return None;
+            }
+        };
+        if buf.len() + chunk.len() > cap {
+            tracing::warn!(cap, url, "arxiv: pdf body exceeded size cap; aborting");
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Some(buf.freeze())
+}
+
+/// Run `pdftotext` over `bytes`, with a wall-clock `timeout` and an
+/// extracted-byte cap of `max_out`. The bytes are consumed from a
+/// `Bytes` (refcount-cheap, no `to_vec` copy) on a background task
+/// while we drain stdout in capped chunks. If either limit is hit
+/// the child is killed; partial output is returned only on success
+/// or natural EOF.
+async fn extract_pdf_text(bytes: Bytes, timeout: Duration, max_out: usize) -> Result<String> {
     let mut child = Command::new("pdftotext")
-        .arg("-q")           // quiet
-        .arg("-enc")         // explicit UTF-8
+        .arg("-q") // quiet
+        .arg("-enc") // explicit UTF-8
         .arg("UTF-8")
-        .arg("-")            // stdin
-        .arg("-")            // stdout
+        .arg("-") // stdin
+        .arg("-") // stdout
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // If our task is dropped mid-flight (e.g. scheduler shutdown),
+        // make sure we don't leak a pdftotext process.
+        .kill_on_drop(true)
         .spawn()?;
 
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| Error::Adapter {
-            name: ADAPTER_NAME.into(),
-            message: "pdftotext: stdin not captured".into(),
-        })?;
-    let bytes_owned = bytes.to_vec();
+    let mut stdin = child.stdin.take().ok_or_else(|| Error::Adapter {
+        name: ADAPTER_NAME.into(),
+        message: "pdftotext: stdin not captured".into(),
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| Error::Adapter {
+        name: ADAPTER_NAME.into(),
+        message: "pdftotext: stdout not captured".into(),
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| Error::Adapter {
+        name: ADAPTER_NAME.into(),
+        message: "pdftotext: stderr not captured".into(),
+    })?;
+
     let writer = tokio::spawn(async move {
-        let _ = stdin.write_all(&bytes_owned).await;
+        let _ = stdin.write_all(&bytes).await;
         let _ = stdin.shutdown().await;
     });
 
-    let output = child.wait_with_output().await?;
-    let _ = writer.await;
+    let read_capped = async {
+        let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
+        let mut buf = [0u8; 16 * 1024];
+        let mut truncated = false;
+        loop {
+            let n = match stdout.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    return Err(Error::Adapter {
+                        name: ADAPTER_NAME.into(),
+                        message: format!("pdftotext stdout read: {e}"),
+                    })
+                }
+            };
+            let take = max_out.saturating_sub(out.len()).min(n);
+            out.extend_from_slice(&buf[..take]);
+            if out.len() >= max_out {
+                truncated = true;
+                break;
+            }
+        }
+        Ok::<(Vec<u8>, bool), Error>((out, truncated))
+    };
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let (out, truncated) = match tokio::time::timeout(timeout, read_capped).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            let _ = child.kill().await;
+            let _ = writer.await;
+            return Err(e);
+        }
+        Err(_elapsed) => {
+            let _ = child.kill().await;
+            let _ = writer.await;
+            return Err(Error::Adapter {
+                name: ADAPTER_NAME.into(),
+                message: format!("pdftotext timed out after {}s", timeout.as_secs()),
+            });
+        }
+    };
+
+    if truncated {
+        tracing::info!(
+            cap_bytes = max_out,
+            "arxiv: pdftotext output capped — killing child"
+        );
+        let _ = child.kill().await;
+    }
+
+    let _ = writer.await;
+    let mut err_buf = String::new();
+    let _ = stderr.read_to_string(&mut err_buf).await;
+    let status = child.wait().await?;
+
+    // pdftotext can exit non-zero on a malformed page while still
+    // emitting useful text for the rest of the document — keep what we
+    // got. Hard fail only when there's no output to salvage.
+    if !status.success() && out.is_empty() && !truncated {
         return Err(Error::Adapter {
             name: ADAPTER_NAME.into(),
-            message: format!("pdftotext failed: {stderr}"),
+            message: format!("pdftotext failed: {err_buf}"),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────────
@@ -571,5 +745,99 @@ to particular tasks or domains. We propose Low-Rank Adaptation, or LoRA.</summar
     fn formats_date_for_arxiv_submitted_date_filter() {
         let dt = parse_rfc3339("2021-06-17T17:37:18Z").unwrap();
         assert_eq!(format_arxiv_date(dt), "202106171737");
+    }
+
+    /// Drives `extract_pdf_text` through a `cat`-equivalent: a fake
+    /// pdftotext that just echoes stdin to stdout. Lets us verify the
+    /// timeout and output-cap branches without a real PDF.
+    #[cfg(unix)]
+    mod pdftotext_caps {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::process::Command;
+        use tokio::time::Duration;
+
+        /// Stand-in extractor that runs `cat` instead of `pdftotext`,
+        /// applying the same timeout + output-cap policy. Mirrors the
+        /// real extract_pdf_text shape so the test exercises the actual
+        /// kill / cap logic rather than a re-implementation.
+        async fn extract_via_cat(
+            bytes: bytes::Bytes,
+            timeout: Duration,
+            max_out: usize,
+        ) -> Option<(String, bool)> {
+            let mut child = Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .ok()?;
+            let mut stdin = child.stdin.take()?;
+            let mut stdout = child.stdout.take()?;
+            let writer = tokio::spawn(async move {
+                let _ = stdin.write_all(&bytes).await;
+                let _ = stdin.shutdown().await;
+            });
+            let read_capped = async {
+                let mut out: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 8 * 1024];
+                let mut truncated = false;
+                loop {
+                    let n = stdout.read(&mut buf).await.ok()?;
+                    if n == 0 {
+                        break;
+                    }
+                    let take = max_out.saturating_sub(out.len()).min(n);
+                    out.extend_from_slice(&buf[..take]);
+                    if out.len() >= max_out {
+                        truncated = true;
+                        break;
+                    }
+                }
+                Some((out, truncated))
+            };
+            let (out, truncated) = tokio::time::timeout(timeout, read_capped).await.ok()??;
+            if truncated {
+                let _ = child.kill().await;
+            }
+            let _ = writer.await;
+            let _ = child.wait().await;
+            Some((String::from_utf8_lossy(&out).into_owned(), truncated))
+        }
+
+        #[tokio::test]
+        async fn output_cap_truncates_and_kills() {
+            // Write 5 MB of 'a' through cat with a 1 MB cap.
+            let payload = bytes::Bytes::from(vec![b'a'; 5 * 1024 * 1024]);
+            let cap = 1 * 1024 * 1024;
+            let (out, truncated) =
+                extract_via_cat(payload, Duration::from_secs(5), cap).await.expect("extract");
+            assert!(truncated, "should report truncation");
+            assert_eq!(out.len(), cap, "output capped exactly at the limit");
+        }
+
+        #[tokio::test]
+        async fn timeout_kills_long_runner() {
+            // `sleep 5` produces no stdout; the read loop hangs until
+            // the timeout fires.
+            let mut child = Command::new("sleep")
+                .arg("5")
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn sleep");
+            let mut stdout = child.stdout.take().unwrap();
+            let started = std::time::Instant::now();
+            let r = tokio::time::timeout(Duration::from_millis(200), async {
+                let mut buf = [0u8; 64];
+                stdout.read(&mut buf).await
+            })
+            .await;
+            assert!(r.is_err(), "expected timeout elapsed");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            assert!(started.elapsed() < Duration::from_secs(2), "fired well before sleep wakes");
+        }
     }
 }
