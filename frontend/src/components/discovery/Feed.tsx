@@ -36,7 +36,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
-import { PaperCard } from "@/components/discovery/PaperCard";
+import { DocumentCard } from "@/components/discovery/DocumentCard";
 import { api, type FeedDocument, type FeedPage, type FeedSort } from "@/lib/api";
 import { useFeedEvents } from "@/hooks/useFeedEvents";
 
@@ -129,7 +129,7 @@ export function Feed() {
           className="fixed left-1/2 -translate-x-1/2 top-20 z-20 inline-flex items-center gap-2 rounded-full bg-primary text-primary-foreground px-4 py-1.5 text-sm shadow-lg hover:bg-primary/90"
         >
           <ArrowUp className="size-4" />
-          {newSet.size} new {newSet.size === 1 ? "paper" : "papers"} above
+          {newSet.size} new {newSet.size === 1 ? "document" : "documents"} above
         </button>
       )}
 
@@ -147,7 +147,7 @@ export function Feed() {
 
       {!query.isLoading && items.length === 0 && (
         <p className="text-sm text-muted-foreground">
-          No papers yet. As your source adapters discover content, it will
+          No documents yet. As your source adapters discover content, it will
           show up here.
         </p>
       )}
@@ -155,7 +155,7 @@ export function Feed() {
       <ul className="space-y-3">
         {items.map((item) => (
           <li key={item.id}>
-            <PaperCard
+            <DocumentCard
               item={item}
               isNew={newSet.has(item.id)}
               onMarkRead={(id) => markRead.mutate(id)}

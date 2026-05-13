@@ -163,7 +163,7 @@ async fn feed_400_on_malformed_cursor() {
 #[tokio::test]
 async fn mark_read_then_unread_round_trip() {
     let app = TestApp::build().await;
-    seed(&app, "paper-x").await;
+    seed(&app, "doc-x").await;
 
     // First read: confirm unread.
     let res = app.send(auth_get("/api/discovery/feed")).await;
@@ -217,7 +217,7 @@ async fn mark_read_then_unread_round_trip() {
 #[tokio::test]
 async fn read_state_isolates_per_user() {
     let app = TestApp::build().await;
-    seed(&app, "paper-x").await;
+    seed(&app, "doc-x").await;
 
     // Alice reads the feed and gets the doc id.
     let res = app

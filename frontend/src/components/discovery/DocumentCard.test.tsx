@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import userEvent from "@testing-library/user-event";
 
 import { render, screen } from "../../../test-utils/render";
-import { PaperCard } from "./PaperCard";
+import { DocumentCard } from "./DocumentCard";
 import type { FeedDocument } from "@/lib/api";
 
 function doc(overrides: Partial<FeedDocument> = {}): FeedDocument {
@@ -13,7 +13,7 @@ function doc(overrides: Partial<FeedDocument> = {}): FeedDocument {
     source_uri: "https://arxiv.org/abs/0001.0001",
     authors: ["Alice", "Bob"],
     title: "Hello world",
-    summary: "An abstract about hello world.",
+    summary: "A summary of hello world.",
     ingested_at: new Date().toISOString(),
     content_hash: "h",
     version: 1,
@@ -23,10 +23,10 @@ function doc(overrides: Partial<FeedDocument> = {}): FeedDocument {
   };
 }
 
-describe("PaperCard", () => {
-  it("renders title, authors, abstract", () => {
+describe("DocumentCard", () => {
+  it("renders title, authors, summary", () => {
     render(
-      <PaperCard
+      <DocumentCard
         item={doc()}
         isNew={false}
         onMarkRead={() => {}}
@@ -36,13 +36,13 @@ describe("PaperCard", () => {
     expect(screen.getByText("Hello world")).toBeInTheDocument();
     expect(screen.getByText(/Alice, Bob/)).toBeInTheDocument();
     expect(
-      screen.getByText("An abstract about hello world."),
+      screen.getByText("A summary of hello world."),
     ).toBeInTheDocument();
   });
 
   it("shows the New badge when isNew=true", () => {
     render(
-      <PaperCard
+      <DocumentCard
         item={doc()}
         isNew
         onMarkRead={() => {}}
@@ -54,7 +54,7 @@ describe("PaperCard", () => {
 
   it("shows the Read chip when item.read=true", () => {
     render(
-      <PaperCard
+      <DocumentCard
         item={doc({ read: true })}
         isNew={false}
         onMarkRead={() => {}}
@@ -67,7 +67,7 @@ describe("PaperCard", () => {
   it("clicking the card body fires onMarkRead with the doc id", async () => {
     const onMarkRead = vi.fn();
     render(
-      <PaperCard
+      <DocumentCard
         item={doc()}
         isNew={false}
         onMarkRead={onMarkRead}
@@ -76,9 +76,9 @@ describe("PaperCard", () => {
     );
     await userEvent.click(screen.getByText("Hello world"));
     // Title link's `e.stopPropagation()` means clicking the title alone
-    // shouldn't fire — but clicking the abstract should.
+    // shouldn't fire — but clicking the summary should.
     await userEvent.click(
-      screen.getByText("An abstract about hello world."),
+      screen.getByText("A summary of hello world."),
     );
     expect(onMarkRead).toHaveBeenCalledWith("document:abc");
   });
@@ -87,7 +87,7 @@ describe("PaperCard", () => {
     const onMarkRead = vi.fn();
     const onMarkUnread = vi.fn();
     render(
-      <PaperCard
+      <DocumentCard
         item={doc({ read: true })}
         isNew={false}
         onMarkRead={onMarkRead}
@@ -102,7 +102,7 @@ describe("PaperCard", () => {
   it("does not call onMarkRead when clicking an already-read card", async () => {
     const onMarkRead = vi.fn();
     render(
-      <PaperCard
+      <DocumentCard
         item={doc({ read: true })}
         isNew={false}
         onMarkRead={onMarkRead}
@@ -110,7 +110,7 @@ describe("PaperCard", () => {
       />,
     );
     await userEvent.click(
-      screen.getByText("An abstract about hello world."),
+      screen.getByText("A summary of hello world."),
     );
     expect(onMarkRead).not.toHaveBeenCalled();
   });

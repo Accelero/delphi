@@ -57,8 +57,8 @@ function fakeDoc(i: number, overrides: Partial<FeedDocument> = {}): FeedDocument
     source_type: "arxiv",
     source_uri: `https://arxiv.org/abs/${i}`,
     authors: [`Author ${i}`],
-    title: `Paper ${i}`,
-    summary: `Abstract for paper ${i}.`,
+    title: `Document ${i}`,
+    summary: `Summary for document ${i}.`,
     ingested_at: new Date(Date.now() - i * 1000).toISOString(),
     content_hash: `h${i}`,
     version: 1,
@@ -77,7 +77,7 @@ describe("Feed", () => {
     );
     render(<Feed />);
     await waitFor(() =>
-      expect(screen.getByText(/No papers yet/i)).toBeInTheDocument(),
+      expect(screen.getByText(/No documents yet/i)).toBeInTheDocument(),
     );
   });
 
@@ -101,12 +101,12 @@ describe("Feed", () => {
     );
 
     render(<Feed />);
-    await waitFor(() => expect(screen.getByText("Paper 1")).toBeInTheDocument());
-    expect(screen.getByText("Paper 2")).toBeInTheDocument();
-    expect(screen.queryByText("Paper 3")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("Document 1")).toBeInTheDocument());
+    expect(screen.getByText("Document 2")).toBeInTheDocument();
+    expect(screen.queryByText("Document 3")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: /load more/i }));
-    await waitFor(() => expect(screen.getByText("Paper 3")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Document 3")).toBeInTheDocument());
     // After last page, the button is gone.
     expect(
       screen.queryByRole("button", { name: /load more/i }),
@@ -129,10 +129,10 @@ describe("Feed", () => {
     );
 
     render(<Feed />);
-    await waitFor(() => expect(screen.getByText("Paper 1")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Document 1")).toBeInTheDocument());
     expect(screen.queryByText("Read")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByText("Abstract for paper 1."));
+    await userEvent.click(screen.getByText("Summary for document 1."));
     await waitFor(() =>
       expect(markReadCalls).toHaveBeenCalledWith("doc-1"),
     );

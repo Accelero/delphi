@@ -18,7 +18,7 @@
 //!
 //! The HTTP `POST /api/ingestion/documents` endpoint deliberately
 //! bypasses filtering. Manual pushes are owner-driven and authoritative
-//! (e.g. "I want this paper in my corpus, regardless of my standing
+//! (e.g. "I want this document in my corpus, regardless of my standing
 //! filters").
 
 mod noop;

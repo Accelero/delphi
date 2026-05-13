@@ -84,8 +84,8 @@ async fn build_world(ns: &str) -> World {
     create_membership(&system, &alice, &tenant_a, "member").await;
     create_membership(&system, &bob, &tenant_b, "member").await;
 
-    let doc_a = create_document(&system, &tenant_a, "paper-shared", "Alice's paper").await;
-    let doc_b = create_document(&system, &tenant_b, "paper-shared", "Bob's paper").await;
+    let doc_a = create_document(&system, &tenant_a, "doc-shared", "Alice's document").await;
+    let doc_b = create_document(&system, &tenant_b, "doc-shared", "Bob's document").await;
 
     // Re-confirm we're still Root-equivalent by querying both tenants.
     let count: Option<i64> = db
@@ -222,7 +222,7 @@ async fn alice_cannot_read_bobs_documents() {
         .expect("decode");
 
     assert_eq!(docs.len(), 1, "alice sees exactly one doc; got {docs:?}");
-    assert_eq!(docs[0]["title"], "Alice's paper");
+    assert_eq!(docs[0]["title"], "Alice's document");
 }
 
 #[tokio::test]
@@ -374,7 +374,7 @@ async fn alice_can_read_and_mark_her_own_document() {
         .take(0)
         .expect("decode");
     assert_eq!(docs.len(), 1);
-    assert_eq!(docs[0]["canonical_id"], "paper-shared");
+    assert_eq!(docs[0]["canonical_id"], "doc-shared");
 
     // And can mark-read her own doc.
     w.system

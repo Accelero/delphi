@@ -1,11 +1,11 @@
 /**
- * PaperCard — one row in the Discovery feed.
+ * DocumentCard — one row in the Discovery feed.
  *
  * Presentational. Read state and "newness" highlight are driven by props
  * the parent page owns (so optimistic mutations live in one place and
  * the IntersectionObserver glow-fader can manage `isNew` from outside).
  *
- * Click anywhere on the card body marks the paper read (one-shot —
+ * Click anywhere on the card body marks the document read (one-shot —
  * idempotent on the server). The "Read" chip itself is a toggle — click
  * to mark unread without affecting the rest of the click target.
  */
@@ -24,7 +24,7 @@ type Props = {
   onMarkUnread: (id: string) => void;
 };
 
-export function PaperCard({ item, isNew, onMarkRead, onMarkUnread }: Props) {
+export function DocumentCard({ item, isNew, onMarkRead, onMarkUnread }: Props) {
   const dim = item.read;
 
   const handleCardClick = () => {
