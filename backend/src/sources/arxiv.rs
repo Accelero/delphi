@@ -69,7 +69,9 @@ const ADAPTER_NAME: &str = "arxiv";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 21_600; // 6 h
 const DEFAULT_PAGE_SIZE: usize = 50;
 const DEFAULT_MAX_STALENESS_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
-const ENDPOINT: &str = "https://export.arxiv.org/api/query";
+/// Default endpoint. Override via `ARXIV_ENDPOINT` (or
+/// [`ArxivAdapter::with_endpoint`] in tests) to point at a fake server.
+const DEFAULT_ENDPOINT: &str = "https://export.arxiv.org/api/query";
 const PDF_FETCH_DELAY: Duration = Duration::from_secs(3);
 /// Hard cap on PDF download size. arXiv preprints almost always fit in
 /// a few MB; the cap is mostly defence against a malformed or
@@ -107,6 +109,9 @@ const USER_AGENT_FALLBACK: &str =
 
 pub struct ArxivAdapter {
     query: String,
+    /// Search endpoint. Overridable for tests via [`Self::with_endpoint`]
+    /// or production via `ARXIV_ENDPOINT`.
+    endpoint: String,
     poll_interval: Duration,
     page_size: usize,
     /// Maximum age of auto-discovered content. Floors the lower bound
@@ -181,8 +186,11 @@ impl ArxivAdapter {
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_MAX_EXTRACTED_TEXT_BYTES);
+        let endpoint =
+            std::env::var("ARXIV_ENDPOINT").unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
         Some(Self {
             query,
+            endpoint,
             poll_interval: Duration::from_secs(poll_interval),
             page_size,
             max_staleness,
@@ -192,6 +200,14 @@ impl ArxivAdapter {
             http,
             object_store,
         })
+    }
+
+    /// Override the search endpoint. Tests point this at a local fake
+    /// server serving canned Atom XML; production code uses the
+    /// `ARXIV_ENDPOINT` env var (or the arxiv.org default).
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
     }
 }
 
@@ -286,7 +302,7 @@ impl SourceAdapter for ArxivAdapter {
 
         let resp = self
             .http
-            .get(ENDPOINT)
+            .get(&self.endpoint)
             .query(&[
                 ("search_query", scoped_query.as_str()),
                 ("sortBy", "submittedDate"),
