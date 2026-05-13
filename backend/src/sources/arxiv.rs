@@ -60,10 +60,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
-use crate::ingestion::IngestRequest;
+use crate::ingestion::IngestRequestBody;
 use crate::object_store::ObjectStore;
 
-use super::{placeholder_tenant_id, Fetched, SourceAdapter};
+use super::{Fetched, SourceAdapter};
 
 const ADAPTER_NAME: &str = "arxiv";
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 21_600; // 6 h
@@ -362,7 +362,7 @@ impl ArxivAdapter {
         &self,
         entry: AtomEntry,
         published: DateTime<Utc>,
-    ) -> Result<IngestRequest> {
+    ) -> Result<IngestRequestBody> {
         // Identity. arXiv ids look like "http://arxiv.org/abs/2106.09685v2".
         let abs_id = parse_arxiv_abs_id(&entry.id).ok_or_else(|| Error::Adapter {
             name: ADAPTER_NAME.into(),
@@ -400,12 +400,9 @@ impl ArxivAdapter {
             "primary_category": categories_first(&abs_id, &entry.id), // best-effort
         });
 
-        Ok(IngestRequest {
-            // Tenant placeholder: scheduler is authoritative and always
-            // overwrites this before the request reaches the sink. The
-            // adapter is tenant-agnostic; v2 multi-tenant scheduler will
-            // construct one adapter instance per tenant.
-            tenant_id: placeholder_tenant_id(),
+        // Adapter is tenant-agnostic — the `/api/ingestion/documents`
+        // handler stamps `tenant_id` from the service-identity JWT.
+        Ok(IngestRequestBody {
             canonical_id,
             source_type: ADAPTER_NAME.into(),
             source_uri,

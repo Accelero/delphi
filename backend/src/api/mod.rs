@@ -16,15 +16,15 @@ use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 use crate::auth::{
-    self, validator_from_jwt_access, AuthConfig, AuthMode, ClaimsExtractor, IdentityDeps,
-    JwtClaimsExtractor,
+    self, service_identity_from_env, validator_from_jwt_access, AuthConfig, AuthMode,
+    ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::filter::{IngestFilter, NoopFilter};
 use crate::ingestion::{self, NotifyingSink, Pipeline, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
 use crate::object_store::{self, ObjectStore};
-use crate::sources;
+use crate::sources::{self, IngestApiClient};
 use crate::state::AppState;
 use crate::storage::{RequestDbPool, Storage};
 
@@ -128,30 +128,43 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         events: events_tx,
     };
 
-    // Source-adapter scheduler runs alongside the HTTP server. It shares
-    // the same `IngestSink` the HTTP handler uses — internal and external
-    // ingestion paths converge on one method. Scheduler ingest is pinned
-    // to the tenant identified by `SOURCES_DEFAULT_TENANT_SLUG` (defaults
-    // to the auth default tenant).
+    // Source-adapter scheduler runs alongside the HTTP server. It used
+    // to share an in-process `IngestSink` with the HTTP handler;
+    // post-refactor it POSTs to `/api/ingestion/documents` over
+    // loopback under a service-identity JWT — same trust boundary,
+    // same JWT pipeline, one ingestion API. The handler still uses
+    // `state.sink`, so the storage code path is unchanged. Only the
+    // identity model moved.
+    //
+    // Cursor persistence is still scheduler-local (system path) and
+    // must agree with the service-identity tenant; both derive from
+    // `SOURCES_DEFAULT_TENANT_SLUG`.
     let sources_enabled = std::env::var("SOURCES_ENABLED").as_deref() == Ok("true");
     let scheduler = if sources_enabled {
-        let scheduler_tenant_slug = std::env::var("SOURCES_DEFAULT_TENANT_SLUG")
-            .unwrap_or_else(|_| auth_cfg.default_tenant_slug().to_string());
-        let scheduler_tenant_id = auth::resolve_default_tenant(&system, &scheduler_tenant_slug)
-            .await
-            .context("resolving scheduler tenant")?;
-
         let registry = sources::default_registry(object_store.clone());
         if registry.is_empty() {
             info!("SOURCES_ENABLED=true but no adapters configured; scheduler idle");
             None
         } else {
+            let scheduler_tenant_slug = std::env::var("SOURCES_DEFAULT_TENANT_SLUG")
+                .unwrap_or_else(|_| auth_cfg.default_tenant_slug().to_string());
+            let scheduler_tenant_id =
+                auth::resolve_default_tenant(&system, &scheduler_tenant_slug)
+                    .await
+                    .context("resolving scheduler tenant")?;
+
+            let identity = service_identity_from_env("arxiv")
+                .context("loading arxiv service identity")?;
+            let ingest_url = std::env::var("INGEST_API_URL")
+                .unwrap_or_else(|_| default_loopback_url(&bind));
             info!(
                 tenant = %scheduler_tenant_slug,
+                ingest_url = %ingest_url,
                 "starting source-adapter scheduler"
             );
+            let ingest = Arc::new(IngestApiClient::new(ingest_url, identity));
             Some(sources::run_scheduler(
-                sink,
+                ingest,
                 filter,
                 scheduler_storage.clone(),
                 scheduler_tenant_id,
@@ -261,6 +274,18 @@ pub fn build_router(
     }
 
     router
+}
+
+/// Construct the loopback URL the scheduler POSTs to when
+/// `INGEST_API_URL` is not set. Reads the port from `BIND_ADDR`
+/// (the same value the HTTP server listens on) and pins the host to
+/// `127.0.0.1` so the call never leaves the loopback interface.
+fn default_loopback_url(bind: &str) -> String {
+    let port = bind
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(8081);
+    format!("http://127.0.0.1:{port}")
 }
 
 async fn shutdown_signal() {

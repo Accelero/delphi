@@ -1,6 +1,10 @@
-//! Scheduler with a fake adapter: tick fires, pipeline persists, cursor
-//! advances. Verifies the in-process polling path end-to-end without
-//! touching the network.
+//! Scheduler with a fake adapter against a real HTTP loopback: each
+//! tick fires, the adapter's `IngestRequestBody`s POST through
+//! `/api/ingestion/documents` under an HS512 service-identity JWT, the
+//! pipeline persists, and the cursor advances.
+//!
+//! Verifies the in-process polling path end-to-end without touching
+//! the network *outside* the test process.
 
 mod common;
 
@@ -8,21 +12,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
-use surrealdb::RecordId;
 use tokio::time::sleep;
 
-use delphi::auth::resolve_default_tenant;
+use delphi::auth::{Hs512ServiceIdentity, ServiceIdentity};
 use delphi::filter::{IngestFilter, NoopFilter};
-use delphi::ingestion::{IngestRequest, IngestSink, Pipeline};
-use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{Storage, SystemDb};
+use delphi::ingestion::IngestRequestBody;
+use delphi::sources::{run_scheduler, AdapterRegistry, IngestApiClient};
+use delphi::storage::Storage;
 
 use crate::common::fake_source::FakeAdapter;
+use crate::common::{TestApp, TEST_JWT_SECRET};
 
-fn req(canonical_id: &str) -> IngestRequest {
-    IngestRequest {
-        // Placeholder — scheduler always overwrites via its tenant_id arg.
-        tenant_id: RecordId::from(("tenant", "scheduler-placeholder")),
+fn body(canonical_id: &str) -> IngestRequestBody {
+    IngestRequestBody {
         canonical_id: canonical_id.into(),
         source_type: "fake".into(),
         source_uri: format!("https://fake.example/{canonical_id}"),
@@ -38,27 +40,27 @@ fn req(canonical_id: &str) -> IngestRequest {
 }
 
 #[tokio::test]
-async fn scheduler_persists_and_advances_cursor() {
-    let system = Arc::new(
-        SystemDb::in_memory("scheduler_test", "main")
-            .await
-            .expect("connect"),
-    );
-    system.init_schema().await.expect("init schema");
-    let tenant = resolve_default_tenant(&system, "test")
-        .await
-        .expect("seed tenant");
+async fn scheduler_persists_via_http_and_advances_cursor() {
+    let app = TestApp::build().await;
+    let (base_url, server) = app.serve_local().await;
 
-    // Scheduler runs against the privileged path in production —
-    // the test mirrors that wiring rather than the per-request path.
-    let trait_storage: Arc<dyn Storage> = system.storage();
-    let sink: Arc<dyn IngestSink> = Arc::new(Pipeline::new(trait_storage.clone()));
+    // HS512 service identity, signed with the test secret SurrealDB's
+    // app_session access method validates against. Roles=["ingester"]
+    // so the role gate inside the HTTP handler accepts the call.
+    let identity: Arc<dyn ServiceIdentity> = Arc::new(Hs512ServiceIdentity::new(
+        "test",
+        TEST_JWT_SECRET,
+        app.default_tenant_slug.clone(),
+        "delphi_test",
+        "main",
+    ));
+    let ingest = Arc::new(IngestApiClient::new(base_url, identity));
 
     let adapter = Arc::new(
         FakeAdapter::new(
             "fake",
             Duration::from_millis(50),
-            vec![vec![req("doc-A"), req("doc-B")], vec![req("doc-C")]],
+            vec![vec![body("doc-A"), body("doc-B")], vec![body("doc-C")]],
         )
         .with_next_cursor(json!({ "since": "2026-05-06" })),
     );
@@ -67,24 +69,34 @@ async fn scheduler_persists_and_advances_cursor() {
     registry.register(adapter.clone());
 
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
-    let handle = run_scheduler(sink, filter, trait_storage.clone(), tenant.clone(), registry);
+    let storage: Arc<dyn Storage> = app.system.storage();
+    let handle = run_scheduler(
+        ingest,
+        filter,
+        storage.clone(),
+        app.default_tenant_id.clone(),
+        registry,
+    );
 
-    // Wait long enough for at least two ticks to fire (first is immediate).
-    sleep(Duration::from_millis(200)).await;
+    // Adapter waits one full poll_interval before its first tick now
+    // (loopback ordering, see scheduler doc-comment); allow several
+    // ticks to fire.
+    sleep(Duration::from_millis(300)).await;
     handle.shutdown().await;
+    server.abort();
 
     assert!(adapter.fetch_count() >= 2, "fake adapter should have ticked");
 
     for canonical_id in ["doc-A", "doc-B", "doc-C"] {
-        let doc = trait_storage
-            .get_document_by_canonical(&tenant, canonical_id)
+        let doc = storage
+            .get_document_by_canonical(&app.default_tenant_id, canonical_id)
             .await
             .unwrap();
         assert!(doc.is_some(), "{canonical_id} not persisted");
     }
 
-    let cursor = trait_storage
-        .get_source_cursor(&tenant, "fake")
+    let cursor = storage
+        .get_source_cursor(&app.default_tenant_id, "fake")
         .await
         .unwrap();
     assert_eq!(cursor, Some(json!({ "since": "2026-05-06" })));

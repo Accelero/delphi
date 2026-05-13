@@ -30,6 +30,7 @@ mod guard;
 mod jwt;
 mod middleware;
 mod routes;
+mod service_identity;
 mod validator;
 
 #[cfg(feature = "dev-auth")]
@@ -43,6 +44,9 @@ pub use context::AuthContext;
 pub use guard::{enforce_production_guard, print_banner};
 pub use jwt::JwtClaimsExtractor;
 pub use middleware::{identity_middleware, IdentityDeps};
+pub use service_identity::{
+    service_identity_from_env, Hs512ServiceIdentity, OAuthClientCredsIdentity, ServiceIdentity,
+};
 pub use validator::{validator_from_jwt_access, Hs512Validator, JwksValidator, JwtValidator};
 
 pub use bootstrap::{ensure_user, resolve_default_tenant};

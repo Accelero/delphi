@@ -152,6 +152,25 @@ impl TestApp {
         }
     }
 
+    /// Bind a real TCP listener and serve the router on it. Returns the
+    /// `http://127.0.0.1:<port>` base URL plus the JoinHandle so the
+    /// test can abort the server on teardown.
+    ///
+    /// Used by tests that exercise the scheduler's loopback HTTP path —
+    /// `IngestApiClient` speaks `reqwest`, not `tower::ServiceExt`, so
+    /// the router has to live behind a real socket.
+    pub async fn serve_local(&self) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local_addr");
+        let app = self.router.clone();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     /// Issue a request through the full middleware stack. Consumes the body
     /// and returns the parsed JSON / raw bytes / status.
     pub async fn send(&self, req: Request<Body>) -> TestResponse {

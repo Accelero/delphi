@@ -2,7 +2,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use surrealdb::RecordId;
 
 use crate::auth::AuthContext;
@@ -19,7 +19,7 @@ const INGESTER_ROLES: &[&str] = &["ingester", "owner"];
 /// **not** read from the request body. The handler stamps it from
 /// `AuthContext.tenant_id` so a caller can never smuggle a foreign
 /// tenant via the JSON payload.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequestBody {
     pub canonical_id: String,
     pub source_type: String,

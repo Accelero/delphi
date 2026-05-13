@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::ingestion::IngestRequest;
+use crate::ingestion::IngestRequestBody;
 
 use super::{Decision, IngestFilter};
 
@@ -17,7 +17,7 @@ impl NoopFilter {
 
 #[async_trait]
 impl IngestFilter for NoopFilter {
-    async fn evaluate(&self, _req: &IngestRequest) -> Decision {
+    async fn evaluate(&self, _req: &IngestRequestBody) -> Decision {
         Decision::Accept
     }
 }

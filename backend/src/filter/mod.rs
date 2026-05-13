@@ -25,13 +25,13 @@ mod noop;
 
 use async_trait::async_trait;
 
-use crate::ingestion::IngestRequest;
+use crate::ingestion::IngestRequestBody;
 
 pub use noop::NoopFilter;
 
 #[async_trait]
 pub trait IngestFilter: Send + Sync {
-    async fn evaluate(&self, req: &IngestRequest) -> Decision;
+    async fn evaluate(&self, req: &IngestRequestBody) -> Decision;
 }
 
 #[derive(Debug, Clone)]

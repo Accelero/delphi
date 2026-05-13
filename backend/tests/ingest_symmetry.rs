@@ -1,8 +1,8 @@
-//! The same `IngestRequest` submitted via the HTTP endpoint and via the
-//! in-process scheduler must produce the same `IngestOutcome` and the
-//! same persisted state. This is the test that *enforces* the
-//! "one unified interface" property of `IngestSink` — if anyone
-//! introduces a parallel codepath in either layer, this test catches it.
+//! HTTP-direct and scheduler ingest must produce the same persisted
+//! state. After the cutover both paths terminate at the same
+//! `/api/ingestion/documents` handler, so this test is structurally
+//! guaranteed — it stays in the tree as a regression net against a
+//! future refactor that re-introduces a parallel ingest codepath.
 
 mod common;
 
@@ -12,16 +12,15 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
-use surrealdb::RecordId;
 
-use delphi::auth::resolve_default_tenant;
+use delphi::auth::{Hs512ServiceIdentity, ServiceIdentity};
 use delphi::filter::{IngestFilter, NoopFilter};
-use delphi::ingestion::{IngestRequest, IngestSink, Pipeline};
-use delphi::sources::{run_scheduler, AdapterRegistry};
-use delphi::storage::{Storage, SystemDb};
+use delphi::ingestion::IngestRequestBody;
+use delphi::sources::{run_scheduler, AdapterRegistry, IngestApiClient};
+use delphi::storage::Storage;
 
 use crate::common::fake_source::FakeAdapter;
-use crate::common::{AuthRequestBuilder, TestApp};
+use crate::common::{AuthRequestBuilder, TestApp, TEST_JWT_SECRET};
 
 fn payload(canonical_id: &str) -> serde_json::Value {
     json!({
@@ -34,9 +33,8 @@ fn payload(canonical_id: &str) -> serde_json::Value {
     })
 }
 
-fn build_request(tenant: &RecordId, canonical_id: &str) -> IngestRequest {
-    IngestRequest {
-        tenant_id: tenant.clone(),
+fn build_body(canonical_id: &str) -> IngestRequestBody {
+    IngestRequestBody {
         canonical_id: canonical_id.into(),
         source_type: "symmetry-test".into(),
         source_uri: "https://symmetry.example/x".into(),
@@ -54,7 +52,8 @@ fn build_request(tenant: &RecordId, canonical_id: &str) -> IngestRequest {
 #[tokio::test]
 async fn http_and_scheduler_produce_equal_outcomes() {
     // Path A: HTTP. Use TestApp's full router so the IngestSink call is
-    // routed through axum + auth + JSON deserialization.
+    // routed through axum + auth + JSON deserialization under a user
+    // identity.
     let app_http = TestApp::build().await;
     let req = AuthRequestBuilder::default()
         .sub("ingestor")
@@ -80,48 +79,48 @@ async fn http_and_scheduler_produce_equal_outcomes() {
         .unwrap()
         .expect("HTTP path persisted doc");
 
-    // Path B: scheduler with the exact same `IngestRequest` shape in a
-    // fresh DB.
-    let system_b = Arc::new(
-        SystemDb::in_memory("symmetry_test_b", "main")
-            .await
-            .unwrap(),
-    );
-    system_b.init_schema().await.unwrap();
-    let tenant_b = resolve_default_tenant(&system_b, "test")
-        .await
-        .expect("tenant");
-    let trait_storage_b: Arc<dyn Storage> = system_b.storage();
-    let sink_b: Arc<dyn IngestSink> = Arc::new(Pipeline::new(trait_storage_b.clone()));
+    // Path B: scheduler, fresh app. The scheduler now goes through HTTP
+    // under a service-identity JWT — same endpoint, same handler.
+    let app_sched = TestApp::build().await;
+    let (base_url, server) = app_sched.serve_local().await;
+    let identity: Arc<dyn ServiceIdentity> = Arc::new(Hs512ServiceIdentity::new(
+        "test",
+        TEST_JWT_SECRET,
+        app_sched.default_tenant_slug.clone(),
+        "delphi_test",
+        "main",
+    ));
+    let ingest = Arc::new(IngestApiClient::new(base_url, identity));
 
-    let item = build_request(&tenant_b, "sym-1");
     let adapter = Arc::new(FakeAdapter::new(
         "symmetry",
         Duration::from_millis(50),
-        vec![vec![item]],
+        vec![vec![build_body("sym-1")]],
     ));
     let mut registry = AdapterRegistry::new();
     registry.register(adapter.clone());
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
+    let storage: Arc<dyn Storage> = app_sched.system.storage();
     let handle = run_scheduler(
-        sink_b,
+        ingest,
         filter,
-        trait_storage_b.clone(),
-        tenant_b.clone(),
+        storage.clone(),
+        app_sched.default_tenant_id.clone(),
         registry,
     );
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     handle.shutdown().await;
+    server.abort();
 
-    let sched_doc = trait_storage_b
-        .get_document_by_canonical(&tenant_b, "sym-1")
+    let sched_doc = storage
+        .get_document_by_canonical(&app_sched.default_tenant_id, "sym-1")
         .await
         .unwrap()
         .expect("scheduler path persisted doc");
 
     // Symmetry: both paths agree on every persisted field except for
-    // server-stamped `ingested_at` (different DBs, different wall-clock)
-    // and `tenant_id` (different DBs have different tenant RecordIds).
+    // server-stamped `ingested_at` (different wall-clocks) and
+    // `tenant_id` (different DBs — same slug, different RecordIds).
     assert_eq!(http_doc.canonical_id, sched_doc.canonical_id);
     assert_eq!(http_doc.source_type, sched_doc.source_type);
     assert_eq!(http_doc.source_uri, sched_doc.source_uri);

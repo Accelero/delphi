@@ -58,6 +58,12 @@
       "attributes": {
         "tenant_id": ["tenant-b"]
       }
+    },
+    {
+      "username": "service-account-delphi-arxiv-adapter",
+      "enabled": true,
+      "serviceAccountClientId": "delphi-arxiv-adapter",
+      "realmRoles": ["ingester"]
     }
   ],
 
@@ -80,7 +86,8 @@
       ],
       "protocol": "openid-connect",
       "attributes": {
-        "access.token.lifespan": "1800"
+        "access.token.lifespan": "1800",
+        "post.logout.redirect.uris": "http://localhost/"
       },
       "protocolMappers": [
         {
@@ -143,6 +150,102 @@
           "config": {
             "claim.name": "db",
             "claim.value": "main",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "//": "Service identity for the in-process arXiv adapter. Tier-2 only — tier-1 mints HS512 locally with SURREAL_JWT_SECRET. The backend's scheduler exchanges client_credentials for an access token and POSTs to its own /api/ingestion/documents endpoint under that bearer — same trust boundary as user requests.",
+      "clientId": "delphi-arxiv-adapter",
+      "name": "Delphi arXiv adapter service identity",
+      "enabled": true,
+      "secret": "delphi-arxiv-adapter-dev-secret-please-change",
+      "clientAuthenticatorType": "client-secret",
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "publicClient": false,
+      "protocol": "openid-connect",
+      "attributes": {
+        "access.token.lifespan": "1800"
+      },
+      "protocolMappers": [
+        {
+          "name": "tenant_id-hardcoded",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "tenant_id",
+            "claim.value": "tenant-a",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "roles-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "config": {
+            "claim.name": "roles",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false",
+            "multivalued": "true"
+          }
+        },
+        {
+          "name": "surreal-ac-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "ac",
+            "claim.value": "app_session",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "surreal-ns-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "ns",
+            "claim.value": "delphi",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "surreal-db-mapper",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "db",
+            "claim.value": "main",
+            "jsonType.label": "String",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "false"
+          }
+        },
+        {
+          "name": "email-hardcoded",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-hardcoded-claim-mapper",
+          "config": {
+            "claim.name": "email",
+            "claim.value": "arxiv-adapter@delphi.local",
             "jsonType.label": "String",
             "id.token.claim": "false",
             "access.token.claim": "true",

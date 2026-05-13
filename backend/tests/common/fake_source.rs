@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use delphi::error::Result;
-use delphi::ingestion::IngestRequest;
+use delphi::ingestion::IngestRequestBody;
 use delphi::sources::{Fetched, SourceAdapter};
 
 pub struct FakeAdapter {
@@ -17,13 +17,13 @@ pub struct FakeAdapter {
     poll_interval: Duration,
     /// Each tick pops one batch from the front. When exhausted, returns
     /// an empty batch — the scheduler keeps ticking but does no work.
-    batches: Arc<Mutex<Vec<Vec<IngestRequest>>>>,
+    batches: Arc<Mutex<Vec<Vec<IngestRequestBody>>>>,
     next_cursor: Mutex<Option<Value>>,
     fetch_count: AtomicUsize,
 }
 
 impl FakeAdapter {
-    pub fn new(name: &str, poll_interval: Duration, batches: Vec<Vec<IngestRequest>>) -> Self {
+    pub fn new(name: &str, poll_interval: Duration, batches: Vec<Vec<IngestRequestBody>>) -> Self {
         Self {
             name: name.into(),
             poll_interval,

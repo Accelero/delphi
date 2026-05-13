@@ -19,6 +19,6 @@ mod http;
 mod notifier;
 mod pipeline;
 
-pub use http::ingest_documents;
+pub use http::{ingest_documents, IngestRequestBody};
 pub use notifier::{FeedItemEvent, NotifyingSink, DEFAULT_BROADCAST_CAPACITY};
 pub use pipeline::{IngestOutcome, IngestRequest, IngestSink, Pipeline};

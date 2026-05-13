@@ -1,16 +1,16 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use surrealdb::RecordId;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio::time::interval;
+use tokio::time::interval_at;
 
 use crate::error::Result;
 use crate::filter::{Decision, IngestFilter};
-use crate::ingestion::IngestSink;
 use crate::storage::Storage;
 
-use super::{AdapterRegistry, SourceAdapter};
+use super::{AdapterRegistry, IngestApiClient, SourceAdapter};
 
 /// Returned by [`run_scheduler`]. Call `.shutdown().await` to stop all
 /// adapter tasks. Holding it alive keeps the scheduler running.
@@ -31,36 +31,45 @@ impl SchedulerHandle {
 /// Spawn one task per adapter and return a handle for shutdown.
 ///
 /// Each task ticks on `adapter.poll_interval()`, calls
-/// `adapter.fetch(cursor)`, hands every returned `IngestRequest` to the
-/// filter, and on `Accept` funnels it through `sink.ingest`. The
-/// scheduler stamps `tenant_id` on every `IngestRequest` before passing
-/// to filter / sink — adapters set the field to a placeholder; the
-/// scheduler is authoritative. v1 is single-tenant scheduler-wide; v2
-/// multi-tenant will spawn one scheduler per tenant.
+/// `adapter.fetch(cursor)`, runs each item through the filter, and on
+/// `Accept` POSTs an [`IngestRequestBody`] to `/api/ingestion/documents`
+/// via [`IngestApiClient`]. The handler stamps `tenant_id` from the
+/// service-identity JWT — the scheduler does not see it on the ingest
+/// path.
 ///
-/// Errors at any stage are logged and the task continues — no DLQ in
-/// slice 2.
+/// `cursor_tenant_id` is used **only** for system-path cursor
+/// persistence (the `source_state` row that records "where this adapter
+/// got to"). It must match the tenant the service identity carries so
+/// cursor reads and ingest writes land together; in `api::serve` both
+/// derive from the same `SOURCES_DEFAULT_TENANT_SLUG`.
 ///
-/// Note: `tokio::time::interval` fires its first tick immediately, so
-/// adapters poll right at startup (the desired behaviour after a
-/// restart).
+/// Tasks wait one full `poll_interval` before their first tick: the
+/// scheduler is spawned from `api::serve` before the HTTP listener
+/// starts accepting connections, so an immediate tick would race the
+/// `axum::serve` bind. After the initial wait the cadence is the
+/// standard fixed-interval poll.
 pub fn run_scheduler(
-    sink: Arc<dyn IngestSink>,
+    ingest: Arc<IngestApiClient>,
     filter: Arc<dyn IngestFilter>,
     storage: Arc<dyn Storage>,
-    tenant_id: RecordId,
+    cursor_tenant_id: RecordId,
     registry: AdapterRegistry,
 ) -> SchedulerHandle {
     let shutdown = Arc::new(Notify::new());
     let mut handles = Vec::new();
     for adapter in registry.into_inner() {
-        let sink = sink.clone();
+        let ingest = ingest.clone();
         let filter = filter.clone();
         let storage = storage.clone();
-        let tenant_id = tenant_id.clone();
+        let cursor_tenant_id = cursor_tenant_id.clone();
         let shutdown = shutdown.clone();
         handles.push(tokio::spawn(adapter_loop(
-            adapter, sink, filter, storage, tenant_id, shutdown,
+            adapter,
+            ingest,
+            filter,
+            storage,
+            cursor_tenant_id,
+            shutdown,
         )));
     }
     SchedulerHandle { shutdown, handles }
@@ -68,14 +77,19 @@ pub fn run_scheduler(
 
 async fn adapter_loop(
     adapter: Arc<dyn SourceAdapter>,
-    sink: Arc<dyn IngestSink>,
+    ingest: Arc<IngestApiClient>,
     filter: Arc<dyn IngestFilter>,
     storage: Arc<dyn Storage>,
-    tenant_id: RecordId,
+    cursor_tenant_id: RecordId,
     shutdown: Arc<Notify>,
 ) {
     let name = adapter.name().to_string();
-    let mut ticker = interval(adapter.poll_interval());
+    let interval = adapter.poll_interval();
+    // `interval_at(now + period, period)` skips the immediate first
+    // tick `tokio::time::interval` would otherwise fire — see the
+    // doc-comment on `run_scheduler` for why.
+    let start = tokio::time::Instant::from_std(Instant::now() + interval);
+    let mut ticker = interval_at(start, interval);
 
     loop {
         tokio::select! {
@@ -87,10 +101,10 @@ async fn adapter_loop(
             _ = ticker.tick() => {
                 if let Err(e) = run_once(
                     adapter.as_ref(),
-                    sink.as_ref(),
+                    ingest.as_ref(),
                     filter.as_ref(),
                     storage.as_ref(),
-                    &tenant_id,
+                    &cursor_tenant_id,
                 )
                 .await
                 {
@@ -103,31 +117,34 @@ async fn adapter_loop(
 
 async fn run_once(
     adapter: &dyn SourceAdapter,
-    sink: &dyn IngestSink,
+    ingest: &IngestApiClient,
     filter: &dyn IngestFilter,
     storage: &dyn Storage,
-    tenant_id: &RecordId,
+    cursor_tenant_id: &RecordId,
 ) -> Result<()> {
-    let cursor = storage.get_source_cursor(tenant_id, adapter.name()).await?;
+    let cursor = storage
+        .get_source_cursor(cursor_tenant_id, adapter.name())
+        .await?;
     let fetched = adapter.fetch(cursor).await?;
 
     let total = fetched.items.len();
     let mut accepted = 0usize;
     let mut rejected = 0usize;
 
-    for mut item in fetched.items {
-        // Scheduler is authoritative for tenant — overwrite whatever the
-        // adapter set (adapters use a placeholder).
-        item.tenant_id = tenant_id.clone();
+    for item in fetched.items {
         match filter.evaluate(&item).await {
             Decision::Accept => {
                 accepted += 1;
-                match sink.ingest(item).await {
+                match ingest.ingest(item).await {
                     Ok(outcome) => {
-                        tracing::debug!(adapter = adapter.name(), ?outcome, "ingested")
+                        tracing::debug!(adapter = adapter.name(), ?outcome, "ingested via API")
                     }
                     Err(e) => {
-                        tracing::error!(adapter = adapter.name(), error = %e, "ingest failed")
+                        tracing::error!(
+                            adapter = adapter.name(),
+                            error = %e,
+                            "ingest API call failed"
+                        );
                     }
                 }
             }
@@ -144,7 +161,9 @@ async fn run_once(
     }
 
     if let Some(c) = fetched.next_cursor {
-        storage.put_source_cursor(tenant_id, adapter.name(), &c).await?;
+        storage
+            .put_source_cursor(cursor_tenant_id, adapter.name(), &c)
+            .await?;
     }
     tracing::info!(
         adapter = adapter.name(),

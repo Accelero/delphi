@@ -1,18 +1,21 @@
 //! Source adapters: in-process pollers that fetch documents from external
 //! catalogues on a schedule and funnel them through the ingestion pipeline.
 //!
-//! Adapters do not persist; they produce [`IngestRequest`]s that the
-//! scheduler hands to an [`IngestSink`]. This is the same
-//! `IngestSink::ingest` call the HTTP endpoint at
-//! `POST /api/ingestion/documents` makes — internal and external
-//! ingestion paths converge on one method.
+//! Adapters do not persist; they produce [`IngestRequestBody`]s that the
+//! scheduler POSTs to its own `/api/ingestion/documents` endpoint over
+//! loopback, authenticated as a service identity. There is exactly one
+//! ingestion API — internal adapters and external callers converge on
+//! it, validated by the same JWT pipeline.
 //!
 //! ## Tenancy
 //!
-//! Slice 1 is single-tenant. The scheduler has no `AuthContext`; it
-//! operates implicitly against `AUTH_DEFAULT_TENANT_SLUG` (resolved at
-//! startup in `crate::api::serve`). When SaaS lands, the scheduler will
-//! gain per-tenant context and `IngestRequest` will carry `tenant_id`.
+//! Adapters are tenant-agnostic — they construct
+//! [`IngestRequestBody`]s (which carry no `tenant_id` field). The
+//! tenant is stamped server-side by the `/api/ingestion/documents`
+//! handler from the service-identity JWT's `tenant_id` claim. v1 mints
+//! a single service identity per scheduler, pinning it to
+//! `SOURCES_DEFAULT_TENANT_SLUG`. SaaS will mint one identity per
+//! tenant.
 //!
 //! ## Installing adapters
 //!
@@ -22,13 +25,15 @@
 //!   required env vars are unset, so adapters are opt-in by configuration.
 //! - **External (any language):** call `POST /api/ingestion/documents`
 //!   with a service-account identity that has the `ingester` role. The
-//!   request shape is the same `IngestRequest` in-tree adapters produce.
+//!   request shape is the same `IngestRequestBody` in-tree adapters
+//!   produce — this is literally the same endpoint the in-process
+//!   scheduler calls.
 //! - **Hot-loadable (WASM/dlopen):** explicitly out of scope for slice 1.
 //!
-//! [`IngestRequest`]: crate::ingestion::IngestRequest
-//! [`IngestSink`]: crate::ingestion::IngestSink
+//! [`IngestRequestBody`]: crate::ingestion::IngestRequestBody
 
 mod arxiv;
+mod ingest_client;
 mod registry;
 mod scheduler;
 
@@ -36,24 +41,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use surrealdb::RecordId;
 
 use crate::error::Result;
-use crate::ingestion::IngestRequest;
+use crate::ingestion::IngestRequestBody;
 
+pub use ingest_client::IngestApiClient;
 pub use registry::{default_registry, AdapterRegistry};
 pub use scheduler::{run_scheduler, SchedulerHandle};
 
-/// Placeholder tenant id adapters use when constructing an
-/// `IngestRequest`. The scheduler overwrites it before the request
-/// reaches the sink — adapters are tenant-agnostic.
-pub(crate) fn placeholder_tenant_id() -> RecordId {
-    RecordId::from(("tenant", "scheduler-placeholder"))
-}
-
 /// One adapter's output for a single fetch cycle.
 pub struct Fetched {
-    pub items: Vec<IngestRequest>,
+    pub items: Vec<IngestRequestBody>,
     /// Optional new cursor to persist before the next poll. `None` means
     /// "leave the cursor alone" (e.g., empty fetch with nothing new).
     pub next_cursor: Option<Value>,

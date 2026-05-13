@@ -160,6 +160,15 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+      # In-process source-adapter scheduler authenticates to its own
+      # /api/ingestion/documents endpoint as a Keycloak service account
+      # via OAuth2 client_credentials. The realm-export defines
+      # `delphi-arxiv-adapter` with the `ingester` realm role + a
+      # hard-coded `tenant_id: tenant-a` mapper so doc ingest lands in
+      # alice's tenant.
+      ARXIV_OAUTH_TOKEN_URL: ${ARXIV_OAUTH_TOKEN_URL:-http://keycloak:8080/realms/delphi/protocol/openid-connect/token}
+      ARXIV_OAUTH_CLIENT_ID: ${ARXIV_OAUTH_CLIENT_ID:-delphi-arxiv-adapter}
+      ARXIV_OAUTH_CLIENT_SECRET: ${ARXIV_OAUTH_CLIENT_SECRET:-delphi-arxiv-adapter-dev-secret-please-change}
     depends_on:
       surrealdb:
         condition: service_healthy
