@@ -14,7 +14,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # `dev-auth` so local dev gets the dev-mode auth bypass.
 ARG BACKEND_FEATURES=""
 
-COPY Cargo.toml ./
+# Pre-build dependencies against stub sources so source-only edits don't
+# trigger a full recompile of every crate. Cache key is (Cargo.toml,
+# Cargo.lock, BACKEND_FEATURES); the real `src/` change below only
+# recompiles the leaf `delphi` crate.
+#
+# Cargo has no native "deps-only build" command. The stub trick — feed it
+# an empty lib + bin so it resolves and compiles the full dep graph, then
+# delete the stub artifacts so cargo recompiles the leaf against real src
+# — is the standard workaround. cargo-chef would also work; it's not
+# worth the extra base image for a single-crate project.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src \
+ && echo "fn main() {}" > src/main.rs \
+ && echo ""              > src/lib.rs \
+ && cargo build --release --bin delphi ${BACKEND_FEATURES:+--features ${BACKEND_FEATURES}} \
+ && rm -rf src \
+            target/release/deps/delphi-* target/release/deps/libdelphi-* \
+            target/release/delphi target/release/delphi.d
+
 COPY src ./src
 COPY schema.surql ./schema.surql
 
