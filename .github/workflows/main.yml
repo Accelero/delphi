@@ -40,14 +40,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker tags must be all-lowercase; GitHub repo owners often
+      # aren't (e.g. `Accelero`). Project expressions have no `lower()`
+      # builtin, so compute it here.
+      - name: Lowercase repository owner
+        id: owner
+        run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: ./backend
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/delphi-backend:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/delphi-backend:latest
+            ghcr.io/${{ steps.owner.outputs.value }}/delphi-backend:${{ github.sha }}
+            ghcr.io/${{ steps.owner.outputs.value }}/delphi-backend:latest
           cache-from: type=gha,scope=backend
           cache-to: type=gha,mode=max,scope=backend
           # Production-shaped: NO dev-auth feature.
