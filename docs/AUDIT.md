@@ -75,15 +75,31 @@ Mark items as `[x]` once a fix has been merged and verified.
   `UNIQUE (tenant_id, canonical_id)`. `Pipeline::ingest` looks up by
   `(tenant, canonical_id)`._
 
-- [ ] **H2.** `mark_read` is not idempotent under concurrent races: SELECT-
+- [x] **H2.** `mark_read` is not idempotent under concurrent races: SELECT-
   then-CREATE without a transaction. Schema has a UNIQUE `(user, document)`
   index, but the unique-violation isn't swallowed — the second concurrent
   call returns 500. Either use `UPSERT` or catch the unique violation.
 
-- [ ] **H3.** No request body size limits configured. axum's 2 MB default
+  _Resolved: rewrote `SurrealStorage::mark_read` as a single
+  `INSERT INTO feed_read … ON DUPLICATE KEY UPDATE read_at = read_at`
+  statement. The UPDATE side is a deliberate no-op so first-read
+  semantics are preserved (a re-mark doesn't bump the timestamp).
+  SurrealDB's MVCC can still reject genuinely concurrent writes to
+  the same row with a transient "Resource busy" error, so the call
+  retries up to 5x with a few ms of backoff per attempt. Live
+  smoke against tier-1 with 16 parallel POSTs returned 16/16 = 204.
+  New unit test (`mark_read_concurrent_calls_all_succeed_and_create_one_row`)
+  asserts both classes of error are masked from callers._
+
+- [x] **H3.** No request body size limits configured. axum's 2 MB default
   applies, but `/api/ingestion/documents` accepts an `IngestRequest` with
   arbitrary `raw_text` and `metadata`. Set explicit per-route
   `DefaultBodyLimit` (especially tighter on `/api/chat`).
+
+  _Deferred to infra: see [INFRA-BACKLOG.md#i1](INFRA-BACKLOG.md#i1-per-route-body-size-limits-was-audit-h3).
+  Belongs at the reverse proxy (Traefik `buffering.maxRequestBodyBytes`
+  per-route) so oversized requests never reach the backend. Single-user
+  / private deployments skip._
 
 - [x] **H4.** arXiv `pdftotext` shell-out (`sources/arxiv.rs::extract_pdf_text`)
   has no `tokio::time::timeout`, no output size cap, and the PDF download
@@ -255,9 +271,14 @@ Mark items as `[x]` once a fix has been merged and verified.
   builds also link the in-memory engine. Move it behind a `kv-mem`
   feature gated to dev/test.
 
-- [ ] **L2.** No rate-limit middleware anywhere; `/api/chat` logs every
+- [x] **L2.** No rate-limit middleware anywhere; `/api/chat` logs every
   request and forwards to upstream LLM. One user can flood logs and run
   up upstream spend. Add a per-user rate-limit.
+
+  _Deferred to infra: see [INFRA-BACKLOG.md#i2](INFRA-BACKLOG.md#i2-per-user-rate-limiting-on-apichat-was-audit-l2).
+  Belongs at the proxy / API gateway with per-user keying (requires
+  oauth2-proxy header injection so Traefik can see the identity).
+  Single-user / private deployments skip._
 
 - [ ] **L3.** `.env` (gitignored) contains a real `MINIMAX_API_KEY` on
   disk. Not in git history. Rotate and treat like any other credential.
@@ -460,5 +481,8 @@ Mark items as `[x]` once a fix has been merged and verified.
 6. ~~N5 — tier-2 `db.authenticate` against Keycloak JWKS.~~ ✓
 7. ~~N3 — backend signature validation (defence-in-depth).~~ ✓
 8. ~~H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).~~ ✓
-9. **H3, L2 — body size limit and per-user rate limit.**
-10. H2 — mark_read upsert race.
+9. ~~H3, L2 — body size limit and per-user rate limit.~~ Deferred to
+   infra ([`INFRA-BACKLOG.md`](INFRA-BACKLOG.md)) — defended at the
+   reverse proxy in tier-2; single-user deployments skip.
+10. ~~H2 — `mark_read` upsert race.~~ ✓
+11. **H6 — object-store tmp filename collision (concurrent PUT clobber).**

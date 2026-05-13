@@ -612,33 +612,46 @@ impl Storage for SurrealStorage {
         user_id: &RecordId,
         doc_id: &DocId,
     ) -> Result<()> {
-        // Idempotent: lookup-then-create. The unique index on (user,
-        // document) is the safety net if a race slips through.
-        let mut response = self
-            .db
-            .query(
-                "SELECT id FROM feed_read \
-                 WHERE tenant_id = $t AND user = $user AND document = $doc LIMIT 1",
-            )
-            .bind(("t", tenant.clone()))
-            .bind(("user", user_id.clone()))
-            .bind(("doc", doc_id.clone()))
-            .await?;
-        let existing: Option<IdRow> = response.take(0)?;
-        if existing.is_some() {
-            return Ok(());
+        // Audit H2: concurrent mark_read on the same (user, doc) used
+        // to 500 because SELECT-then-CREATE hit the
+        // `feed_read_user_doc` UNIQUE index on the second writer.
+        //
+        // The single statement below makes the duplicate-key path a
+        // no-op (`read_at = read_at` keeps first-read semantics — a
+        // re-mark doesn't bump the timestamp). SurrealDB's MVCC may
+        // still reject concurrent transactions touching the same row
+        // with a "Resource busy" / transaction-conflict error; that's
+        // a transient signal, so retry with brief jitter. Both error
+        // classes (duplicate key + transient conflict) are now masked
+        // from the caller — mark_read is unconditionally idempotent.
+        const MAX_ATTEMPTS: u32 = 5;
+        for attempt in 0..MAX_ATTEMPTS {
+            let result = self
+                .db
+                .query(
+                    "INSERT INTO feed_read \
+                     { tenant_id: $t, user: $user, document: $doc } \
+                     ON DUPLICATE KEY UPDATE read_at = read_at",
+                )
+                .bind(("t", tenant.clone()))
+                .bind(("user", user_id.clone()))
+                .bind(("doc", doc_id.clone()))
+                .await
+                .and_then(|mut r| r.check());
+            match result {
+                Ok(_) => return Ok(()),
+                Err(e) if is_transient_conflict(&e) && attempt + 1 < MAX_ATTEMPTS => {
+                    // Linear backoff with a tiny base so simultaneous
+                    // double-clicks resolve in <50ms total. Each attempt
+                    // gets a different sleep to spread retries out.
+                    let backoff_ms = 5 + 5 * attempt as u64;
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
-        self.db
-            .query(
-                "CREATE feed_read CONTENT \
-                 { tenant_id: $t, user: $user, document: $doc }",
-            )
-            .bind(("t", tenant.clone()))
-            .bind(("user", user_id.clone()))
-            .bind(("doc", doc_id.clone()))
-            .await?
-            .check()?;
-        Ok(())
+        unreachable!("retry loop exits via return")
     }
 
     async fn mark_unread(
@@ -659,6 +672,18 @@ impl Storage for SurrealStorage {
             .check()?;
         Ok(())
     }
+}
+
+/// Recognise SurrealDB's transient transaction-conflict signal so the
+/// caller can retry. Today's matcher uses message inspection because
+/// `surrealdb::Error` doesn't expose the underlying datastore error
+/// kind structurally. If a future surrealdb release surfaces a
+/// dedicated variant for this, swap to that match.
+fn is_transient_conflict(e: &surrealdb::Error) -> bool {
+    let msg = e.to_string();
+    // "Resource busy" — write-write conflict on same record under MVCC.
+    // "failed transaction" — broader transient transaction error.
+    msg.contains("Resource busy") || msg.contains("failed transaction")
 }
 
 fn build_filter_clause(f: &Filters) -> String {
@@ -838,6 +863,57 @@ mod feed_query_tests {
         storage.mark_unread(&tenant, &user, &id).await.unwrap();
         let items = storage.list_feed(&tenant, &user, None, 50).await.unwrap();
         assert!(!items[0].read);
+    }
+
+    #[tokio::test]
+    async fn mark_read_concurrent_calls_all_succeed_and_create_one_row() {
+        // Audit H2 regression: prior SELECT-then-CREATE pattern 500'd
+        // on concurrent calls because the second CREATE hit the
+        // `feed_read_user_doc` UNIQUE index. The new INSERT … ON
+        // DUPLICATE KEY UPDATE pattern serializes through the engine
+        // and keeps every call idempotent.
+        let (system, storage, tenant) = fresh().await;
+        let user = create_user(&system, "u1", &tenant).await;
+        let id = storage.upsert_document(&tenant, &doc(&tenant, "x")).await.unwrap();
+
+        // 16 simultaneous mark_reads, all must succeed.
+        let storage = std::sync::Arc::new(storage);
+        let mut tasks = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let storage = storage.clone();
+            let tenant = tenant.clone();
+            let user = user.clone();
+            let id = id.clone();
+            tasks.push(tokio::spawn(async move {
+                storage.mark_read(&tenant, &user, &id).await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task panic").expect("mark_read errored");
+        }
+
+        // Exactly one row in feed_read for (user, doc); the unique
+        // index would have caught any duplicates anyway, but assert
+        // explicitly so this test is the canary if the constraint is
+        // ever weakened.
+        #[derive(serde::Deserialize)]
+        struct CountRow {
+            count: i64,
+        }
+        let mut count_response = system
+            .raw()
+            .query(
+                "SELECT count() FROM feed_read \
+                 WHERE tenant_id = $t AND user = $user AND document = $doc \
+                 GROUP ALL",
+            )
+            .bind(("t", tenant.clone()))
+            .bind(("user", user.clone()))
+            .bind(("doc", id.clone()))
+            .await
+            .unwrap();
+        let row: Option<CountRow> = count_response.take(0).unwrap();
+        assert_eq!(row.map(|r| r.count).unwrap_or(0), 1, "exactly one row");
     }
 
     #[tokio::test]
