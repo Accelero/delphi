@@ -39,3 +39,30 @@ export async function loginViaKeycloak(
   // redirect chain (Keycloak → oauth2-proxy callback → original URL).
   await page.waitForURL(/^http:\/\/localhost\/(api\/)?/);
 }
+
+/**
+ * Drive the full sign-out chain including the Keycloak confirmation
+ * step. The chain:
+ *   /signout
+ *     ─► Traefik signout-chain middleware → /oauth2/sign_out?rd=…
+ *     ─► oauth2-proxy clears _oauth2_proxy + Redis session
+ *     ─► Keycloak end-session endpoint
+ *        ── shows a "Are you sure?" confirmation page because we
+ *           don't pass id_token_hint (Keycloak ≥ 18 requirement)
+ *     ─► click "Logout" button
+ *     ─► Keycloak invalidates SSO session, drops cookies
+ *     ─► /  (clean SPA boot)
+ */
+export async function signOutViaKeycloak(page: Page): Promise<void> {
+  await page.goto("http://localhost/signout");
+  // Land on Keycloak's logout-confirm page; the form's submit button
+  // is rendered as `input[type=submit]` with the localised label
+  // "Logout" (msg key: doLogout). Match either the role-based name or
+  // the raw input.
+  const confirm = page
+    .getByRole("button", { name: /^log[ -]?out$/i })
+    .or(page.locator("input[type=submit]"));
+  await confirm.first().click();
+  // Keycloak's post_logout_redirect_uri sends us back to "/".
+  await page.waitForURL(/^http:\/\/localhost\/?$/);
+}

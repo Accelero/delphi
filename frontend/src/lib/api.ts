@@ -107,11 +107,15 @@ export const api = {
   },
 };
 
-/** URL the browser hard-navigates to for sign-out. Owned by oauth2-proxy
- *  (the BFF), which clears the session cookie and redirects back to "/".
- *  In dev (Tier 1) this URL doesn't exist — the UI hides the sign-out
- *  control whenever `session.dev === true`. */
-export const SIGN_OUT_URL = "/oauth2/sign_out";
+/** URL the browser hard-navigates to for sign-out. Stable and
+ *  IdP-agnostic — Traefik's `signout-chain` middleware rewrites it to
+ *  `/oauth2/sign_out?rd=<keycloak end-session URL>`, so oauth2-proxy
+ *  clears the BFF session and the browser then hits Keycloak's
+ *  RP-initiated logout endpoint to kill the SSO session. Without that
+ *  second hop the next /api call silently re-authenticates against
+ *  the still-valid IdP session. In dev (Tier 1) there is no BFF; the
+ *  UI hides the sign-out control whenever `session.dev === true`. */
+export const SIGN_OUT_URL = "/signout";
 
 /** URL the browser hard-navigates to on a 401. oauth2-proxy starts the
  *  OIDC redirect chain and ?rd= brings the user back here afterwards. */

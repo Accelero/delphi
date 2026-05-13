@@ -204,6 +204,49 @@ Mark items as `[x]` once a fix has been merged and verified.
   URL. Operator-trusted, so not a vuln, but a typo silently produces a
   different query. Add a small validator (e.g. balanced parens).
 
+- [ ] **M13.** `POST /api/discovery/items/:id/read` returns 204 even
+  when `:id` does not exist or belongs to another tenant. Surfaced by
+  `tests/e2e/tenant-leakage.spec.ts` while writing the leakage suite.
+  Per-user read-state row gets created against an unverified document
+  id — bloats `feed_read` and would let a curious caller probe other
+  tenants' id space (existence side-channel). Fix: validate the
+  document exists in the caller's tenant before upserting `feed_read`.
+
+- [ ] **M14.** Tier-2 sign-out shows Keycloak's "Are you sure?"
+  confirmation page before clearing SSO cookies, because we don't
+  pass `id_token_hint` to the end-session endpoint. Keycloak ≥ 18
+  requires the hint to skip the prompt. Two fixes possible:
+  (a) make oauth2-proxy forward the IdP-issued id_token through to
+      the rd target — not a native oauth2-proxy feature, would need
+      a small wrapper or a fork;
+  (b) move the redirect into a tiny backend `/api/auth/logout`
+      handler that has the id_token in scope (BFF stores it
+      server-side) and constructs the URL with `id_token_hint`.
+  Test `tests/e2e/logout.spec.ts` currently clicks the confirm
+  button via `signOutViaKeycloak`, which masks this UX wart but
+  proves the security chain is correct.
+
+- [ ] **M12.** No instant permission/revocation path. After an admin
+  disables a user or drops a role in Keycloak, the user keeps
+  authenticated access until the next oauth2-proxy token refresh
+  (≤20 min) or JWT `exp` (≤30 min) — worst-case ~20 min of stale
+  access. ARCH.md previously implied a Redis blacklist closed this
+  gap; it does not, because oauth2-proxy ships **no** native blacklist
+  hook, no per-request revocation check, and no back-channel logout
+  endpoint (upstream `oauth2-proxy/oauth2-proxy#1224` and `#1684`,
+  both still open as of May 2026). The Guiding Principles rule out
+  any solution that would teach the backend about revocation
+  (no blacklist check or introspection in `JwtClaimsExtractor`).
+  Treated as advanced functionality and deferred. Two viable paths
+  when we revisit, both keep auth at the edge:
+  (a) **Shorter access-token TTL** — pure IdP + proxy config
+      change; "instant" SLO becomes "≤ TTL" (e.g. 60 s). Backend
+      contract unchanged. Cheapest, no code.
+  (b) **Replace the edge** with one that supports per-request
+      policy evaluation natively — **Pomerium**, **Ory Oathkeeper**,
+      or a managed IAP (Cloudflare Access, Google IAP). Backend
+      contract unchanged.
+
 ---
 
 ## Low

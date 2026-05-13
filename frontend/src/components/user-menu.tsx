@@ -1,11 +1,14 @@
 /**
  * Sidebar user menu: avatar + email + Sign out.
  *
- * Sign-out is owned by the BFF (oauth2-proxy), so we hard-navigate to
- * `/oauth2/sign_out`, which clears the session cookie and bounces back to
- * the IdP's logout endpoint. In dev mode (Tier 1) there's no BFF and no
- * cookie to clear — the menu hides the sign-out item entirely, since
- * "logging out" the dev user is a contradiction.
+ * Sign-out is owned by the BFF, so we hard-navigate to `/signout` —
+ * Traefik's `signout-chain` middleware redirects through oauth2-proxy
+ * (clears BFF session) and then to Keycloak's RP-initiated logout
+ * endpoint (kills SSO session). Both hops are required; the BFF-only
+ * hop would silently re-auth against the IdP. In dev mode (Tier 1)
+ * there's no BFF and no cookie to clear — the menu hides the
+ * sign-out item entirely, since "logging out" the dev user is a
+ * contradiction.
  */
 
 import { LogOutIcon, UserIcon } from "lucide-react";

@@ -1,0 +1,201 @@
+# PR-CI — the merge gate.
+#
+# Required to be green before merging to `main`. Mirrors the local
+# `make` targets so that "passes locally" implies "passes here."
+#
+# Four jobs, all in parallel:
+#   - lint             — rustfmt + clippy + tsc (~30s)
+#   - backend-test     — cargo test, matrix on the dev-auth feature
+#   - frontend-test    — Vitest under Node (Bun's child_process shim
+#                        breaks tinypool — same constraint as
+#                        Makefile's `frontend-test`)
+#   - e2e-tier1        — docker compose up + Playwright tier-1 specs
+#
+# Tier-2 e2e (Keycloak full stack) is not run here on purpose — too
+# slow + flaky for the merge gate. It belongs in nightly when wired.
+
+name: PR
+
+on:
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same PR — saves CI minutes when a
+# developer force-pushes during review.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (rustfmt + clippy + tsc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          # Lint and test share a target/ — separate the cache so
+          # they don't fight over the lockfile.
+          shared-key: lint
+
+      - name: rustfmt --check
+        working-directory: backend
+        run: cargo fmt --check
+
+      - name: clippy
+        working-directory: backend
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.1"
+
+      - name: bun install (frontend)
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+
+      - name: tsc --noEmit (frontend)
+        working-directory: frontend
+        run: bun run lint   # `lint` script is `tsc -b --noEmit`
+
+  backend-test:
+    name: Backend test (features=${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Empty string = production-shaped build (no dev-auth).
+        # `dev-auth` mirrors the Tier-1 dev binary.
+        features: ["", "dev-auth"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          shared-key: test-${{ matrix.features }}
+
+      - name: cargo test
+        working-directory: backend
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test --no-fail-fast
+          else
+            cargo test --no-fail-fast --features ${{ matrix.features }}
+          fi
+
+  frontend-test:
+    name: Frontend test (Vitest under Node)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Bun for `bun install` (faster, lockfile-aware), Node for
+      # actually running Vitest — Bun's child_process shim crashes
+      # tinypool. Documented in `docs/architecture/testing.md`.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.1"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: bun install
+        working-directory: frontend
+        run: bun install --frozen-lockfile
+
+      - name: Vitest (Node)
+        working-directory: frontend
+        run: node node_modules/.bin/vitest run
+
+  e2e-tier1:
+    name: E2E (Tier 1, Playwright)
+    runs-on: ubuntu-latest
+    # Tier-1 stack must be up before the playwright run; building the
+    # backend image takes ~3 min cold, ~15 s warm thanks to gha cache.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image (with gha layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          load: true            # keep image local, don't push
+          tags: delphi-backend:ci
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+      - name: Bring up Tier-1 stack
+        run: |
+          # Use the locally-built image so we don't rebuild via compose.
+          docker compose up -d --no-build || docker compose up -d --build
+          # Wait up to 90s for backend /healthz to respond. Surrealdb
+          # has its own healthcheck; backend and frontend don't.
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:8081/healthz >/dev/null 2>&1; then
+              echo "backend healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8081/healthz
+          # Give Vite a moment to compile.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:5173/ >/dev/null 2>&1; then
+              echo "frontend healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.1"
+
+      - name: bun install (tests)
+        working-directory: tests
+        run: bun install --frozen-lockfile
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('tests/bun.lock', 'tests/package.json') }}
+          restore-keys: playwright-${{ runner.os }}-
+
+      - name: Install Playwright browsers
+        working-directory: tests
+        run: bunx playwright install --with-deps chromium
+
+      - name: Run Playwright (tier1)
+        working-directory: tests
+        # `reporter: github` is already set in playwright.config.ts when
+        # CI is true — produces inline PR annotations on failures.
+        # Add HTML so we can upload it as an artifact for debugging.
+        run: bun run playwright test --project=tier1 --reporter=github,html
+
+      - name: Upload Playwright report (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-tier1-report
+          path: tests/playwright-report/
+          retention-days: 7
+
+      - name: Tier-1 stack logs (on failure)
+        if: failure()
+        run: docker compose logs --no-color

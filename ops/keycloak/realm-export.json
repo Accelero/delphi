@@ -159,7 +159,6 @@
       ]
     },
     {
-      "//": "Service identity for the in-process arXiv adapter. Tier-2 only — tier-1 mints HS512 locally with SURREAL_JWT_SECRET. The backend's scheduler exchanges client_credentials for an access token and POSTs to its own /api/ingestion/documents endpoint under that bearer — same trust boundary as user requests.",
       "clientId": "delphi-arxiv-adapter",
       "name": "Delphi arXiv adapter service identity",
       "enabled": true,

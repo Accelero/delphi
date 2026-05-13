@@ -24,7 +24,7 @@ This document describes how Delphi is built. For *what* it does, see
  Browser ──cookie──▶ Traefik (BFF)  ──headers──▶ Delphi backend ──▶ SurrealDB
                           │
                           ├── OIDC provider (login, claims)
-                          └── Redis (optional: JWT/session blacklist)
+                          └── Redis (oauth2-proxy session store)
 ```
 
 - **Frontend.** React SPA. No SSR. Talks to the backend over JSON HTTP.
@@ -38,8 +38,11 @@ This document describes how Delphi is built. For *what* it does, see
   access control.
 - **OIDC provider.** External. Owns user accounts, login UI, MFA, password
   reset, and issues JWTs with the claims the backend needs.
-- **Redis (optional).** Holds a session/JWT blacklist consulted by the
-  proxy for instant invalidation on permission changes.
+- **Redis.** Server-side session store for oauth2-proxy: each browser
+  cookie is an opaque ticket that resolves to an encrypted session
+  payload (access + refresh token, claims) keyed by ticket. Survives
+  proxy restarts. Not consulted as a blacklist today — see "Logout &
+  instant invalidation" below.
 
 ## Auth & session model (BFF)
 
@@ -53,7 +56,6 @@ JWT.
    browser.
 4. On each subsequent request, Traefik:
    - resolves the cookie to the stored JWT,
-   - optionally checks Redis for blacklist entries,
    - validates the JWT,
    - extracts claims and forwards them as request headers to the backend.
 
@@ -95,12 +97,56 @@ production identity middleware runs unchanged — same extractor, same
 upsert, same `AuthContext` reaches handlers. The only thing that changes
 between dev and prod is the source of the headers.
 
-### Logout & instant invalidation
+### Logout & session lifetime
 
-Logout invalidates the server-side session at the proxy and deletes the
-cookie. Permission changes that must take effect immediately (revoked role,
-disabled tenant) are pushed to Redis as blacklist entries and consulted on
-every request, eliminating the usual JWT-expiry lag.
+Logout hits oauth2-proxy's `/oauth2/sign_out`, which clears the BFF
+cookie and deletes the matching session in Redis. To also terminate the
+IdP-side SSO session, sign-out passes Keycloak's RP-initiated logout
+URL as the post-logout redirect (`?rd=…/protocol/openid-connect/logout`),
+so the browser visits Keycloak with its own cookies and the SSO session
+is killed too. Without that step, the SPA's next request silently
+re-authenticates against the still-valid SSO session.
+
+Natural expiry is the only other invalidation path today: oauth2-proxy
+cookie TTL (25 min), `cookie_refresh` (20 min — proxy refreshes the
+access token transparently before this), Keycloak access-token
+lifespan (30 min), idle SSO timeout (30 min), max SSO lifespan (10 h).
+The values are tuned so refresh always happens before expiry; users
+don't see the seams.
+
+### Instant permission updates (deferred)
+
+There is **no instant revocation today**. After an admin disables a
+user or removes a role in Keycloak, the user's BFF session keeps
+working until the next token refresh (≤20 min) or JWT expiry
+(≤30 min). Stale-access window: up to ~20 min worst case.
+
+**Critical constraint:** "auth lives at the edge" (Guiding
+Principles) rules out any solution that would teach the backend
+about revocation. No backend-side blacklist check, no backend-side
+introspection — `JwtClaimsExtractor` validates a JWT and stops
+there. That leaves exactly two options that respect the
+architecture:
+
+- **Shorter access-token TTL.** Pure IdP + proxy config change;
+  backend is unaware. The "instant" SLO becomes "≤ TTL." Cheapest
+  fix, no code, no swap. Mature deployments routinely use minute-
+  scale TTLs for exactly this reason.
+- **Replace the edge** with one that supports per-request policy
+  evaluation natively (e.g. **Pomerium**, **Ory Oathkeeper**, or a
+  managed IAP — Cloudflare Access, Google IAP). Revocation is
+  enforced at the proxy / policy-decision-point; backend contract is
+  unchanged.
+
+upstream oauth2-proxy ships **no** native blacklist hook, no
+per-request revocation check, and no back-channel logout endpoint
+(see `oauth2-proxy/oauth2-proxy#1224`, `#1684`, both open as of
+May 2026), which is why option (a) — staying on oauth2-proxy and
+adding revocation at the edge — is not on the menu without forking
+the proxy.
+
+Treated as advanced functionality and deferred. Tracked in
+[`AUDIT.md`](AUDIT.md) as `M12`.
 
 ### User administration
 
