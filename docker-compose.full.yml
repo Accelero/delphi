@@ -3,7 +3,7 @@ name: delphi-full
 # Tier 2: full prod-shape dev stack.
 #
 # Topology:
-#   browser → traefik (:80) → frontend (Vite)
+#   browser → traefik (:80) → frontend (Caddy serving built dist/)
 #                           → backend (:8081)        [forward-auth required]
 #                           → oauth2-proxy (:4180)   [/oauth2/*]
 #   browser → keycloak (:8088)                       [login UI, host-exposed]
@@ -12,11 +12,13 @@ name: delphi-full
 #   oauth2-proxy            → keycloak               [token redemption]
 #                           → redis                  [session store]
 #
-# Goal: validate the auth perimeter end-to-end against the same primitives
-# you'd use in production. The backend image here is built WITHOUT the
-# `dev-auth` cargo feature — it cannot self-inject identity. Every request
-# arrives at the backend with `X-Auth-*` headers placed there by Traefik
-# (which got them from oauth2-proxy via forward-auth).
+# Goal: validate the full prod-shape end-to-end against the same
+# primitives a real deployment uses. Backend is built WITHOUT the
+# `dev-auth` cargo feature — it cannot self-inject identity, every
+# request arrives with an IdP-issued JWT placed there by oauth2-proxy.
+# Frontend is the production Caddy bundle (`frontend/Dockerfile`),
+# not the Vite dev server, so e2e tests run against the actual bytes
+# that ship.
 #
 # Bring up:   docker compose -f docker-compose.full.yml up -d --build
 # Tear down:  docker compose -f docker-compose.full.yml down
@@ -173,20 +175,20 @@ services:
       surrealdb:
         condition: service_healthy
 
+  # Prod-shape frontend: production bundle baked into a Caddy image,
+  # not the Vite dev server. Tier-2 is meant to mirror prod end-to-end;
+  # serving HMR'd dev sources here would defeat the purpose. Tier-1
+  # (`docker-compose.yml`) keeps Vite for the inner-loop dev workflow.
+  #
+  # `build:` block lets `make full-up` build the image locally on first
+  # run; CI overrides with the GHCR image (`ghcr.io/.../delphi-frontend:<sha>`)
+  # so e2e validates the exact bytes that ship.
   frontend:
-    image: oven/bun:1.1
+    image: delphi-frontend:tier2
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
     container_name: delphi-full-frontend
-    working_dir: /app
-    command: ["sh", "-c", "if [ ! -x node_modules/.bin/vite ]; then bun install; fi; exec bun run dev"]
-    environment:
-      # The Vite dev-server proxy is irrelevant in this stack — Traefik
-      # routes `/api/*` directly. We still set BACKEND_URL so anyone hitting
-      # Vite on :5173 (bypassing Traefik) doesn't 404 on /api.
-      BACKEND_URL: http://backend:8081
-    volumes:
-      - ./frontend:/app
-      - frontend_node_modules_full:/app/node_modules
 
 volumes:
   surreal_data_full:
-  frontend_node_modules_full:

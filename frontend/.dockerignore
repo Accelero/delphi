@@ -1,0 +1,14 @@
+# Keep the Docker build context lean and reproducible.
+node_modules
+dist
+.vite
+*.log
+.env
+.env.*.local
+.DS_Store
+.idea
+.vscode
+# The Vite plugin regenerates these inside the build stage; don't
+# carry stale local copies.
+src/routeTree.gen.ts
+*.tsbuildinfo

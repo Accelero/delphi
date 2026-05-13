@@ -223,6 +223,16 @@ through that interface.
 - **Routing/state.** SPA with client-side routing. No SSR.
 - **Auth.** The SPA assumes it is already authenticated — if a request
   401s, it lets the proxy handle the redirect to the OIDC provider.
+- **Production serving.** Vite builds a static bundle (`dist/`) at
+  image-build time. A two-stage `frontend/Dockerfile` copies the
+  bundle into a `caddy:2-alpine` image that serves it on `:80` with
+  SPA fallback (`try_files {path} /index.html`), zstd/gzip
+  compression, and `immutable` cache headers on hashed assets. The
+  resulting `delphi-frontend` image sits behind Traefik like any
+  other upstream — Traefik handles TLS, routing, and the BFF chain;
+  Caddy just serves files. Tier-1 dev keeps the Vite dev server for
+  HMR; Tier-2 runs the production Caddy image so e2e validates the
+  actual bytes that ship.
 - **Chat surface.** Reusable component used for both corpus-RAG chat and
   per-document analysis chat. Streaming responses with markdown and
   reasoning rendering.
@@ -243,10 +253,14 @@ Two reference stacks ship in the repo, each backed by a compose file:
   backend's dev injector writes `X-Auth-*` headers itself, so the
   production identity middleware runs unchanged.
 - **Tier 2 — `docker-compose.full.yml`.** Full prod-shape stack: Traefik
-  (entry point + forward-auth) + Dex (OIDC IdP) + oauth2-proxy (BFF) +
-  Redis (session store) + SurrealDB + backend (built without `dev-auth`)
-  + frontend. Browser only sees the Traefik origin; the backend never
-  sees a JWT or a cookie.
+  (entry point + forward-auth) + Keycloak (OIDC IdP) + oauth2-proxy
+  (BFF) + Redis (session store) + SurrealDB + backend (built without
+  `dev-auth`) + **frontend served by Caddy from a built bundle**
+  (`frontend/Dockerfile`). Browser only sees the Traefik origin;
+  the backend receives an IdP-issued JWT as `Authorization: Bearer`.
+  Both backend and frontend are built once in PR-CI and the same
+  bytes are promoted to GHCR on merge — the e2e suite tests the
+  artifact that ships, not a dev variant of it.
 
 Production deployment is Tier 2 with the IdP, secrets, TLS, and the
 backend image as the only deltas from the dev compose file. "Works in

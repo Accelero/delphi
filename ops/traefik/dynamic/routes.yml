@@ -65,7 +65,7 @@ http:
     frontend:
       loadBalancer:
         servers:
-          - url: "http://frontend:5173"
+          - url: "http://frontend:80"
 
   middlewares:
     # Forward-auth: every /api/* request triggers a sub-request to

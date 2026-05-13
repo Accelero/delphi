@@ -26,8 +26,21 @@ permissions:
 
 jobs:
   build-and-push:
-    name: Build & push backend image to GHCR
+    name: Build & push ${{ matrix.image }} image to GHCR
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: backend
+            context: ./backend
+            cache_scope: backend
+            # Production-shaped: NO dev-auth feature.
+            build_args: BACKEND_FEATURES=
+          - image: frontend
+            context: ./frontend
+            cache_scope: frontend
+            build_args: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -50,13 +63,11 @@ jobs:
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
-          context: ./backend
+          context: ${{ matrix.context }}
           push: true
           tags: |
-            ghcr.io/${{ steps.owner.outputs.value }}/delphi-backend:${{ github.sha }}
-            ghcr.io/${{ steps.owner.outputs.value }}/delphi-backend:latest
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,mode=max,scope=backend
-          # Production-shaped: NO dev-auth feature.
-          build-args: |
-            BACKEND_FEATURES=
+            ghcr.io/${{ steps.owner.outputs.value }}/delphi-${{ matrix.image }}:${{ github.sha }}
+            ghcr.io/${{ steps.owner.outputs.value }}/delphi-${{ matrix.image }}:latest
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+          build-args: ${{ matrix.build_args }}
