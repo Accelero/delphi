@@ -5,7 +5,7 @@
 # the case where you actually want to test/ship the production bundle.
 
 # ── Stage 1 — build the SPA ──────────────────────────────────────────
-FROM oven/bun:1.1 AS build
+FROM oven/bun:1.3 AS build
 WORKDIR /app
 
 # Install deps first so bun's layer is cached across source edits.

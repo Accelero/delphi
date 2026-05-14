@@ -148,7 +148,7 @@ services:
 
   # Vite dev server with HMR. Mounts ./frontend so edits are live.
   frontend:
-    image: oven/bun:1.1
+    image: oven/bun:1.3
     container_name: delphi-frontend
     working_dir: /app
     command: ["sh", "-c", "if [ ! -x node_modules/.bin/vite ]; then bun install; fi; exec bun run dev"]
