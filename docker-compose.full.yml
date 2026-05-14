@@ -171,9 +171,39 @@ services:
       ARXIV_OAUTH_TOKEN_URL: ${ARXIV_OAUTH_TOKEN_URL:-http://keycloak:8080/realms/delphi/protocol/openid-connect/token}
       ARXIV_OAUTH_CLIENT_ID: ${ARXIV_OAUTH_CLIENT_ID:-delphi-arxiv-adapter}
       ARXIV_OAUTH_CLIENT_SECRET: ${ARXIV_OAUTH_CLIENT_SECRET:-delphi-arxiv-adapter-dev-secret-please-change}
+      # RAG v1: embedder sidecars.
+      EMBEDDER_CHUNK_ENABLED: ${EMBEDDER_CHUNK_ENABLED:-true}
+      EMBEDDER_CHUNK_ENDPOINT: ${EMBEDDER_CHUNK_ENDPOINT:-http://tei-chunk:80}
+      EMBEDDER_CHUNK_MODEL_NAME: ${EMBEDDER_CHUNK_MODEL_NAME:-bge-small-en-v1.5}
+      EMBEDDER_DOCUMENT_ENABLED: ${EMBEDDER_DOCUMENT_ENABLED:-true}
+      EMBEDDER_DOCUMENT_ENDPOINT: ${EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
+      EMBEDDER_DOCUMENT_MODEL_NAME: ${EMBEDDER_DOCUMENT_MODEL_NAME:-specter2}
     depends_on:
       surrealdb:
         condition: service_healthy
+      tei-chunk:
+        condition: service_started
+      tei-paper:
+        condition: service_started
+
+  # RAG v1: TEI sidecars. Same images / model IDs as tier 1.
+  tei-chunk:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    container_name: delphi-full-tei-chunk
+    command: ["--model-id", "BAAI/bge-small-en-v1.5"]
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+    volumes:
+      - tei_chunk_data_full:/data
+
+  tei-paper:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    container_name: delphi-full-tei-paper
+    command: ["--model-id", "allenai/specter2_base"]
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+    volumes:
+      - tei_paper_data_full:/data
 
   # Prod-shape frontend: production bundle baked into a Caddy image,
   # not the Vite dev server. Tier-2 is meant to mirror prod end-to-end;
@@ -192,3 +222,5 @@ services:
 
 volumes:
   surreal_data_full:
+  tei_chunk_data_full:
+  tei_paper_data_full:

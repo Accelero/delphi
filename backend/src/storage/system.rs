@@ -28,8 +28,8 @@ use surrealdb::{Datetime, RecordId, Surreal};
 use crate::error::{Error, Result};
 
 use super::{
-    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
-    Document, FeedCursor, Filters, MessageId, Storage,
+    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
+    DocId, Document, FeedCursor, Filters, MessageId, Storage,
 };
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
@@ -413,6 +413,10 @@ struct DocumentWire {
     language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paper_embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paper_embedding_model: Option<String>,
     content_hash: String,
     #[serde(default = "default_version")]
     version: i64,
@@ -439,6 +443,8 @@ impl SystemStorage {
             ingested_at: d.ingested_at.map(Datetime::from),
             language: d.language.clone(),
             summary: d.summary.clone(),
+            paper_embedding: d.paper_embedding.clone(),
+            paper_embedding_model: d.paper_embedding_model.clone(),
             content_hash: d.content_hash.clone(),
             version: d.version,
             metadata: d.metadata.clone(),
@@ -463,6 +469,8 @@ impl SystemStorage {
                 .map(|d| -> DateTime<Utc> { d.into_inner().into() }),
             language: w.language,
             summary: w.summary,
+            paper_embedding: w.paper_embedding,
+            paper_embedding_model: w.paper_embedding_model,
             content_hash: w.content_hash,
             version: w.version,
             metadata: w.metadata,
@@ -486,8 +494,7 @@ struct ChunkData {
     ordinal: i64,
     char_start: i64,
     char_end: i64,
-    page: Option<i64>,
-    bbox: Option<serde_json::Value>,
+    bboxes: Option<Vec<Bbox>>,
     text: String,
     embedding: Vec<f32>,
     embedding_model: String,
@@ -633,8 +640,7 @@ impl Storage for SystemStorage {
                 ordinal: c.ordinal,
                 char_start: c.char_start,
                 char_end: c.char_end,
-                page: c.page,
-                bbox: c.bbox.clone(),
+                bboxes: c.bboxes.clone(),
                 text: c.text.clone(),
                 embedding: c.embedding.clone(),
                 embedding_model: c.embedding_model.clone(),
@@ -703,13 +709,48 @@ impl Storage for SystemStorage {
         Ok(())
     }
 
+    async fn get_chunk(&self, id: &ChunkId) -> Result<Option<Chunk>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM $rid WHERE tenant_id = $t LIMIT 1")
+            .bind(("rid", id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
+    async fn list_chunks_in_range(
+        &self,
+        doc_id: &DocId,
+        ord_lo: i64,
+        ord_hi: i64,
+    ) -> Result<Vec<Chunk>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM chunk \
+                 WHERE doc = $rid AND tenant_id = $t \
+                   AND ordinal >= $lo AND ordinal <= $hi \
+                 ORDER BY ordinal ASC",
+            )
+            .bind(("rid", doc_id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .bind(("lo", ord_lo))
+            .bind(("hi", ord_hi))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
     async fn search_vector(
         &self,
         query: &[f32],
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        let mut clause = String::from("WHERE tenant_id = $t AND embedding <|$k|> $q");
+        // Brute-force cosine; see surreal.rs::search_vector for the
+        // reasoning (HNSW is silent on small corpora / kv-mem).
+        let k_lit = top_k.clamp(1, 1000);
+        let mut clause = String::from("WHERE tenant_id = $t");
         if filters.embedding_model.is_some() {
             clause.push_str(" AND embedding_model = $f_model");
         }
@@ -721,14 +762,13 @@ impl Storage for SystemStorage {
         }
         let sql = format!(
             "SELECT id AS chunk_id, doc AS doc_id, ordinal, char_start, char_end, \
-             page, text, vector::distance::knn() AS score \
-             FROM chunk {clause} ORDER BY score ASC LIMIT $k"
+             text, (1 - vector::similarity::cosine(embedding, $q)) AS score \
+             FROM chunk {clause} ORDER BY score ASC LIMIT {k_lit}"
         );
         let mut q = self
             .db
             .query(sql)
             .bind(("t", self.tenant.clone()))
-            .bind(("k", top_k as i64))
             .bind(("q", query.to_vec()));
         if let Some(v) = &filters.embedding_model {
             q = q.bind(("f_model", v.clone()));
@@ -761,7 +801,7 @@ impl Storage for SystemStorage {
         }
         let sql = format!(
             "SELECT id AS chunk_id, doc AS doc_id, ordinal, char_start, char_end, \
-             page, text, search::score(0) AS score \
+             text, search::score(0) AS score \
              FROM chunk {clause} ORDER BY score DESC LIMIT $k"
         );
         let mut q = self

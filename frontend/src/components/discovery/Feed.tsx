@@ -18,6 +18,7 @@
  * exports there break the split.
  */
 import { useEffect, useMemo, useState } from "react";
+import { useSearch } from "@tanstack/react-router";
 import {
   useInfiniteQuery,
   useQueryClient,
@@ -97,6 +98,38 @@ export function Feed() {
   // stays mounted (just hidden) so scroll position and any in-memory
   // state survive the round-trip.
   const [selected, setSelected] = useState<FeedDocument | null>(null);
+  // Optional `chunk:<key>` to draw an overlay over the selected doc.
+  // Lifted into state so navigating away clears the highlight too.
+  const [selectedChunk, setSelectedChunk] = useState<string | null>(null);
+
+  // Deep-link entry: `/feed?doc=<id>&chunk=<id>` opens the viewer at
+  // that document and pre-loads the chunk overlay. The router's
+  // `useSearch` exposes the query string typed by the route's
+  // `validateSearch`; we fall back to `URLSearchParams` so the route
+  // declaration stays unchanged.
+  const search = useSearchSafely();
+  useEffect(() => {
+    if (!search.doc) return;
+    // Synthesise a minimal FeedDocument from the URL — the viewer only
+    // reads `id` + `title` for its chrome, the bytes come from
+    // `/api/documents/:key/file`. When the real row later joins the
+    // feed (via SSE or pagination) the viewer keeps its current state.
+    setSelected({
+      id: search.doc,
+      canonical_id: search.doc,
+      source_type: "deeplink",
+      source_uri: "",
+      title: null,
+      authors: [],
+      content_hash: "",
+      version: 0,
+      metadata: {},
+    } as FeedDocument);
+    setSelectedChunk(search.chunk ?? null);
+    // run once per URL change — re-running on selection clears would
+    // re-open the viewer unexpectedly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search.doc, search.chunk]);
 
   return (
     <div className="space-y-4 max-w-3xl mx-auto">
@@ -171,11 +204,44 @@ export function Feed() {
         <PdfViewer
           documentId={selected.id}
           title={selected.title ?? selected.canonical_id}
-          onBack={() => setSelected(null)}
+          chunkId={selectedChunk}
+          onBack={() => {
+            setSelected(null);
+            setSelectedChunk(null);
+          }}
         />
       )}
     </div>
   );
+}
+
+/** Read `?doc=&chunk=` query params via TanStack Router when the route
+ *  declares them, falling back to `window.location.search` otherwise.
+ *  The fallback keeps `routes/feed.tsx` minimal (no need to wire
+ *  `validateSearch`) while still letting deep links work everywhere. */
+function useSearchSafely(): { doc?: string; chunk?: string } {
+  let routed: Record<string, unknown> | null = null;
+  try {
+    // useSearch with strict:false to avoid pulling a route type.
+    routed = useSearch({ strict: false }) as Record<string, unknown>;
+  } catch {
+    routed = null;
+  }
+  const sp = useMemo(() => {
+    if (routed && (routed.doc || routed.chunk)) {
+      return {
+        doc: typeof routed.doc === "string" ? routed.doc : undefined,
+        chunk: typeof routed.chunk === "string" ? routed.chunk : undefined,
+      };
+    }
+    if (typeof window === "undefined") return {};
+    const q = new URLSearchParams(window.location.search);
+    return {
+      doc: q.get("doc") ?? undefined,
+      chunk: q.get("chunk") ?? undefined,
+    };
+  }, [routed]);
+  return sp;
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────

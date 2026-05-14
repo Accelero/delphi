@@ -7,6 +7,7 @@
 
 #![allow(dead_code)] // each test binary uses a different subset of helpers
 
+pub mod fake_embedder;
 pub mod fake_llm;
 pub mod fake_sink;
 pub mod fake_source;
@@ -30,9 +31,11 @@ use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
     JwtClaimsExtractor, JwtValidator,
 };
+use delphi::embedder::Embedder;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
 use delphi::storage::{JwtAccessConfig, JwtAccessKind, RequestDbPool, SystemDb};
+use delphi::text_extractor::TextExtractor;
 
 /// HS512 secret shared between the test JWT signer and SurrealDB's
 /// `app_session` access method. Test-only — not used in production builds.
@@ -61,7 +64,27 @@ impl TestApp {
     /// the test secret so `AuthRequestBuilder`'s signed JWTs authenticate
     /// against the engine. Each call is independent — no shared state
     /// between tests.
+    /// Build with optional RAG components injected. `None` for any
+    /// keeps the default test behaviour (no chunking, no paper
+    /// embedding, no retrieval). The integration tests opt in by
+    /// passing fakes via [`TestApp::build_with_rag`].
+    pub async fn build_with_rag(
+        text_extractor: Option<Arc<dyn TextExtractor>>,
+        chunk_embedder: Option<Arc<dyn Embedder>>,
+        document_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Self {
+        Self::build_inner(text_extractor, chunk_embedder, document_embedder).await
+    }
+
     pub async fn build() -> Self {
+        Self::build_inner(None, None, None).await
+    }
+
+    async fn build_inner(
+        text_extractor: Option<Arc<dyn TextExtractor>>,
+        chunk_embedder: Option<Arc<dyn Embedder>>,
+        document_embedder: Option<Arc<dyn Embedder>>,
+    ) -> Self {
         let system = Arc::new(
             SystemDb::in_memory("delphi_test", "main")
                 .await
@@ -120,6 +143,13 @@ impl TestApp {
             llm: Arc::new(FakeLlmClient::default()),
             object_store: object_store.clone(),
             events: events_tx.clone(),
+            // RAG: integration tests that don't set up an embedder leave
+            // these `None`; the ingest path then runs metadata-only.
+            // The `rag_ingest` integration test builds its own wired-up
+            // router instead of calling `TestApp::build`.
+            text_extractor,
+            chunk_embedder,
+            document_embedder,
         };
 
         let router = api::build_router(state, None, &mode, identity_deps, extractor);

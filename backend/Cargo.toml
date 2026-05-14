@@ -100,6 +100,8 @@ tower            = { version = "0.5", features = ["util"] }
 http-body-util   = "0.1"
 bytes            = "1"
 tempfile         = "3"
+# Local HTTP mock server for embedder tests — small and pure-Rust.
+wiremock         = "0.6"
 # (surrealdb `kv-mem` engine is in [dependencies] above so prod builds also
 #  link the runtime polymorphic `Any` engine; tests hit the in-memory variant
 #  by URL alone.)

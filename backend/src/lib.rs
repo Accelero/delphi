@@ -9,7 +9,9 @@
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod chunker;
 pub mod config;
+pub mod embedder;
 pub mod error;
 pub mod filter;
 pub mod ingestion;
@@ -18,6 +20,7 @@ pub mod object_store;
 pub mod sources;
 pub mod state;
 pub mod storage;
+pub mod text_extractor;
 
 // Subcommands the CLI binary surfaces. Defined here so the bin and any
 // integration-test process can both reach the type without one depending

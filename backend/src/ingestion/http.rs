@@ -6,11 +6,28 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
+use async_trait::async_trait;
+use bytes::Bytes;
+
 use crate::auth::AuthContext;
+use crate::chunker::ChunkConfig;
 use crate::state::AppState;
 use crate::storage::AuthedDb;
+use crate::text_extractor::{TextExtractor, Word};
 
-use super::{IngestRequest, IngestSink, NotifyingSink, Pipeline};
+use super::{IngestRequest, IngestSink, NotifyingSink, Pipeline, RagSink};
+
+/// Stand-in extractor used when only the document embedder is wired
+/// up — the chunking branch needs *some* `TextExtractor`, but we'd
+/// rather skip extraction than fail loudly.
+struct NoopExtractor;
+
+#[async_trait]
+impl TextExtractor for NoopExtractor {
+    async fn extract(&self, _bytes: Bytes) -> crate::error::Result<Vec<Word>> {
+        Ok(Vec::new())
+    }
+}
 
 /// Roles permitted to push documents in via the HTTP path.
 const INGESTER_ROLES: &[&str] = &["ingester", "owner"];
@@ -79,6 +96,32 @@ pub async fn ingest_documents(
 
     let storage = db.as_storage();
     let pipeline: Arc<dyn IngestSink> = Arc::new(Pipeline::new(storage.clone()));
+    // Wrap with the RAG decorator when at least one embedder is wired up.
+    // The chunking branch additionally needs a text extractor; if only
+    // the document embedder is configured the decorator still runs and
+    // populates `paper_embedding` without touching chunks.
+    let pipeline: Arc<dyn IngestSink> =
+        if state.chunk_embedder.is_some() || state.document_embedder.is_some() {
+            // For the chunking path we need an extractor; when missing,
+            // pass a no-op that returns empty word streams so the chunk
+            // branch is a fast no-op while the doc-embedding branch
+            // still runs.
+            let extractor: Arc<dyn crate::text_extractor::TextExtractor> = state
+                .text_extractor
+                .clone()
+                .unwrap_or_else(|| Arc::new(NoopExtractor));
+            Arc::new(RagSink::new(
+                pipeline,
+                storage.clone(),
+                state.object_store.clone(),
+                extractor,
+                state.chunk_embedder.clone(),
+                state.document_embedder.clone(),
+                ChunkConfig::default(),
+            ))
+        } else {
+            pipeline
+        };
     let sink = NotifyingSink::new(pipeline, storage, state.events.clone());
 
     match sink.ingest(body.into()).await {

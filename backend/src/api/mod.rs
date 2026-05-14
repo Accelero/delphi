@@ -1,6 +1,7 @@
 //! HTTP server: routes, static-SPA fallback, axum boot.
 
 mod chat;
+mod chunks;
 mod conversations;
 mod discovery;
 mod documents;
@@ -22,6 +23,7 @@ use crate::auth::{
     ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
 use crate::config::{jwt_access_from_env, system_db_from_env};
+use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
 use crate::ingestion::{self, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
@@ -29,6 +31,7 @@ use crate::object_store::{self, ObjectStore};
 use crate::sources::{self, IngestApiClient};
 use crate::state::AppState;
 use crate::storage::RequestDbPool;
+use crate::text_extractor::{PdftotextExtractor, TextExtractor};
 
 pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let auth_cfg = AuthConfig::from_env().context("loading auth config")?;
@@ -104,10 +107,23 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     // drop-in implementing the same `IngestFilter` trait.
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
 
+    // RAG v1: load embedder sidecars. `EMBEDDER_*_ENABLED=false` or an
+    // unreachable TEI host yields `None` per slot — ingest just skips
+    // the chunk/paper-embedding stages rather than crashing the boot.
+    let embedders = embedder_from_env().context("loading embedders")?;
+    let text_extractor: Option<Arc<dyn TextExtractor>> = if embedders.chunk.is_some() {
+        Some(Arc::new(PdftotextExtractor::new()))
+    } else {
+        None
+    };
+
     let state = AppState {
         llm,
         object_store: object_store.clone(),
         events: events_tx,
+        text_extractor,
+        chunk_embedder: embedders.chunk,
+        document_embedder: embedders.document,
     };
 
     // Source-adapter scheduler runs alongside the HTTP server. It POSTs
@@ -223,7 +239,8 @@ pub fn build_router(
         )
         .route("/api/discovery/feed", get(discovery::feed))
         .route("/api/discovery/feed/events", get(discovery::events))
-        .route("/api/documents/{key}/file", get(documents::file));
+        .route("/api/documents/{key}/file", get(documents::file))
+        .route("/api/chunks/{key}", get(chunks::get_chunk));
 
     // Routes that don't require an authenticated identity.
     let api_public = Router::new().route("/healthz", get(health::healthz));

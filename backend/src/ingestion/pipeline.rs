@@ -167,6 +167,8 @@ fn build_document(req: &IngestRequest, content_hash: String, version: i64) -> Do
         ingested_at: None,
         language: req.language.clone(),
         summary: req.summary.clone(),
+        paper_embedding: None,
+        paper_embedding_model: None,
         content_hash,
         version,
         metadata: ensure_object(req.metadata.clone()),

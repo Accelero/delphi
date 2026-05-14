@@ -6,17 +6,39 @@
 //!  1. Verify the conversation exists for this caller (PERMISSIONS gate).
 //!  2. Load full message history via `list_messages`.
 //!  3. Persist the user's new message.
-//!  4. Stream the LLM reply as Vercel AI SDK Data Stream Protocol records,
+//!  4. Run RAG retrieval against that message (best-effort — see below).
+//!  5. Stream the LLM reply as Vercel AI SDK Data Stream Protocol records,
 //!     while accumulating into a buffer.
-//!  5. On stream end (or error), persist the assistant reply with whatever
+//!  6. On stream end (or error), persist the assistant reply with whatever
 //!     bytes we have.
-//!  6. If the conversation had no title at request entry, synthesise one
-//!     synchronously after step 5 by re-invoking the LLM with a short
+//!  7. If the conversation had no title at request entry, synthesise one
+//!     synchronously after step 6 by re-invoking the LLM with a short
 //!     prompt. This delays the trailing `finish` marker by ~1–2s, which is
 //!     acceptable for v1; an async path would need a cloneable `AuthedDb`,
 //!     which the pool's release semantics intentionally forbid.
+//!
+//! ## RAG retrieval (step 4)
+//!
+//! When a chunk embedder is configured, before calling the LLM the
+//! handler:
+//!
+//! 1. Embeds the latest user message with the chunk embedder's `query()`
+//!    transform.
+//! 2. Runs KNN over `chunk.embedding` (tenant-scoped — engine PERMISSIONS).
+//! 3. Expands each hit by `±RAG_RETRIEVAL_NEIGHBOR_RADIUS` (same doc,
+//!    adjacent ordinal).
+//! 4. Prepends a `Role::System` message enumerating each chunk with a
+//!    `[N]` marker so the LLM can cite.
+//! 5. Streams a `citations` data block as the first record, then the
+//!    LLM's text deltas; the frontend resolves `[N]` against the table.
+//!
+//! Retrieval is best-effort: if there's no embedder, no chunks match,
+//! or KNN/expansion errors, the handler falls through to the pre-RAG
+//! flow (history + user message only). It never fails the chat.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
+use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -31,11 +53,16 @@ use surrealdb::RecordId;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
-use crate::api::stream as proto;
+use crate::api::stream::{self as proto, CitationEntry};
 use crate::auth::AuthContext;
 use crate::llm::{LlmClient, LlmDelta, LlmMessage, Role};
 use crate::state::AppState;
-use crate::storage::{AuthedDb, ChatMessage, ConversationId, Storage};
+use crate::storage::{
+    AuthedDb, ChatMessage, Chunk, ChunkSearchResult, ConversationId, Filters, Storage,
+};
+
+const DEFAULT_TOP_K: usize = 5;
+const DEFAULT_NEIGHBOR_RADIUS: i64 = 1;
 
 /// Body sent by `@ai-sdk/react`'s `useChat`. Extra fields (id, parts, etc.)
 /// are ignored.
@@ -178,6 +205,37 @@ pub async fn post_message(
         content: last_user_text.clone(),
     });
 
+    // 6. RAG retrieval (best-effort). When a chunk embedder is wired in,
+    //    embed the user's message, KNN, expand to neighbors, prepend a
+    //    `[N]`-labelled system message so the LLM can cite. Any failure
+    //    falls through to the pre-RAG flow without erroring the chat.
+    let citations = if let Some(embedder) = state.chunk_embedder.clone() {
+        match retrieve_for_query(db.as_ref(), embedder.as_ref(), &last_user_text).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "rag retrieval failed; continuing without citations");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let citation_block = if citations.is_empty() {
+        None
+    } else {
+        let system = build_system_prompt(&citations);
+        // Prepend so the LLM sees citation context before the history.
+        prompt.insert(
+            0,
+            LlmMessage {
+                role: Role::System,
+                content: system,
+            },
+        );
+        Some(citation_entries(&citations))
+    };
+
     let llm = state.llm.clone();
     let upstream = match llm.stream_chat(prompt.clone()).await {
         Ok(s) => s,
@@ -196,6 +254,13 @@ pub async fn post_message(
     let needs_title = conversation.title.is_none();
     let user_text_for_finish = last_user_text;
 
+    // The `citations` data block streams first (if any), then text deltas.
+    let citations_lead: Option<String> = citation_block.as_ref().map(|c| proto::citations(c));
+    let lead_stream = stream::iter(
+        citations_lead
+            .into_iter()
+            .map(|s| Ok::<_, Infallible>(s.into_bytes())),
+    );
     let body_stream = upstream
         .map(move |item| {
             let line = match item {
@@ -254,12 +319,14 @@ pub async fn post_message(
             Ok::<_, Infallible>(proto::finish(reason).into_bytes())
         }));
 
+    let body = lead_stream.chain(body_stream);
+
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .header("x-vercel-ai-data-stream", "v1")
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(body_stream))
+        .body(Body::from_stream(body))
         .unwrap()
 }
 
@@ -329,6 +396,129 @@ fn clean_title(raw: &str) -> String {
         s = s.chars().take(60).collect();
     }
     s
+}
+
+/// One row in the assembled retrieval context. Survives KNN expansion +
+/// neighbor expansion + de-dup; what the system prompt enumerates.
+#[derive(Debug, Clone)]
+struct Retrieved {
+    chunk_id: surrealdb::RecordId,
+    doc_id: surrealdb::RecordId,
+    #[allow(dead_code)] // kept for future neighbor-aware reranking
+    ordinal: i64,
+    text: String,
+    /// Title looked up from the document row when available — feeds
+    /// the `[N] "Title" (page X)` lead-in.
+    doc_title: Option<String>,
+    /// First page mentioned in the chunk's bboxes (best-effort).
+    page: Option<i64>,
+}
+
+async fn retrieve_for_query(
+    db: &AuthedDb,
+    embedder: &dyn crate::embedder::Embedder,
+    query: &str,
+) -> crate::error::Result<Vec<Retrieved>> {
+    let top_k = env_usize("RAG_RETRIEVAL_TOP_K", DEFAULT_TOP_K).max(1);
+    let radius = env_i64("RAG_RETRIEVAL_NEIGHBOR_RADIUS", DEFAULT_NEIGHBOR_RADIUS).max(0);
+
+    let qv = embedder.query(query).await?;
+    let filters = Filters {
+        embedding_model: Some(embedder.model_name().to_string()),
+        ..Default::default()
+    };
+    let hits: Vec<ChunkSearchResult> = db.search_vector(&qv, top_k, &filters).await?;
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Expand: for each unique (doc, ordinal) hit, load the chunk window
+    // [ord-r, ord+r]. Then de-dup so multiple hits in the same window
+    // don't double-quote.
+    let mut seen: HashSet<surrealdb::RecordId> = HashSet::new();
+    let mut out: Vec<Retrieved> = Vec::new();
+    for hit in &hits {
+        let lo = (hit.ordinal - radius).max(0);
+        let hi = hit.ordinal + radius;
+        let window = db
+            .list_chunks_in_range(&hit.doc_id, lo, hi)
+            .await
+            .unwrap_or_default();
+        let doc_title = db
+            .get_document(&hit.doc_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|d| d.title);
+        for c in window {
+            if let Some(cid) = c.id.clone() {
+                if !seen.insert(cid.clone()) {
+                    continue;
+                }
+                out.push(Retrieved {
+                    chunk_id: cid,
+                    doc_id: hit.doc_id.clone(),
+                    ordinal: c.ordinal,
+                    text: c.text,
+                    doc_title: doc_title.clone(),
+                    page: c.bboxes.as_ref().and_then(|b| b.first().map(|b| b.page)),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn build_system_prompt(rows: &[Retrieved]) -> String {
+    let mut s = String::from(
+        "You have access to the following excerpts from the user's corpus.\n\
+         When you make a claim drawn from one of them, append the corresponding \
+         [N] marker. Cite only chunks you actually used.\n\n",
+    );
+    for (i, r) in rows.iter().enumerate() {
+        let n = i + 1;
+        let title = r.doc_title.as_deref().unwrap_or("(untitled)");
+        match r.page {
+            Some(p) => s.push_str(&format!("[{n}] \"{title}\" (page {p})\n")),
+            None => s.push_str(&format!("[{n}] \"{title}\"\n")),
+        }
+        s.push_str(&r.text);
+        s.push_str("\n\n");
+    }
+    s
+}
+
+fn citation_entries(rows: &[Retrieved]) -> Vec<CitationEntry> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| CitationEntry {
+            n: i + 1,
+            chunk_id: r.chunk_id.to_string(),
+            doc_id: r.doc_id.to_string(),
+            doc_title: r.doc_title.clone(),
+            page: r.page,
+        })
+        .collect()
+}
+
+// helper: we don't use `Chunk` directly in the API surface, but the
+// integration test does. Reference it so the type stays in scope; the
+// compiler will drop this if unused.
+#[allow(dead_code)]
+fn _chunk_is_used(_c: Chunk) {}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_i64(key: &str, default: i64) -> i64 {
+    env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]

@@ -97,6 +97,16 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
 
+    /// Optional document-level embedding (RAG v1: SPECTER2 over
+    /// `title + [SEP] + abstract`). 768-dim when populated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_embedding: Option<Vec<f32>>,
+    /// Model name written alongside `paper_embedding` for cross-version
+    /// safety (when we eventually migrate to a different SPECTER2-class
+    /// model, mixed rows are distinguishable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper_embedding_model: Option<String>,
+
     /// Hex-encoded SHA-256 of normalized content. Dedup key.
     pub content_hash: String,
 
@@ -128,20 +138,39 @@ fn default_extractor() -> String {
     "manual".into()
 }
 
+/// One line-bounding rectangle of a chunk on a specific PDF page. PDF
+/// coordinate space (origin bottom-left, points = 1/72 inch). The viewer
+/// flips to CSS top-left coords using the page's height + rotation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Bbox {
+    pub page: i64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chunk {
     /// Populated by the backend on read; ignored on write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RecordId>,
 
+    /// Foreign key to the owning document. Populated on read (via the
+    /// schema's `doc` field). On the write path the value is supplied
+    /// out-of-band (the `upsert_chunks(&doc_id, …)` parameter), so the
+    /// struct serializer skips it.
+    #[serde(default, skip_serializing)]
+    pub doc: Option<RecordId>,
+
     pub ordinal: i64,
     pub char_start: i64,
     pub char_end: i64,
 
+    /// Per-line rectangles spanning the chunk's text. Multi-page chunks
+    /// carry boxes from each page they cross.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub page: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bbox: Option<serde_json::Value>,
+    pub bboxes: Option<Vec<Bbox>>,
 
     pub text: String,
     pub embedding: Vec<f32>,
@@ -158,7 +187,6 @@ pub struct ChunkSearchResult {
     pub ordinal: i64,
     pub char_start: i64,
     pub char_end: i64,
-    pub page: Option<i64>,
 }
 
 /// Backend-agnostic filter struct. Backends may ignore unknown filters but

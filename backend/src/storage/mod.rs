@@ -28,8 +28,8 @@ mod surreal;
 mod system;
 
 pub use models::{
-    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
-    Document, FeedCursor, Filters, MessageId,
+    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
+    DocId, Document, FeedCursor, Filters, MessageId,
 };
 pub use request::{AuthedDb, RequestDbPool};
 pub use surreal::SurrealStorage;
@@ -77,6 +77,19 @@ pub trait Storage: Send + Sync {
     async fn list_chunks(&self, doc_id: &DocId) -> Result<Vec<Chunk>>;
 
     async fn delete_chunks(&self, doc_id: &DocId) -> Result<()>;
+
+    /// Fetch a single chunk by id (tenant-scoped).
+    async fn get_chunk(&self, id: &ChunkId) -> Result<Option<Chunk>>;
+
+    /// Load a window of chunks for the same document by ordinal range
+    /// (inclusive). Used by chat retrieval to expand a KNN hit with its
+    /// adjacent neighbors.
+    async fn list_chunks_in_range(
+        &self,
+        doc_id: &DocId,
+        ord_lo: i64,
+        ord_hi: i64,
+    ) -> Result<Vec<Chunk>>;
 
     // ---- search ------------------------------------------------------------
 

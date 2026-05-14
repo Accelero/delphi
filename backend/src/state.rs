@@ -14,9 +14,11 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::embedder::Embedder;
 use crate::ingestion::FeedItemEvent;
 use crate::llm::LlmClient;
 use crate::object_store::ObjectStore;
+use crate::text_extractor::TextExtractor;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,4 +32,15 @@ pub struct AppState {
     /// publishes via a per-request `NotifyingSink` on the `Created`
     /// outcome.
     pub events: broadcast::Sender<FeedItemEvent>,
+    /// PDF → `Vec<Word>` extractor used at ingest by the RAG pipeline.
+    /// `None` when chunking/embedding are disabled — the ingest path then
+    /// runs the old metadata-only flow.
+    pub text_extractor: Option<Arc<dyn TextExtractor>>,
+    /// Chunk-level embedder (BGE-small in v1). `None` ⇒ chunking
+    /// pipeline is skipped at ingest. Same instance also drives the
+    /// chat retrieval path's `query()` call.
+    pub chunk_embedder: Option<Arc<dyn Embedder>>,
+    /// Document-level embedder (SPECTER2 in v1). `None` ⇒
+    /// `document.paper_embedding` is not populated.
+    pub document_embedder: Option<Arc<dyn Embedder>>,
 }

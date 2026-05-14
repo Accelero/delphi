@@ -153,12 +153,47 @@ function parseSegments(text: string): Segment[] {
   );
 }
 
+/** One entry in the per-message citation table — what the chat handler
+ *  streams as a `2:` data block ahead of the text deltas. The frontend
+ *  parses `[N]` markers in the assistant text and resolves them
+ *  against this table to render deep links into the PDF viewer. */
+export type CitationEntry = {
+  n: number;
+  chunk_id: string;
+  doc_id: string;
+  doc_title?: string | null;
+  page?: number | null;
+};
+
+/** Rewrite `[N]` markers in `text` to inline anchor markup whenever a
+ *  matching entry is in the table. Unresolved markers pass through as
+ *  plain text — never crash on a hallucinated number.
+ *
+ *  Markdown sees the substituted anchor verbatim; Streamdown's HTML
+ *  passthrough renders it. We use a stable CSS class so the e2e test
+ *  can locate citation anchors deterministically. */
+export function rewriteCitations(text: string, citations: CitationEntry[]): string {
+  if (!citations.length) return text;
+  const byN = new Map<number, CitationEntry>();
+  for (const c of citations) byN.set(c.n, c);
+  return text.replace(/\[(\d+)\]/g, (match, p1) => {
+    const n = Number(p1);
+    const c = byN.get(n);
+    if (!c) return match;
+    const doc = encodeURIComponent(c.doc_id);
+    const chunk = encodeURIComponent(c.chunk_id);
+    return `<a class="citation" href="/feed?doc=${doc}&chunk=${chunk}">[${n}]</a>`;
+  });
+}
+
 export function MessageBody({
   content,
   isStreaming = false,
+  citations,
 }: {
   content: string;
   isStreaming?: boolean;
+  citations?: CitationEntry[];
 }) {
   const { shown } = useSmoothedContent(content, isStreaming);
   if (!shown) return null;
@@ -184,13 +219,19 @@ export function MessageBody({
           );
         }
         if (!seg.content.trim()) return null;
+        // Resolve `[N]` markers against the per-message citation table
+        // (when present) before handing off to Streamdown — markdown
+        // sees the inline anchor markup and renders it.
+        const rendered = citations?.length
+          ? rewriteCitations(seg.content, citations)
+          : seg.content;
         return (
           <Streamdown
             key={i}
             plugins={staticPlugins}
             className="text-base leading-7"
           >
-            {seg.content}
+            {rendered}
           </Streamdown>
         );
       })}

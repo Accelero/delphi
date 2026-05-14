@@ -97,6 +97,15 @@ services:
       # Object storage for original artefacts (PDFs etc.). Path is the
       # *container* path; the volume mount below maps it to the host.
       OBJECT_STORE_URL: ${OBJECT_STORE_URL:-file:///var/lib/delphi/originals}
+      # RAG v1: embedder sidecars (tei-chunk + tei-paper). The backend
+      # tolerates absent / disabled embedders — RAG is a pillar, not a
+      # boot-critical dep — but the defaults wire it up.
+      EMBEDDER_CHUNK_ENABLED: ${EMBEDDER_CHUNK_ENABLED:-true}
+      EMBEDDER_CHUNK_ENDPOINT: ${EMBEDDER_CHUNK_ENDPOINT:-http://tei-chunk:80}
+      EMBEDDER_CHUNK_MODEL_NAME: ${EMBEDDER_CHUNK_MODEL_NAME:-bge-small-en-v1.5}
+      EMBEDDER_DOCUMENT_ENABLED: ${EMBEDDER_DOCUMENT_ENABLED:-true}
+      EMBEDDER_DOCUMENT_ENDPOINT: ${EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
+      EMBEDDER_DOCUMENT_MODEL_NAME: ${EMBEDDER_DOCUMENT_MODEL_NAME:-specter2}
     volumes:
       - ./data/originals:/var/lib/delphi/originals
     ports:
@@ -104,6 +113,38 @@ services:
     depends_on:
       surrealdb:
         condition: service_healthy
+      tei-chunk:
+        condition: service_started
+      tei-paper:
+        condition: service_started
+
+  # Hugging Face Text Embeddings Inference (chunk-class — BGE-small).
+  # Model weights are cached on a named volume so dev restarts are fast.
+  # First boot downloads weights to the volume (slow); subsequent boots
+  # are near-instant.
+  tei-chunk:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    container_name: delphi-tei-chunk
+    command: ["--model-id", "BAAI/bge-small-en-v1.5"]
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+    volumes:
+      - tei_chunk_data:/data
+    ports:
+      # Tier 1 exposes the chunk TEI for curl debugging; tier 2 doesn't.
+      - "8082:80"
+
+  # TEI (document-class — SPECTER2). Same shape as tei-chunk.
+  tei-paper:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    container_name: delphi-tei-paper
+    command: ["--model-id", "allenai/specter2_base"]
+    environment:
+      HUGGINGFACE_HUB_CACHE: /data
+    volumes:
+      - tei_paper_data:/data
+    ports:
+      - "8083:80"
 
   # Vite dev server with HMR. Mounts ./frontend so edits are live.
   frontend:
@@ -124,3 +165,5 @@ services:
 volumes:
   surreal_data:
   frontend_node_modules:
+  tei_chunk_data:
+  tei_paper_data:

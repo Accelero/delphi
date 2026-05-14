@@ -18,7 +18,9 @@
 mod http;
 mod notifier;
 mod pipeline;
+mod rag;
 
 pub use http::{ingest_documents, IngestRequestBody};
 pub use notifier::{FeedItemEvent, NotifyingSink, DEFAULT_BROADCAST_CAPACITY};
 pub use pipeline::{IngestOutcome, IngestRequest, IngestSink, Pipeline};
+pub use rag::RagSink;

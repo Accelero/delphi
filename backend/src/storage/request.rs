@@ -276,6 +276,17 @@ impl Storage for AuthedDb {
     async fn delete_chunks(&self, doc_id: &DocId) -> Result<()> {
         self.storage().delete_chunks(doc_id).await
     }
+    async fn get_chunk(&self, id: &ChunkId) -> Result<Option<Chunk>> {
+        self.storage().get_chunk(id).await
+    }
+    async fn list_chunks_in_range(
+        &self,
+        doc_id: &DocId,
+        ord_lo: i64,
+        ord_hi: i64,
+    ) -> Result<Vec<Chunk>> {
+        self.storage().list_chunks_in_range(doc_id, ord_lo, ord_hi).await
+    }
     async fn search_vector(
         &self,
         query: &[f32],

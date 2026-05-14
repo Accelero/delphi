@@ -116,9 +116,35 @@ export function conversationKey(id: string): string {
   return idx >= 0 ? id.slice(idx + 1) : id;
 }
 
+/** Strip the `chunk:` table prefix from a chunk id (`chunk:<key>`). */
+export function chunkKey(id: string): string {
+  const idx = id.indexOf(":");
+  return idx >= 0 ? id.slice(idx + 1) : id;
+}
+
+/** URL for `GET /api/chunks/:id`. */
+export function chunkUrl(id: string): string {
+  return `/api/chunks/${encodeURIComponent(chunkKey(id))}`;
+}
+
+/** Wire shape returned by `GET /api/chunks/:id`. PDF-coordinate
+ *  bboxes (origin bottom-left); the viewer flips to CSS at render. */
+export type ChunkBbox = { page: number; x: number; y: number; w: number; h: number };
+export type ChunkPayload = {
+  id: string;
+  doc_id: string;
+  ordinal: number;
+  text: string;
+  bboxes?: ChunkBbox[] | null;
+};
+
+
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   session: () => request<Session>("/api/auth/me"),
+  chunks: {
+    get: (id: string) => request<ChunkPayload>(chunkUrl(id)),
+  },
   discovery: {
     feed: (params: {
       sort?: FeedSort;

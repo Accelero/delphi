@@ -141,6 +141,11 @@ DEFINE FIELD IF NOT EXISTS summary      ON document TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS content_hash ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS version      ON document TYPE int DEFAULT 1;
 DEFINE FIELD IF NOT EXISTS metadata     ON document FLEXIBLE TYPE object DEFAULT {};
+-- RAG v1: document-level embedding for "similar papers" + paper-rank reranking.
+-- Populated at ingest by SPECTER2 over `title + [SEP] + abstract`. 768-dim.
+-- Surfacing in the UI is deferred (see docs/architecture/rag.md "Deferred").
+DEFINE FIELD IF NOT EXISTS paper_embedding       ON document TYPE option<array<float>>;
+DEFINE FIELD IF NOT EXISTS paper_embedding_model ON document TYPE option<string>;
 
 -- canonical_id is unique *per tenant*. Closes audit finding H1: pre-tenancy
 -- schema had a global UNIQUE which silently merged cross-tenant rows.
@@ -149,6 +154,10 @@ DEFINE INDEX IF NOT EXISTS document_tenant_canonical ON document FIELDS tenant_i
 DEFINE INDEX IF NOT EXISTS document_tenant_id        ON document FIELDS tenant_id;
 DEFINE INDEX IF NOT EXISTS document_source_type      ON document FIELDS source_type;
 DEFINE INDEX IF NOT EXISTS document_content_hash     ON document FIELDS content_hash;
+-- RAG v1: HNSW over SPECTER2 paper embeddings (768-dim). Used later by
+-- "similar papers" features; doesn't drive chat retrieval (that's
+-- chunk-level).
+DEFINE INDEX IF NOT EXISTS document_paper_embedding ON document FIELDS paper_embedding HNSW DIMENSION 768 DIST COSINE TYPE F32 EFC 200 M 16;
 
 -- ---------------------------------------------------------------------------
 -- document_content
@@ -191,8 +200,12 @@ DEFINE FIELD IF NOT EXISTS doc             ON chunk TYPE record<document>;
 DEFINE FIELD IF NOT EXISTS ordinal         ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS char_start      ON chunk TYPE int;
 DEFINE FIELD IF NOT EXISTS char_end        ON chunk TYPE int;
-DEFINE FIELD IF NOT EXISTS page            ON chunk TYPE option<int>;
-DEFINE FIELD IF NOT EXISTS bbox            ON chunk FLEXIBLE TYPE option<object>;
+-- RAG v1: single-page `page` + single-rect `bbox` superseded by `bboxes`
+-- (an array of `{page, x, y, w, h}` line rectangles). Drop the legacy
+-- fields — no rows in the wild yet since no chunker had run.
+REMOVE FIELD IF EXISTS page ON chunk;
+REMOVE FIELD IF EXISTS bbox ON chunk;
+DEFINE FIELD IF NOT EXISTS bboxes          ON chunk FLEXIBLE TYPE option<array<object>>;
 DEFINE FIELD IF NOT EXISTS text            ON chunk TYPE string;
 DEFINE FIELD IF NOT EXISTS embedding       ON chunk TYPE array<float>;
 DEFINE FIELD IF NOT EXISTS embedding_model ON chunk TYPE string;

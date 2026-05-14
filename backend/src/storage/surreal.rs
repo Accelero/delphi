@@ -21,8 +21,8 @@ use surrealdb::{Datetime, RecordId, Surreal};
 
 use crate::error::{Error, Result};
 use crate::storage::{
-    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
-    Document, FeedCursor, Filters, MessageId, Storage,
+    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
+    DocId, Document, FeedCursor, Filters, MessageId, Storage,
 };
 
 /// Storage trait implementation against a SurrealDB connection.
@@ -72,6 +72,10 @@ struct DocumentWire {
     language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paper_embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    paper_embedding_model: Option<String>,
     content_hash: String,
     #[serde(default = "default_version")]
     version: i64,
@@ -98,6 +102,8 @@ impl From<&Document> for DocumentWire {
             ingested_at: d.ingested_at.map(Datetime::from),
             language: d.language.clone(),
             summary: d.summary.clone(),
+            paper_embedding: d.paper_embedding.clone(),
+            paper_embedding_model: d.paper_embedding_model.clone(),
             content_hash: d.content_hash.clone(),
             version: d.version,
             metadata: d.metadata.clone(),
@@ -120,6 +126,8 @@ impl From<DocumentWire> for Document {
             ingested_at: w.ingested_at.map(datetime_to_chrono),
             language: w.language,
             summary: w.summary,
+            paper_embedding: w.paper_embedding,
+            paper_embedding_model: w.paper_embedding_model,
             content_hash: w.content_hash,
             version: w.version,
             metadata: w.metadata,
@@ -197,8 +205,7 @@ struct ChunkData {
     ordinal: i64,
     char_start: i64,
     char_end: i64,
-    page: Option<i64>,
-    bbox: Option<serde_json::Value>,
+    bboxes: Option<Vec<Bbox>>,
     text: String,
     embedding: Vec<f32>,
     embedding_model: String,
@@ -343,8 +350,7 @@ impl Storage for SurrealStorage {
                 ordinal: c.ordinal,
                 char_start: c.char_start,
                 char_end: c.char_end,
-                page: c.page,
-                bbox: c.bbox.clone(),
+                bboxes: c.bboxes.clone(),
                 text: c.text.clone(),
                 embedding: c.embedding.clone(),
                 embedding_model: c.embedding_model.clone(),
@@ -407,6 +413,35 @@ impl Storage for SurrealStorage {
         Ok(())
     }
 
+    async fn get_chunk(&self, id: &ChunkId) -> Result<Option<Chunk>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM $rid LIMIT 1")
+            .bind(("rid", id.clone()))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
+    async fn list_chunks_in_range(
+        &self,
+        doc_id: &DocId,
+        ord_lo: i64,
+        ord_hi: i64,
+    ) -> Result<Vec<Chunk>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM chunk \
+                 WHERE doc = $rid AND ordinal >= $lo AND ordinal <= $hi \
+                 ORDER BY ordinal ASC",
+            )
+            .bind(("rid", doc_id.clone()))
+            .bind(("lo", ord_lo))
+            .bind(("hi", ord_hi))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
     // ---- search ------------------------------------------------------------
 
     async fn search_vector(
@@ -415,23 +450,37 @@ impl Storage for SurrealStorage {
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        let where_clause = build_filter_clause(filters);
+        let where_filters = build_filter_clause_no_and(filters);
+        let where_clause = if where_filters.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {where_filters}")
+        };
+        // We use brute-force cosine similarity rather than the HNSW
+        // `<|N|>` operator. Reasoning: the HNSW operator silently
+        // returns empty when the index hasn't built sufficient layers
+        // (small corpora / certain engine builds — including the
+        // in-memory engine the integration tests run against). Brute
+        // force is O(N) but our corpora are well under the threshold
+        // where that matters. The schema's HNSW index is kept for
+        // forward-compatibility; switching to it once we hit a
+        // performance ceiling is one query-string change.
+        let k_lit = sanitize_top_k(top_k);
         let sql = format!(
             "SELECT \
                 id AS chunk_id, \
                 doc AS doc_id, \
-                ordinal, char_start, char_end, page, text, \
-                vector::distance::knn() AS score \
+                ordinal, char_start, char_end, text, \
+                (1 - vector::similarity::cosine(embedding, $q)) AS score \
              FROM chunk \
-             WHERE embedding <|$k|> $q {where_clause} \
+             {where_clause} \
              ORDER BY score ASC \
-             LIMIT $k"
+             LIMIT {k_lit}"
         );
 
         let mut q = self
             .db
             .query(sql)
-            .bind(("k", top_k as i64))
             .bind(("q", query.to_vec()));
         if let Some(v) = &filters.embedding_model {
             q = q.bind(("f_model", v.clone()));
@@ -457,7 +506,7 @@ impl Storage for SurrealStorage {
             "SELECT \
                 id AS chunk_id, \
                 doc AS doc_id, \
-                ordinal, char_start, char_end, page, text, \
+                ordinal, char_start, char_end, text, \
                 search::score(0) AS score \
              FROM chunk \
              WHERE text @0@ $q {where_clause} \
@@ -614,7 +663,24 @@ impl Storage for SurrealStorage {
     }
 }
 
+/// Clamp `top_k` into a small literal-safe range. SurrealDB's KNN /
+/// HNSW operators expect unsigned integer literals (no parameter
+/// binding); brute-force `LIMIT` likewise wants a literal in some
+/// engine builds. The cap is defence-in-depth against a sloppy caller.
+fn sanitize_top_k(k: usize) -> usize {
+    k.clamp(1, 1000)
+}
+
 fn build_filter_clause(f: &Filters) -> String {
+    let inner = build_filter_clause_no_and(f);
+    if inner.is_empty() {
+        String::new()
+    } else {
+        format!("AND {inner}")
+    }
+}
+
+fn build_filter_clause_no_and(f: &Filters) -> String {
     let mut parts = Vec::new();
     if f.embedding_model.is_some() {
         parts.push("embedding_model = $f_model");
@@ -625,9 +691,5 @@ fn build_filter_clause(f: &Filters) -> String {
     if f.source_type.is_some() {
         parts.push("doc.source_type = $f_source_type");
     }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        format!("AND {}", parts.join(" AND "))
-    }
+    parts.join(" AND ")
 }

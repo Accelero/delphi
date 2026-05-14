@@ -55,7 +55,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
-import { MessageBody } from "./MessageBody";
+import { MessageBody, type CitationEntry } from "./MessageBody";
 
 type InitialMessage = {
   id: string;
@@ -148,7 +148,7 @@ export function Chat({
   sessionKey,
 }: ChatProps) {
   const queryClient = useQueryClient();
-  const { messages, append, isLoading, error, stop } = useChat({
+  const { messages, append, isLoading, error, stop, data } = useChat({
     api,
     initialMessages: initialMessages as never,
   });
@@ -167,6 +167,27 @@ export function Chat({
     }
     wasLoadingRef.current = isLoading;
   }, [isLoading, sessionKey, queryClient]);
+
+  // RAG v1: the backend streams a `citations` data block at the head of
+  // each chat response. `useChat` collects all data records into `data`;
+  // we look for the most recent `{ type: 'citations', chunks: [...] }`
+  // entry and apply it to the tail assistant message so its `[N]`
+  // markers can resolve to deep links into the PDF viewer.
+  const citations: CitationEntry[] = useMemo(() => {
+    if (!Array.isArray(data)) return [];
+    for (let i = data.length - 1; i >= 0; i--) {
+      const entry = data[i] as unknown;
+      if (
+        entry &&
+        typeof entry === "object" &&
+        (entry as { type?: string }).type === "citations"
+      ) {
+        const chunks = (entry as { chunks?: CitationEntry[] }).chunks;
+        if (Array.isArray(chunks)) return chunks;
+      }
+    }
+    return [];
+  }, [data]);
 
   const status: ChatStatus = error
     ? "error"
@@ -341,6 +362,9 @@ export function Chat({
                           <MessageBody
                             content={m.content}
                             isStreaming={isLoading && isTailAssistant}
+                            citations={
+                              m.role === "assistant" ? citations : undefined
+                            }
                           />
                         </MessageContent>
                         <MessageActions
