@@ -23,6 +23,24 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use surrealdb::RecordId;
 
+/// Returns true if `err`'s source chain contains a SurrealDB
+/// `IndexExists` failure — i.e. another concurrent writer beat us to the
+/// CREATE on a UNIQUE-indexed table (`app_user(iss,sub)`,
+/// `membership(user,tenant_id)`). The upsert SELECT-then-CREATE pattern
+/// has a TOCTOU window; this is how we detect that we lost the race.
+fn is_index_exists(err: &anyhow::Error) -> bool {
+    let mut e: Option<&dyn std::error::Error> = Some(err.as_ref());
+    while let Some(cur) = e {
+        if let Some(surrealdb::Error::Db(surrealdb::error::Db::IndexExists { .. })) =
+            cur.downcast_ref::<surrealdb::Error>()
+        {
+            return true;
+        }
+        e = cur.source();
+    }
+    false
+}
+
 use super::claims::Claims;
 use super::context::AuthContext;
 #[cfg(feature = "dev-auth")]
@@ -100,15 +118,30 @@ async fn upsert_tenant(system: &SystemDb, slug: &str, name: &str) -> Result<Reco
     if let Some(t) = existing {
         return Ok(t.id);
     }
-    let mut r = db
+    let create = db
         .query("CREATE tenant CONTENT { slug: $slug, name: $name } RETURN id")
         .bind(("slug", slug.to_string()))
         .bind(("name", name.to_string()))
         .await
-        .context("create tenant")?;
-    let row: Option<IdRow> = r.take(0).context("decode tenant create")?;
-    row.map(|x| x.id)
-        .ok_or_else(|| anyhow!("tenant CREATE returned no row"))
+        .context("create tenant")
+        .and_then(|mut r| r.take::<Option<IdRow>>(0).context("decode tenant create"));
+    match create {
+        Ok(Some(row)) => Ok(row.id),
+        Ok(None) => Err(anyhow!("tenant CREATE returned no row")),
+        Err(e) if is_index_exists(&e) => {
+            // Concurrent request created the same slug first; re-select.
+            let mut r = db
+                .query("SELECT id FROM tenant WHERE slug = $slug LIMIT 1")
+                .bind(("slug", slug.to_string()))
+                .await
+                .context("reselect tenant after race")?;
+            r.take::<Option<IdRow>>(0)
+                .context("decode tenant reselect")?
+                .map(|x| x.id)
+                .ok_or_else(|| anyhow!("tenant vanished after IndexExists race"))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn upsert_user(
@@ -148,7 +181,7 @@ async fn upsert_user(
             .await;
         return Ok(u);
     }
-    let mut r = db
+    let create = db
         .query(
             "CREATE app_user CONTENT { \
                 iss: $iss, sub: $sub, email: $email, display_name: $name, \
@@ -161,9 +194,33 @@ async fn upsert_user(
         .bind(("name", display_name.map(|s| s.to_string())))
         .bind(("tid", tenant.clone()))
         .await
-        .context("create app_user")?;
-    let row: Option<UserRow> = r.take(0).context("decode app_user create")?;
-    row.ok_or_else(|| anyhow!("app_user CREATE returned no row"))
+        .context("create app_user")
+        .and_then(|mut r| {
+            r.take::<Option<UserRow>>(0)
+                .context("decode app_user create")
+        });
+    match create {
+        Ok(Some(row)) => Ok(row),
+        Ok(None) => Err(anyhow!("app_user CREATE returned no row")),
+        Err(e) if is_index_exists(&e) => {
+            // Lost the create race against a concurrent request for the
+            // same (iss, sub). Re-select to pick up the row the winner
+            // inserted.
+            let mut r = db
+                .query(
+                    "SELECT id, iss, sub, email, display_name FROM app_user \
+                     WHERE iss = $iss AND sub = $sub LIMIT 1",
+                )
+                .bind(("iss", iss.to_string()))
+                .bind(("sub", sub.to_string()))
+                .await
+                .context("reselect app_user after race")?;
+            r.take::<Option<UserRow>>(0)
+                .context("decode app_user reselect")?
+                .ok_or_else(|| anyhow!("app_user vanished after IndexExists race"))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn upsert_membership(
@@ -184,15 +241,21 @@ async fn upsert_membership(
     if existing.is_some() {
         return Ok(());
     }
-    db.query("CREATE membership CONTENT { user: $u, tenant_id: $t, role: $role }")
+    let result = db
+        .query("CREATE membership CONTENT { user: $u, tenant_id: $t, role: $role }")
         .bind(("u", user.clone()))
         .bind(("t", tenant.clone()))
         .bind(("role", role.to_string()))
         .await
-        .context("create membership")?
-        .check()
-        .context("membership create check")?;
-    Ok(())
+        .context("create membership")
+        .and_then(|r| r.check().context("membership create check"));
+    match result {
+        Ok(_) => Ok(()),
+        // Lost the create race; the membership already exists. Idempotent
+        // upsert semantics: treat as success.
+        Err(e) if is_index_exists(&e) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Resolve the default tenant by slug, creating it if missing. Called once

@@ -113,10 +113,19 @@ impl TestApp {
             .await
             .expect("resolve default tenant");
 
-        // RequestDbPool clones the system handle — slots share the same
-        // in-memory engine state. See `RequestDbPool::in_memory` for the
-        // shared-session caveat (fine for non-parallel tests).
-        let request_pool = RequestDbPool::in_memory(system.raw(), 4)
+        // RequestDbPool clones the system handle — every slot is a
+        // clone of the same in-memory engine, so they share ONE
+        // session. With size > 1, two requests can hold "different"
+        // slots concurrently; one request's [`AuthedDb::Drop`] then
+        // races the next request's `db.authenticate(bearer)` and
+        // clears the freshly-set RECORD session out from under it
+        // (visible as `$auth = NONE` in handler queries). Single-slot
+        // forces serialization through the channel: the next acquire
+        // waits for Drop's invalidate+send to complete, so authenticate
+        // always runs on a known-clean session. Production has
+        // physically independent WebSocket connections per slot and is
+        // not subject to this.
+        let request_pool = RequestDbPool::in_memory(system.raw(), 1)
             .await
             .expect("init test request pool");
 

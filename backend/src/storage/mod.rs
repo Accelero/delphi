@@ -31,7 +31,7 @@ pub use models::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
     DocId, Document, FeedCursor, Filters, MessageId,
 };
-pub use request::{AuthedDb, RequestDbPool};
+pub use request::{AuthRecord, AuthedDb, RequestDbPool};
 pub use surreal::SurrealStorage;
 pub use system::{Counts, JwtAccessConfig, JwtAccessKind, SystemDb, SystemStorage};
 

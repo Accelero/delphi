@@ -21,9 +21,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::opt::auth::Root;
-use surrealdb::Surreal;
+use surrealdb::{RecordId, Surreal};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::{Error, Result};
@@ -223,6 +224,45 @@ impl AuthedDb {
             .clone();
         Arc::new(SurrealStorage::from_handle(db))
     }
+
+    /// One-shot resolution of the authenticated user's row fields via
+    /// `$auth`. Used by the identity middleware to populate
+    /// [`crate::auth::AuthContext`] without an upsert. The
+    /// `app_session` AUTHENTICATE clause has already resolved
+    /// `(iss, sub)` to an `app_user` record; this query just surfaces
+    /// the fields the Rust side needs (logging, `/me` response, the
+    /// SSE broadcast filter that compares `RecordId`s).
+    pub async fn resolve_auth(&self) -> Result<AuthRecord> {
+        let inner = self.inner.as_ref().expect("AuthedDb used after drop");
+        // `$auth` is the `app_user` record link the `app_session`
+        // AUTHENTICATE clause returns. Field access on a record link
+        // auto-dereferences, so we project the four fields the
+        // identity middleware needs as an inline object — bypassing
+        // table-level PERMISSIONS in the process (no SELECT against
+        // a table).
+        // `$auth` is the `app_user` record link returned by the
+        // `app_session` AUTHENTICATE clause. `FROM ONLY $auth`
+        // dereferences it; PERMISSIONS on `app_user`
+        // (`FOR select WHERE id = $auth.id`) admit this row (the
+        // caller's own).
+        let mut r = inner
+            .db
+            .query("SELECT id, tenant_id, email, display_name FROM ONLY $auth;")
+            .await?;
+        let row: Option<AuthRecord> = r.take(0)?;
+        row.ok_or_else(|| Error::InvalidConfig("resolve_auth: $auth returned no row".into()))
+    }
+}
+
+/// Subset of `app_user` fields the identity middleware reads after
+/// authenticate. All values come from `$auth`, which is bound by the
+/// `app_session` access method's AUTHENTICATE clause.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthRecord {
+    pub id: RecordId,
+    pub tenant_id: RecordId,
+    pub email: String,
+    pub display_name: Option<String>,
 }
 
 impl Drop for AuthedDb {
