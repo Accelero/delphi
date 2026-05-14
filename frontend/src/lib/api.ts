@@ -73,6 +73,20 @@ export type FeedPage = {
 
 export type FeedSort = "recency";
 
+/** Strip the `document:` table prefix from a FeedDocument.id. The
+ *  backend's per-document routes are keyed on the record key alone. */
+export function documentKey(id: string): string {
+  const idx = id.indexOf(":");
+  return idx >= 0 ? id.slice(idx + 1) : id;
+}
+
+/** URL for `GET /api/documents/:key/file` — the stored original
+ *  (PDF) bytes. Plain string because callers feed it to `fetch` /
+ *  react-pdf rather than going through the typed `request()`. */
+export function documentFileUrl(id: string): string {
+  return `/api/documents/${encodeURIComponent(documentKey(id))}/file`;
+}
+
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   session: () => request<Session>("/api/auth/me"),

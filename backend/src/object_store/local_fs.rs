@@ -90,6 +90,24 @@ impl ObjectStore for LocalFsObjectStore {
         let target = self.resolve(key)?;
         Ok(fs::try_exists(&target).await?)
     }
+
+    async fn get_by_url(&self, url: &str) -> Result<Bytes> {
+        let rest = url.strip_prefix("file://").ok_or_else(|| {
+            Error::InvalidConfig(format!("not a file:// URL: {url}"))
+        })?;
+        let abs = PathBuf::from(rest);
+        // Constrain reads to under `root` to defeat any storage_uri that
+        // wandered outside it (corrupt row, traversal-by-rewrite).
+        let canonical = std::fs::canonicalize(&abs)
+            .map_err(|_| Error::InvalidConfig(format!("object not found: {url}")))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(Error::InvalidConfig(format!(
+                "object URL escapes store root: {url}"
+            )));
+        }
+        let v = fs::read(&canonical).await?;
+        Ok(Bytes::from(v))
+    }
 }
 
 fn ensure_safe_key(key: &str) -> Result<()> {

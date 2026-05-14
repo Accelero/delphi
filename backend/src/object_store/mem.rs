@@ -58,4 +58,11 @@ impl ObjectStore for MemObjectStore {
             .expect("MemObjectStore poisoned")
             .contains_key(key))
     }
+
+    async fn get_by_url(&self, url: &str) -> Result<Bytes> {
+        let key = url.strip_prefix("mem://").ok_or_else(|| {
+            Error::InvalidConfig(format!("not a mem:// URL: {url}"))
+        })?;
+        self.get(key).await
+    }
 }
