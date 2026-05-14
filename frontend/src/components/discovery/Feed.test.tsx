@@ -3,11 +3,11 @@
  *
  * Drives the route's `Feed` component directly (no TanStack Router) with
  * MSW mocking the backend. Covers: empty state, pagination via the
- * "Load more" button, mark-read mutation. SSE arrival is not tested
- * here — `EventSource` requires a heavier mock and is exercised
- * end-to-end in the Tier 1 Playwright run instead.
+ * "Load more" button. SSE arrival is not tested here — `EventSource`
+ * requires a heavier mock and is exercised end-to-end in the Tier 1
+ * Playwright run instead.
  */
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach } from "vitest";
 import { http, HttpResponse } from "msw";
 import userEvent from "@testing-library/user-event";
 import { render as rtlRender, screen, waitFor } from "@testing-library/react";
@@ -40,14 +40,6 @@ beforeEach(() => {
     removeEventListener() {}
     close() {}
   };
-  // jsdom's IntersectionObserver shim is also missing.
-  // @ts-expect-error — partial polyfill
-  globalThis.IntersectionObserver = class {
-    constructor() {}
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-  };
 });
 
 function fakeDoc(i: number, overrides: Partial<FeedDocument> = {}): FeedDocument {
@@ -63,7 +55,6 @@ function fakeDoc(i: number, overrides: Partial<FeedDocument> = {}): FeedDocument
     content_hash: `h${i}`,
     version: 1,
     metadata: {},
-    read: false,
     ...overrides,
   };
 }
@@ -111,32 +102,5 @@ describe("Feed", () => {
     expect(
       screen.queryByRole("button", { name: /load more/i }),
     ).not.toBeInTheDocument();
-  });
-
-  it("clicking a card POSTs the mark-read endpoint and shows the Read chip", async () => {
-    const markReadCalls = vi.fn();
-    server.use(
-      http.get("/api/discovery/feed", () =>
-        HttpResponse.json<FeedPage>({
-          items: [fakeDoc(1)],
-          next_cursor: null,
-        }),
-      ),
-      http.post("/api/discovery/items/:key/read", ({ params }) => {
-        markReadCalls(params.key);
-        return new HttpResponse(null, { status: 204 });
-      }),
-    );
-
-    render(<Feed />);
-    await waitFor(() => expect(screen.getByText("Document 1")).toBeInTheDocument());
-    expect(screen.queryByText("Read")).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByText("Summary for document 1."));
-    await waitFor(() =>
-      expect(markReadCalls).toHaveBeenCalledWith("doc-1"),
-    );
-    // Optimistic update: chip appears immediately.
-    expect(screen.getByText("Read")).toBeInTheDocument();
   });
 });

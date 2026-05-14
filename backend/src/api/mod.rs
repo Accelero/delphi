@@ -101,7 +101,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let scheduler_pipeline: Arc<dyn ingestion::IngestSink> =
         Arc::new(Pipeline::new(scheduler_storage.clone()));
     // NotifyingSink reads back the canonical Document on `Created` so
-    // its broadcast carries the same `FeedItem` shape /api/discovery/feed
+    // its broadcast carries the same Document shape /api/discovery/feed
     // returns. Hand it the same SystemStorage handle the inner pipeline
     // uses — read path crosses no permission boundary (no user JWT in
     // scope here).
@@ -229,11 +229,7 @@ pub fn build_router(
             post(ingestion::ingest_documents),
         )
         .route("/api/discovery/feed", get(discovery::feed))
-        .route("/api/discovery/feed/events", get(discovery::events))
-        .route(
-            "/api/discovery/items/{key}/read",
-            post(discovery::mark_read).delete(discovery::mark_unread),
-        );
+        .route("/api/discovery/feed/events", get(discovery::events));
 
     // Routes that don't require an authenticated identity.
     let api_public = Router::new().route("/healthz", get(health::healthz));

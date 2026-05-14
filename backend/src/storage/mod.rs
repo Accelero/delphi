@@ -25,7 +25,7 @@ mod surreal;
 mod system;
 
 pub use models::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
 };
 pub use request::{AuthedDb, RequestDbPool};
 pub use system::{Counts, JwtAccessConfig, JwtAccessKind, SystemDb, SystemStorage};
@@ -124,29 +124,12 @@ pub trait Storage: Send + Sync {
 
     // ---- discovery feed ----------------------------------------------------
 
-    /// Cursor-paginated list of documents joined with the caller's read
-    /// state. Sorted newest-first by `(ingested_at, id)`. Scoped to tenant.
+    /// Cursor-paginated list of documents. Sorted newest-first by
+    /// `(ingested_at, id)`. Scoped to tenant.
     async fn list_feed(
         &self,
         tenant: &RecordId,
-        user_id: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
-    ) -> Result<Vec<FeedItem>>;
-
-    /// Idempotent. Marks `(user, doc)` as read; succeeds even if already marked.
-    async fn mark_read(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()>;
-
-    /// Idempotent. Removes the read marker; succeeds even if not present.
-    async fn mark_unread(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()>;
+    ) -> Result<Vec<Document>>;
 }

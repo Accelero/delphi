@@ -310,50 +310,7 @@ async fn alice_cannot_create_doc_in_bobs_tenant() {
 }
 
 #[tokio::test]
-async fn alice_cannot_mark_bobs_doc_read() {
-    let w = build_world("xtenant_feedread").await;
-    let token = mint_jwt("https://idp.test/", "alice", &w.ns);
-
-    w.system
-        .raw()
-        .authenticate(&token)
-        .await
-        .expect("authenticate as alice");
-
-    // feed_read PERMISSIONS gate creates on both tenant_id match AND
-    // user = $auth.id. Alice trying to mark Bob's doc fails on the
-    // tenant_id check (and would also fail on user-id if alice's id
-    // didn't match).
-    let _res = w
-        .system
-        .raw()
-        .query(
-            "CREATE feed_read CONTENT { \
-                tenant_id: $t, user: $u, document: $d \
-             }",
-        )
-        .bind(("t", w.tenant_b.clone()))
-        .bind(("u", w.alice.clone()))
-        .bind(("d", w.doc_b.clone()))
-        .await;
-
-    // Verify nothing landed.
-    let bob_token = mint_jwt("https://idp.test/", "bob", &w.ns);
-    w.system.raw().authenticate(&bob_token).await.expect("auth bob");
-
-    let rows: Vec<serde_json::Value> = w
-        .system
-        .raw()
-        .query("SELECT id FROM feed_read")
-        .await
-        .expect("query")
-        .take(0)
-        .expect("decode");
-    assert!(rows.is_empty(), "no feed_read should have been created");
-}
-
-#[tokio::test]
-async fn alice_can_read_and_mark_her_own_document() {
+async fn alice_can_read_her_own_document() {
     let w = build_world("xtenant_happy").await;
     let token = mint_jwt("https://idp.test/", "alice", &w.ns);
 
@@ -375,20 +332,4 @@ async fn alice_can_read_and_mark_her_own_document() {
         .expect("decode");
     assert_eq!(docs.len(), 1);
     assert_eq!(docs[0]["canonical_id"], "doc-shared");
-
-    // And can mark-read her own doc.
-    w.system
-        .raw()
-        .query(
-            "CREATE feed_read CONTENT { \
-                tenant_id: $t, user: $u, document: $d \
-             }",
-        )
-        .bind(("t", w.tenant_a.clone()))
-        .bind(("u", w.alice.clone()))
-        .bind(("d", w.doc_a.clone()))
-        .await
-        .expect("create feed_read")
-        .check()
-        .expect("create succeeded");
 }

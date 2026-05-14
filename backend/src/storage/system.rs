@@ -31,7 +31,7 @@ use crate::error::{Error, Result};
 
 use super::surreal::SurrealStorage;
 use super::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
     Storage,
 };
 
@@ -279,7 +279,7 @@ impl SystemDb {
     /// Delete data; keep schema. `tenant = Some(...)` scopes per-tenant;
     /// `None` is cross-tenant (admin only).
     pub async fn wipe(&self, tenant: Option<&RecordId>) -> Result<()> {
-        for table in ["chunk", "document_content", "document_version", "document", "feed_read"] {
+        for table in ["chunk", "document_content", "document_version", "document"] {
             match tenant {
                 Some(t) => {
                     self.db
@@ -432,27 +432,10 @@ impl Storage for SystemStorage {
     async fn list_feed(
         &self,
         tenant: &RecordId,
-        user_id: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
-    ) -> Result<Vec<FeedItem>> {
-        self.inner.list_feed(tenant, user_id, cursor, limit).await
-    }
-    async fn mark_read(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()> {
-        self.inner.mark_read(tenant, user_id, doc_id).await
-    }
-    async fn mark_unread(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()> {
-        self.inner.mark_unread(tenant, user_id, doc_id).await
+    ) -> Result<Vec<Document>> {
+        self.inner.list_feed(tenant, cursor, limit).await
     }
 }
 

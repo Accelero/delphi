@@ -10,7 +10,7 @@
 //! Only the `Created` outcome fires an event. `Unchanged` and
 //! `Versioned` deliberately don't.
 //!
-//! Payload is the **same `FeedItem`** shape `/api/discovery/feed`
+//! Payload is a [`Document`] — the same shape `/api/discovery/feed`
 //! returns. SPA receivers prepend it directly into the React Query
 //! cache — no extra refetch, no risk of drift between SSE and feed
 //! responses, because there's only one wire shape.
@@ -20,9 +20,9 @@
 //! ingestion.
 //!
 //! Multi-tenancy: `FeedItemEvent` carries the `tenant_id` inside its
-//! [`FeedItem`] payload (under `item.document.tenant_id`). SSE
-//! handlers filter their stream against the connection's tenant —
-//! closes audit finding C2 (no cross-tenant event leakage).
+//! [`Document`] payload (under `document.tenant_id`). SSE handlers
+//! filter their stream against the connection's tenant — closes audit
+//! finding C2 (no cross-tenant event leakage).
 //!
 //! [`Pipeline`]: super::Pipeline
 
@@ -33,21 +33,16 @@ use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::error::Result;
-use crate::storage::{FeedItem, Storage};
+use crate::storage::{Document, Storage};
 
 use super::{IngestOutcome, IngestRequest, IngestSink};
 
 /// Event payload broadcast by [`NotifyingSink`] on each `Created`
-/// outcome. `item` is the same [`FeedItem`] shape `/api/discovery/feed`
-/// emits — clients prepend it into their cache directly.
-///
-/// `read` inside the item is invariant `false` for any newly-created
-/// document: the row didn't exist before this ingest, so no user could
-/// have marked it read. Same payload for every subscriber — read state
-/// only diverges per-user *after* the doc enters the feed.
+/// outcome. `document` is the same shape `/api/discovery/feed` emits —
+/// clients prepend it into their cache directly.
 #[derive(Debug, Clone, Serialize)]
 pub struct FeedItemEvent {
-    pub item: FeedItem,
+    pub document: Document,
 }
 
 /// Default channel capacity. Sized so even a momentary ingest burst
@@ -93,15 +88,11 @@ impl IngestSink for NotifyingSink {
             // small read on first-time ingests only (Unchanged /
             // Versioned skip this branch).
             match self.storage.get_document(&tenant_id, id).await {
-                Ok(Some(doc)) => {
-                    let item = FeedItem {
-                        document: doc,
-                        read: false,
-                    };
+                Ok(Some(document)) => {
                     // SendError just means "no subscribers" — fine in
                     // headless deployments and in tests with no SSE
                     // client connected.
-                    let _ = self.tx.send(FeedItemEvent { item });
+                    let _ = self.tx.send(FeedItemEvent { document });
                 }
                 Ok(None) => {
                     // Race against an external delete between upsert
@@ -176,12 +167,11 @@ mod tests {
         let (sink, mut rx, t) = fresh_sink().await;
         sink.ingest(req(&t, "doc-1")).await.unwrap();
         let event = rx.try_recv().expect("event delivered");
-        assert_eq!(event.item.document.canonical_id, "doc-1");
-        assert_eq!(event.item.document.source_type, "test");
-        assert_eq!(event.item.document.tenant_id, t);
-        assert!(event.item.document.id.is_some(), "id stamped from DB");
-        assert!(event.item.document.ingested_at.is_some(), "ingested_at stamped from DB");
-        assert!(!event.item.read, "newly created doc cannot be read");
+        assert_eq!(event.document.canonical_id, "doc-1");
+        assert_eq!(event.document.source_type, "test");
+        assert_eq!(event.document.tenant_id, t);
+        assert!(event.document.id.is_some(), "id stamped from DB");
+        assert!(event.document.ingested_at.is_some(), "ingested_at stamped from DB");
     }
 
     #[tokio::test]

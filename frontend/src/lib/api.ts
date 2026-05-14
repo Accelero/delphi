@@ -46,9 +46,8 @@ export type Session = {
 };
 
 /** Wire shape returned by `GET /api/discovery/feed`. Mirrors the Rust
- *  `FeedItem` (Document fields plus `read`). `id` is a SurrealDB record
- *  id stringified as `document:<key>`; `docKey()` strips the prefix for
- *  paths that take just the key. */
+ *  `Document`. `id` is a SurrealDB record id stringified as
+ *  `document:<key>`. */
 export type FeedDocument = {
   id: string;
   canonical_id: string;
@@ -64,7 +63,6 @@ export type FeedDocument = {
   content_hash: string;
   version: number;
   metadata: Record<string, unknown>;
-  read: boolean;
 };
 
 export type FeedPage = {
@@ -74,12 +72,6 @@ export type FeedPage = {
 };
 
 export type FeedSort = "recency";
-
-/** Strip the `document:` table prefix from a record-id string. The mark-
- *  read endpoints take only the key portion in the path. */
-export function docKey(id: string): string {
-  return id.startsWith("document:") ? id.slice("document:".length) : id;
-}
 
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
@@ -97,10 +89,6 @@ export const api = {
       const qs = q.toString();
       return request<FeedPage>(`/api/discovery/feed${qs ? `?${qs}` : ""}`);
     },
-    markRead: (id: string) =>
-      request<void>(`/api/discovery/items/${docKey(id)}/read`, { method: "POST" }),
-    markUnread: (id: string) =>
-      request<void>(`/api/discovery/items/${docKey(id)}/read`, { method: "DELETE" }),
     /** URL for the SSE `EventSource`. Plain string because EventSource
      *  manages its own fetch, separate from `request()`. */
     eventsUrl: "/api/discovery/feed/events",

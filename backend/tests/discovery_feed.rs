@@ -1,5 +1,5 @@
-//! `GET /api/discovery/feed` + read-state mutations + SSE wiring,
-//! end-to-end through the auth middleware.
+//! `GET /api/discovery/feed` + SSE wiring, end-to-end through the auth
+//! middleware.
 
 mod common;
 
@@ -37,32 +37,6 @@ async fn seed(app: &TestApp, canonical_id: &str) {
         );
     let res = app.send(req).await;
     assert_eq!(res.status, StatusCode::OK, "seed ingest");
-}
-
-/// Pull the bare record key out of a feed item's `id` field. The wire
-/// shape for a SurrealDB record id depends on serializer settings; this
-/// helper accepts both the string form (`"document:abc"`) and the
-/// object form (`{"tb": "document", "id": {"String": "abc"}}` etc.).
-fn doc_key(item: &Value) -> String {
-    let id = &item["id"];
-    if let Some(s) = id.as_str() {
-        return s.strip_prefix("document:").unwrap_or(s).to_string();
-    }
-    // Object form: try common shapes.
-    if let Some(inner) = id.get("id") {
-        if let Some(s) = inner.as_str() {
-            return s.to_string();
-        }
-        // {"id": {"String": "abc"}} etc.
-        if let Some(obj) = inner.as_object() {
-            for v in obj.values() {
-                if let Some(s) = v.as_str() {
-                    return s.to_string();
-                }
-            }
-        }
-    }
-    panic!("could not extract key from id: {id:?}");
 }
 
 fn auth_get(uri: &str) -> Request<Body> {
@@ -161,130 +135,6 @@ async fn feed_400_on_malformed_cursor() {
 }
 
 #[tokio::test]
-async fn mark_read_then_unread_round_trip() {
-    let app = TestApp::build().await;
-    seed(&app, "doc-x").await;
-
-    // First read: confirm unread.
-    let res = app.send(auth_get("/api/discovery/feed")).await;
-    let body: Value = res.json();
-    let item = &body["items"][0];
-    let key = doc_key(item);
-    assert_eq!(item["read"], false);
-
-    // Mark read.
-    let req = AuthRequestBuilder::default().sub("alice").apply(
-        Request::builder()
-            .method("POST")
-            .uri(format!("/api/discovery/items/{key}/read"))
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let res = app.send(req).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
-
-    // Idempotent: second mark-read still 204.
-    let req = AuthRequestBuilder::default().sub("alice").apply(
-        Request::builder()
-            .method("POST")
-            .uri(format!("/api/discovery/items/{key}/read"))
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let res = app.send(req).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
-
-    let res = app.send(auth_get("/api/discovery/feed")).await;
-    let body: Value = res.json();
-    assert_eq!(body["items"][0]["read"], true);
-
-    // Mark unread.
-    let req = AuthRequestBuilder::default().sub("alice").apply(
-        Request::builder()
-            .method("DELETE")
-            .uri(format!("/api/discovery/items/{key}/read"))
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let res = app.send(req).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
-
-    let res = app.send(auth_get("/api/discovery/feed")).await;
-    let body: Value = res.json();
-    assert_eq!(body["items"][0]["read"], false);
-}
-
-#[tokio::test]
-async fn read_state_isolates_per_user() {
-    let app = TestApp::build().await;
-    seed(&app, "doc-x").await;
-
-    // Alice reads the feed and gets the doc id.
-    let res = app
-        .send(
-            AuthRequestBuilder::default()
-                .sub("alice")
-                .apply(
-                    Request::builder()
-                        .method("GET")
-                        .uri("/api/discovery/feed")
-                        .body(Body::empty())
-                        .unwrap(),
-                ),
-        )
-        .await;
-    let body: Value = res.json();
-    let key = doc_key(&body["items"][0]);
-    let key = key.as_str();
-
-    // Alice marks it read.
-    let req = AuthRequestBuilder::default().sub("alice").apply(
-        Request::builder()
-            .method("POST")
-            .uri(format!("/api/discovery/items/{key}/read"))
-            .body(Body::empty())
-            .unwrap(),
-    );
-    let res = app.send(req).await;
-    assert_eq!(res.status, StatusCode::NO_CONTENT);
-
-    // Bob reads the same feed — still unread for him.
-    let res = app
-        .send(
-            AuthRequestBuilder::default()
-                .sub("bob")
-                .email("bob@delphi.test")
-                .apply(
-                    Request::builder()
-                        .method("GET")
-                        .uri("/api/discovery/feed")
-                        .body(Body::empty())
-                        .unwrap(),
-                ),
-        )
-        .await;
-    let body: Value = res.json();
-    assert_eq!(body["items"][0]["read"], false, "bob should not see alice's read state");
-
-    // Alice still sees it as read.
-    let res = app
-        .send(
-            AuthRequestBuilder::default()
-                .sub("alice")
-                .apply(
-                    Request::builder()
-                        .method("GET")
-                        .uri("/api/discovery/feed")
-                        .body(Body::empty())
-                        .unwrap(),
-                ),
-        )
-        .await;
-    let body: Value = res.json();
-    assert_eq!(body["items"][0]["read"], true);
-}
-
-#[tokio::test]
 async fn ingest_broadcasts_new_document_event() {
     // Validates the wiring: NotifyingSink → broadcast::Sender on
     // AppState → the SSE handler subscribes from the same channel.
@@ -300,7 +150,6 @@ async fn ingest_broadcasts_new_document_event() {
         .await
         .expect("event should arrive within 1s")
         .expect("channel still open");
-    assert_eq!(event.item.document.canonical_id, "broadcast-doc");
-    assert_eq!(event.item.document.source_type, "test");
-    assert!(!event.item.read, "newly created doc cannot be read");
+    assert_eq!(event.document.canonical_id, "broadcast-doc");
+    assert_eq!(event.document.source_type, "test");
 }

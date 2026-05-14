@@ -16,14 +16,8 @@ special role).
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/feed?sort=&cursor=&limit=` | Cursor-paginated list of documents joined with the caller's read state. |
-| `POST` | `/items/{key}/read` | Mark a document read. Idempotent. |
-| `DELETE` | `/items/{key}/read` | Mark a document unread. Idempotent. |
+| `GET` | `/feed?sort=&cursor=&limit=` | Cursor-paginated list of documents. |
 | `GET` | `/feed/events` | SSE stream pushing `event: new_document` records as ingestion accepts new papers. |
-
-`{key}` is the bare SurrealDB record key (everything after
-`document:`). Keeps URLs free of the table prefix; the frontend has a
-`docKey()` helper that strips it from feed-item ids.
 
 ### Cursor
 
@@ -45,26 +39,13 @@ back partial). Pages are full-or-final; clients hide "Load more" when
 
 ## Read state
 
-```surql
-DEFINE TABLE feed_read SCHEMAFULL;
-DEFINE FIELD user     ON feed_read TYPE record<app_user>;
-DEFINE FIELD document ON feed_read TYPE record<document>;
-DEFINE FIELD read_at  ON feed_read TYPE datetime DEFAULT time::now();
-DEFINE INDEX feed_read_user_doc ON feed_read FIELDS user, document UNIQUE;
-```
-
-Existence is the source of truth: a row means the user has read the
-document; absence means unread. Mark-read is an upsert (idempotent);
-mark-unread is a delete (idempotent). The unique `(user, document)`
-index doubles as the lookup index for the join.
-
-`Storage::list_feed` issues two queries — documents page, then a
-`document IN $ids` lookup against `feed_read` — and merges in
-application code. A single nested-SELECT join was tried and rejected:
-the SDK refuses to deserialize `FeedItem<#[serde(flatten)] Document>`
-when `Document` carries a `serde_json::Value` field (flatten + untagged
-enum collide). Two queries cost one extra round trip per page; at the
-default 50 items it's not measurable.
+Not persisted today. "New" highlight is a per-session cosmetic on the
+client — a `Set<string>` of ids that arrived via SSE since the page
+loaded, cleared on first `mouseenter` of the card. Nothing about it
+reaches the backend. If/when cross-device read state is needed, the
+shape would be a `feed_read` edge keyed by `(app_user, document)`; the
+storage layer already takes `tenant_id` everywhere so adding it back
+is a localised change.
 
 ## Live updates: NotifyingSink
 
@@ -110,8 +91,8 @@ shared state; tearing down the connection drops the receiver.
 
 ## Frontend
 
-`Feed.tsx` is the page; `PaperCard.tsx` is the row; `useFeedEvents.ts`
-is the SSE hook.
+`Feed.tsx` is the page; `DocumentCard.tsx` is the row;
+`useFeedEvents.ts` is the SSE hook.
 
 ### Pagination
 
@@ -141,27 +122,15 @@ patterns coexist because they solve opposite problems.
 
 ### Newness fade
 
-A page-level IntersectionObserver (root = `#app-scroll` from
-`__root.tsx`, threshold 0.5) watches every `[data-new="true"]` card.
-When a card has been ≥50% visible for 1s, its id is removed from the
-"new" set and React re-renders the card without the highlight. Timers
-are cancelled if the card leaves the viewport before they fire. A
-MutationObserver-equivalent scan on next animation frame picks up
-freshly mounted cards without polling.
+The card's `onMouseEnter` clears its id from the "new" set; React
+re-renders without the highlight. No timers, no IntersectionObserver
+— hovering the card is the only trigger.
 
 ### "N new above" pill
 
 Shown when `scrollTop > 100 && newSet.size > 0`. Click smooth-scrolls
 to the top of `#app-scroll`. Style mirrors the Chat surface's
 "scroll-to-bottom" floating button.
-
-### Optimistic mark-read
-
-Card click → `useMutation` with `onMutate` that flips `read: true` in
-the React Query cache (`setQueryData` over all pages). On error the
-mutation rolls back from the captured `prev` snapshot. Mark-unread is
-the same shape, fired by the "Read" chip's click handler (which
-`stopPropagation`s so it doesn't re-trigger mark-read).
 
 ## Sort architecture
 
@@ -177,15 +146,6 @@ algorithm owns its cursor encoding (opaque to clients), so adding e.g.
 
 No API contract change.
 
-## Tenant scoping (deferred)
-
-Matches the existing TODO at `ingestion/pipeline.rs`. `list_feed` does
-NOT filter by tenant in v1; `feed_read` rows are per-user, which is
-per-tenant naturally. When the multi-tenant slice lands, the storage
-methods grow a `tenant_id` parameter and queries gain `WHERE tenant =
-$tenant`. The wire contract doesn't change — `tenant_id` flows in from
-the `AuthContext`.
-
 ## Files
 
 | Layer | Path |
@@ -196,8 +156,8 @@ the `AuthContext`.
 | API handlers | `backend/src/api/discovery.rs` |
 | Backend tests | `backend/tests/discovery_feed.rs` |
 | Page | `frontend/src/components/discovery/Feed.tsx` |
-| Card | `frontend/src/components/discovery/PaperCard.tsx` |
+| Card | `frontend/src/components/discovery/DocumentCard.tsx` |
 | SSE hook | `frontend/src/hooks/useFeedEvents.ts` |
 | API client | `frontend/src/lib/api.ts` (`api.discovery.*`) |
 | Route | `frontend/src/routes/feed.tsx` |
-| Frontend tests | `frontend/src/components/discovery/{PaperCard,Feed}.test.tsx` |
+| Frontend tests | `frontend/src/components/discovery/{DocumentCard,Feed}.test.tsx` |

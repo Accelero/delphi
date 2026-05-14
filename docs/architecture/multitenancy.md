@@ -112,8 +112,8 @@ DEFINE FIELD IF NOT EXISTS tenant ON document TYPE record<tenant>
 ```
 
 Apply to: `document`, `document_content`, `chunk`, `document_version`,
-`source_state`, `feed_read`. Add an index on `tenant` for each (queries
-will filter by it heavily).
+`source_state`. Add an index on `tenant` for each (queries will filter
+by it heavily).
 
 `canonical_id` index changes from globally `UNIQUE` to `UNIQUE` per
 tenant: `DEFINE INDEX document_canonical_id ON document FIELDS tenant,

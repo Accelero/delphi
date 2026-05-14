@@ -15,8 +15,7 @@ use surrealdb::{Datetime, RecordId, Surreal};
 
 use crate::error::{Error, Result};
 use crate::storage::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
-    Storage,
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters, Storage,
 };
 
 /// Storage trait implementation against a SurrealDB connection.
@@ -549,11 +548,9 @@ impl Storage for SurrealStorage {
     async fn list_feed(
         &self,
         tenant: &RecordId,
-        user_id: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
-    ) -> Result<Vec<FeedItem>> {
-        // Two-query merge: documents page, then read-state lookup.
+    ) -> Result<Vec<Document>> {
         let where_cursor = if cursor.is_some() {
             "AND (ingested_at < $cursor_ts \
                   OR (ingested_at = $cursor_ts AND id < $cursor_id))"
@@ -578,112 +575,8 @@ impl Storage for SurrealStorage {
         }
         let mut response = q.await?;
         let wires: Vec<DocumentWire> = response.take(0)?;
-        let docs: Vec<Document> = wires.into_iter().map(Document::from).collect();
-
-        if docs.is_empty() {
-            return Ok(Vec::new());
-        }
-        let doc_ids: Vec<RecordId> = docs.iter().filter_map(|d| d.id.clone()).collect();
-        let mut response = self
-            .db
-            .query(
-                "SELECT VALUE document FROM feed_read \
-                 WHERE tenant_id = $t AND user = $user AND document IN $doc_ids",
-            )
-            .bind(("t", tenant.clone()))
-            .bind(("user", user_id.clone()))
-            .bind(("doc_ids", doc_ids))
-            .await?;
-        let read_ids: Vec<RecordId> = response.take(0)?;
-        let read_set: std::collections::HashSet<RecordId> = read_ids.into_iter().collect();
-
-        Ok(docs
-            .into_iter()
-            .map(|d| {
-                let read = d.id.as_ref().is_some_and(|id| read_set.contains(id));
-                FeedItem { document: d, read }
-            })
-            .collect())
+        Ok(wires.into_iter().map(Document::from).collect())
     }
-
-    async fn mark_read(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()> {
-        // Audit H2: concurrent mark_read on the same (user, doc) used
-        // to 500 because SELECT-then-CREATE hit the
-        // `feed_read_user_doc` UNIQUE index on the second writer.
-        //
-        // The single statement below makes the duplicate-key path a
-        // no-op (`read_at = read_at` keeps first-read semantics — a
-        // re-mark doesn't bump the timestamp). SurrealDB's MVCC may
-        // still reject concurrent transactions touching the same row
-        // with a "Resource busy" / transaction-conflict error; that's
-        // a transient signal, so retry with brief jitter. Both error
-        // classes (duplicate key + transient conflict) are now masked
-        // from the caller — mark_read is unconditionally idempotent.
-        const MAX_ATTEMPTS: u32 = 5;
-        for attempt in 0..MAX_ATTEMPTS {
-            let result = self
-                .db
-                .query(
-                    "INSERT INTO feed_read \
-                     { tenant_id: $t, user: $user, document: $doc } \
-                     ON DUPLICATE KEY UPDATE read_at = read_at",
-                )
-                .bind(("t", tenant.clone()))
-                .bind(("user", user_id.clone()))
-                .bind(("doc", doc_id.clone()))
-                .await
-                .and_then(|mut r| r.check());
-            match result {
-                Ok(_) => return Ok(()),
-                Err(e) if is_transient_conflict(&e) && attempt + 1 < MAX_ATTEMPTS => {
-                    // Linear backoff with a tiny base so simultaneous
-                    // double-clicks resolve in <50ms total. Each attempt
-                    // gets a different sleep to spread retries out.
-                    let backoff_ms = 5 + 5 * attempt as u64;
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        unreachable!("retry loop exits via return")
-    }
-
-    async fn mark_unread(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()> {
-        self.db
-            .query(
-                "DELETE feed_read \
-                 WHERE tenant_id = $t AND user = $user AND document = $doc",
-            )
-            .bind(("t", tenant.clone()))
-            .bind(("user", user_id.clone()))
-            .bind(("doc", doc_id.clone()))
-            .await?
-            .check()?;
-        Ok(())
-    }
-}
-
-/// Recognise SurrealDB's transient transaction-conflict signal so the
-/// caller can retry. Today's matcher uses message inspection because
-/// `surrealdb::Error` doesn't expose the underlying datastore error
-/// kind structurally. If a future surrealdb release surfaces a
-/// dedicated variant for this, swap to that match.
-fn is_transient_conflict(e: &surrealdb::Error) -> bool {
-    let msg = e.to_string();
-    // "Resource busy" — write-write conflict on same record under MVCC.
-    // "failed transaction" — broader transient transaction error.
-    msg.contains("Resource busy") || msg.contains("failed transaction")
 }
 
 fn build_filter_clause(f: &Filters) -> String {
@@ -729,22 +622,6 @@ mod feed_query_tests {
         row.unwrap().id
     }
 
-    async fn create_user(system: &SystemDb, sub: &str, tenant: &RecordId) -> RecordId {
-        let mut r = system
-            .raw()
-            .query(
-                "CREATE app_user CONTENT \
-                 { iss: 'test', sub: $sub, email: 'u@example.com', tenant_id: $tid } \
-                 RETURN id",
-            )
-            .bind(("sub", sub.to_string()))
-            .bind(("tid", tenant.clone()))
-            .await
-            .unwrap();
-        let row: Option<IdRow> = r.take(0).unwrap();
-        row.unwrap().id
-    }
-
     fn doc(tenant: &RecordId, canonical_id: &str) -> Document {
         Document {
             id: None,
@@ -767,49 +644,39 @@ mod feed_query_tests {
 
     #[tokio::test]
     async fn list_feed_returns_empty_when_no_documents() {
-        let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1", &tenant).await;
-        let items = storage.list_feed(&tenant, &user, None, 50).await.unwrap();
+        let (_system, storage, tenant) = fresh().await;
+        let items = storage.list_feed(&tenant, None, 50).await.unwrap();
         assert!(items.is_empty());
     }
 
     #[tokio::test]
-    async fn list_feed_orders_newest_first_and_marks_read() {
+    async fn list_feed_orders_newest_first() {
         let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1", &tenant).await;
 
-        let mut ids = Vec::new();
         for (i, c) in ["a", "b", "c"].iter().enumerate() {
             let id = storage.upsert_document(&tenant, &doc(&tenant, c)).await.unwrap();
             let ts = (Utc::now() - Duration::seconds(100 - i as i64 * 10)).to_rfc3339();
             system
                 .raw()
                 .query("UPDATE $rid SET ingested_at = <datetime>$ts")
-                .bind(("rid", id.clone()))
+                .bind(("rid", id))
                 .bind(("ts", ts))
                 .await
                 .unwrap()
                 .check()
                 .unwrap();
-            ids.push(id);
         }
 
-        storage.mark_read(&tenant, &user, &ids[1]).await.unwrap();
-
-        let items = storage.list_feed(&tenant, &user, None, 50).await.unwrap();
+        let items = storage.list_feed(&tenant, None, 50).await.unwrap();
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].document.canonical_id, "c");
-        assert_eq!(items[1].document.canonical_id, "b");
-        assert_eq!(items[2].document.canonical_id, "a");
-        assert!(!items[0].read);
-        assert!(items[1].read);
-        assert!(!items[2].read);
+        assert_eq!(items[0].canonical_id, "c");
+        assert_eq!(items[1].canonical_id, "b");
+        assert_eq!(items[2].canonical_id, "a");
     }
 
     #[tokio::test]
     async fn list_feed_paginates_with_cursor() {
         let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1", &tenant).await;
 
         for i in 0..5 {
             let id = storage
@@ -828,99 +695,30 @@ mod feed_query_tests {
                 .unwrap();
         }
 
-        let page1 = storage.list_feed(&tenant, &user, None, 2).await.unwrap();
+        let page1 = storage.list_feed(&tenant, None, 2).await.unwrap();
         assert_eq!(page1.len(), 2);
         let last = page1.last().unwrap();
         let cursor = FeedCursor {
-            ingested_at: last.document.ingested_at.unwrap(),
-            id: last.document.id.clone().unwrap(),
+            ingested_at: last.ingested_at.unwrap(),
+            id: last.id.clone().unwrap(),
         };
         let page2 = storage
-            .list_feed(&tenant, &user, Some(cursor), 2)
+            .list_feed(&tenant, Some(cursor), 2)
             .await
             .unwrap();
         assert_eq!(page2.len(), 2);
 
-        let p1: Vec<_> = page1.iter().filter_map(|i| i.document.id.clone()).collect();
+        let p1: Vec<_> = page1.iter().filter_map(|d| d.id.clone()).collect();
         for item in &page2 {
-            let id = item.document.id.clone().unwrap();
+            let id = item.id.clone().unwrap();
             assert!(!p1.contains(&id), "page2 should not overlap page1");
         }
-    }
-
-    #[tokio::test]
-    async fn mark_read_is_idempotent_and_unread_removes() {
-        let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1", &tenant).await;
-        let id = storage.upsert_document(&tenant, &doc(&tenant, "x")).await.unwrap();
-
-        storage.mark_read(&tenant, &user, &id).await.unwrap();
-        storage.mark_read(&tenant, &user, &id).await.unwrap();
-        let items = storage.list_feed(&tenant, &user, None, 50).await.unwrap();
-        assert!(items[0].read);
-
-        storage.mark_unread(&tenant, &user, &id).await.unwrap();
-        storage.mark_unread(&tenant, &user, &id).await.unwrap();
-        let items = storage.list_feed(&tenant, &user, None, 50).await.unwrap();
-        assert!(!items[0].read);
-    }
-
-    #[tokio::test]
-    async fn mark_read_concurrent_calls_all_succeed_and_create_one_row() {
-        // Audit H2 regression: prior SELECT-then-CREATE pattern 500'd
-        // on concurrent calls because the second CREATE hit the
-        // `feed_read_user_doc` UNIQUE index. The new INSERT … ON
-        // DUPLICATE KEY UPDATE pattern serializes through the engine
-        // and keeps every call idempotent.
-        let (system, storage, tenant) = fresh().await;
-        let user = create_user(&system, "u1", &tenant).await;
-        let id = storage.upsert_document(&tenant, &doc(&tenant, "x")).await.unwrap();
-
-        // 16 simultaneous mark_reads, all must succeed.
-        let storage = std::sync::Arc::new(storage);
-        let mut tasks = Vec::with_capacity(16);
-        for _ in 0..16 {
-            let storage = storage.clone();
-            let tenant = tenant.clone();
-            let user = user.clone();
-            let id = id.clone();
-            tasks.push(tokio::spawn(async move {
-                storage.mark_read(&tenant, &user, &id).await
-            }));
-        }
-        for t in tasks {
-            t.await.expect("task panic").expect("mark_read errored");
-        }
-
-        // Exactly one row in feed_read for (user, doc); the unique
-        // index would have caught any duplicates anyway, but assert
-        // explicitly so this test is the canary if the constraint is
-        // ever weakened.
-        #[derive(serde::Deserialize)]
-        struct CountRow {
-            count: i64,
-        }
-        let mut count_response = system
-            .raw()
-            .query(
-                "SELECT count() FROM feed_read \
-                 WHERE tenant_id = $t AND user = $user AND document = $doc \
-                 GROUP ALL",
-            )
-            .bind(("t", tenant.clone()))
-            .bind(("user", user.clone()))
-            .bind(("doc", id.clone()))
-            .await
-            .unwrap();
-        let row: Option<CountRow> = count_response.take(0).unwrap();
-        assert_eq!(row.map(|r| r.count).unwrap_or(0), 1, "exactly one row");
     }
 
     #[tokio::test]
     async fn list_feed_isolates_per_tenant() {
         let (system, storage, tenant_a) = fresh().await;
         let tenant_b = create_tenant(&system, "tenant-b").await;
-        let alice = create_user(&system, "alice", &tenant_a).await;
 
         // Same canonical_id in two tenants → two distinct rows (per-tenant
         // canonical UNIQUE index).
@@ -933,10 +731,10 @@ mod feed_query_tests {
             .await
             .unwrap();
 
-        let a_view = storage.list_feed(&tenant_a, &alice, None, 50).await.unwrap();
+        let a_view = storage.list_feed(&tenant_a, None, 50).await.unwrap();
         assert_eq!(a_view.len(), 1, "tenant A sees only its own doc");
 
-        let b_view = storage.list_feed(&tenant_b, &alice, None, 50).await.unwrap();
+        let b_view = storage.list_feed(&tenant_b, None, 50).await.unwrap();
         assert_eq!(b_view.len(), 1, "tenant B sees only its own doc");
     }
 }

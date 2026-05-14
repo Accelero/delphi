@@ -235,25 +235,6 @@ DEFINE FIELD IF NOT EXISTS updated_at ON source_state TYPE datetime DEFAULT time
 REMOVE INDEX IF EXISTS source_state_adapter ON source_state;
 DEFINE INDEX IF NOT EXISTS source_state_tenant_adapter ON source_state FIELDS tenant_id, adapter UNIQUE;
 
--- ---------------------------------------------------------------------------
--- feed_read
--- Per-user, per-document read state. Existence == read; absence == unread.
--- mark-read = idempotent upsert; mark-unread = delete the row.
--- tenant_id denormalized so PERMISSIONS rules can be direct.
--- ---------------------------------------------------------------------------
-DEFINE TABLE IF NOT EXISTS feed_read SCHEMAFULL
-    PERMISSIONS
-        FOR select, delete WHERE tenant_id = $auth.tenant_id AND user = $auth.id
-        FOR create WHERE tenant_id = $auth.tenant_id AND user = $auth.id;
-DEFINE FIELD IF NOT EXISTS tenant_id ON feed_read TYPE record<tenant>
-    ASSERT $value != NONE;
-DEFINE FIELD IF NOT EXISTS user      ON feed_read TYPE record<app_user>;
-DEFINE FIELD IF NOT EXISTS document  ON feed_read TYPE record<document>;
-DEFINE FIELD IF NOT EXISTS read_at   ON feed_read TYPE datetime DEFAULT time::now();
-DEFINE INDEX IF NOT EXISTS feed_read_user_doc  ON feed_read FIELDS user, document UNIQUE;
-DEFINE INDEX IF NOT EXISTS feed_read_user      ON feed_read FIELDS user;
-DEFINE INDEX IF NOT EXISTS feed_read_tenant_id ON feed_read FIELDS tenant_id;
-
 -- ===========================================================================
 -- (Sessions table removed: the BFF — Traefik + oauth2-proxy — owns session
 -- storage in front of the backend. The backend is stateless w.r.t. user

@@ -31,7 +31,7 @@ use crate::error::{Error, Result};
 use super::surreal::SurrealStorage;
 use super::system::engine_requires_auth;
 use super::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, FeedItem, Filters,
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
     Storage,
 };
 
@@ -331,27 +331,10 @@ impl Storage for AuthedDb {
     async fn list_feed(
         &self,
         tenant: &RecordId,
-        user_id: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
-    ) -> Result<Vec<FeedItem>> {
-        self.storage().list_feed(tenant, user_id, cursor, limit).await
-    }
-    async fn mark_read(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()> {
-        self.storage().mark_read(tenant, user_id, doc_id).await
-    }
-    async fn mark_unread(
-        &self,
-        tenant: &RecordId,
-        user_id: &RecordId,
-        doc_id: &DocId,
-    ) -> Result<()> {
-        self.storage().mark_unread(tenant, user_id, doc_id).await
+    ) -> Result<Vec<Document>> {
+        self.storage().list_feed(tenant, cursor, limit).await
     }
 }
 

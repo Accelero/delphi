@@ -1,18 +1,12 @@
 //! Discovery feed API.
 //!
-//! Three handlers, all mounted under `/api/discovery`:
+//! Two handlers, both mounted under `/api/discovery`:
 //!
 //! - `GET  /api/discovery/feed?sort=recency&cursor=<opaque>&limit=N`
-//!   Cursor-paginated list of documents with per-user read state.
-//! - `POST /api/discovery/items/{key}/read` — mark read.
-//! - `DELETE /api/discovery/items/{key}/read` — mark unread.
+//!   Cursor-paginated list of documents.
 //! - `GET  /api/discovery/feed/events` — server-sent events stream that
 //!   pushes a `new_document` record every time an ingest produces a
 //!   `Created` outcome (see `ingestion::NotifyingSink`).
-//!
-//! `{key}` is the bare SurrealDB record key (everything after
-//! `document:`), so the URL path stays free of the table prefix and
-//! survives client-side URL handling.
 //!
 //! All handlers scope to `auth.tenant_id`. The SSE handler also filters
 //! the broadcast stream against the connecting user's tenant and
@@ -24,7 +18,7 @@ use std::time::Duration;
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -40,7 +34,7 @@ use tokio::sync::broadcast;
 use crate::auth::AuthContext;
 use crate::ingestion::FeedItemEvent;
 use crate::state::AppState;
-use crate::storage::{AuthedDb, FeedCursor, FeedItem, Storage};
+use crate::storage::{AuthedDb, Document, FeedCursor, Storage};
 
 const DEFAULT_LIMIT: usize = 50;
 const MAX_LIMIT: usize = 200;
@@ -68,7 +62,7 @@ pub struct FeedQuery {
 
 #[derive(Debug, Serialize)]
 pub struct FeedResponse {
-    pub items: Vec<FeedItem>,
+    pub items: Vec<Document>,
     /// Present iff the page was full — i.e. there *might* be more.
     /// `None` signals end-of-feed and the client should hide "load more".
     pub next_cursor: Option<String>,
@@ -104,10 +98,7 @@ pub async fn feed(
         None => None,
     };
 
-    let items = match db
-        .list_feed(&auth.tenant_id, &auth.user_id, cursor, limit)
-        .await
-    {
+    let items = match db.list_feed(&auth.tenant_id, cursor, limit).await {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "feed query failed");
@@ -116,9 +107,9 @@ pub async fn feed(
     };
 
     let next_cursor = if items.len() == limit {
-        items.last().and_then(|item| {
-            let ts = item.document.ingested_at.as_ref()?;
-            let id = item.document.id.as_ref()?;
+        items.last().and_then(|doc| {
+            let ts = doc.ingested_at.as_ref()?;
+            let id = doc.id.as_ref()?;
             Some(encode_cursor(*ts, id.clone()))
         })
     } else {
@@ -130,42 +121,6 @@ pub async fn feed(
         Json(FeedResponse { items, next_cursor }),
     )
         .into_response()
-}
-
-pub async fn mark_read(
-    Extension(db): Extension<Arc<AuthedDb>>,
-    auth: AuthContext,
-    Path(key): Path<String>,
-) -> Response {
-    let doc_id = RecordId::from(("document", key.as_str()));
-    match db
-        .mark_read(&auth.tenant_id, &auth.user_id, &doc_id)
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "mark_read failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "mark_read failed").into_response()
-        }
-    }
-}
-
-pub async fn mark_unread(
-    Extension(db): Extension<Arc<AuthedDb>>,
-    auth: AuthContext,
-    Path(key): Path<String>,
-) -> Response {
-    let doc_id = RecordId::from(("document", key.as_str()));
-    match db
-        .mark_unread(&auth.tenant_id, &auth.user_id, &doc_id)
-        .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "mark_unread failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "mark_unread failed").into_response()
-        }
-    }
 }
 
 /// Subscribes to the new-document broadcast and emits one
@@ -212,16 +167,16 @@ fn broadcast_to_sse(
                     biased;
                     _ = tokio::time::sleep_until(deadline) => return None,
                     recv = rx.recv() => match recv {
-                        Ok(event) if event.item.document.tenant_id == tenant => {
-                            // Send the FeedItem itself — same wire shape as
+                        Ok(event) if event.document.tenant_id == tenant => {
+                            // Send the Document itself — same wire shape as
                             // /api/discovery/feed items, so SPA receivers
                             // can prepend it directly into the cache without
                             // a refetch. `json_data` only fails on non-
-                            // serializable values; FeedItem is plain data.
+                            // serializable values; Document is plain data.
                             let sse = Event::default()
                                 .event("new_document")
-                                .json_data(&event.item)
-                                .expect("FeedItem must serialize");
+                                .json_data(&event.document)
+                                .expect("Document must serialize");
                             return Some((Ok(sse), (rx, tenant, deadline)));
                         }
                         Ok(_) => continue, // event for a different tenant — drop
