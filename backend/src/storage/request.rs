@@ -31,8 +31,8 @@ use crate::error::{Error, Result};
 use super::surreal::SurrealStorage;
 use super::system::engine_requires_auth;
 use super::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
-    Storage,
+    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
+    Document, FeedCursor, Filters, MessageId, Storage,
 };
 
 /// Default pool size when `REQUEST_DB_POOL_SIZE` is unset. Sized to
@@ -137,10 +137,7 @@ impl RequestDbPool {
     /// tests see consistent state regardless of which slot was
     /// acquired.
     #[doc(hidden)]
-    pub async fn in_memory(
-        seed: &Surreal<Any>,
-        size: usize,
-    ) -> Result<Self> {
+    pub async fn in_memory(seed: &Surreal<Any>, size: usize) -> Result<Self> {
         let (tx, rx) = mpsc::channel(size);
         for _ in 0..size {
             tx.send(seed.clone())
@@ -206,7 +203,11 @@ struct AuthedDbInner {
 
 impl AuthedDb {
     fn storage(&self) -> &SurrealStorage {
-        &self.inner.as_ref().expect("AuthedDb used after drop").storage
+        &self
+            .inner
+            .as_ref()
+            .expect("AuthedDb used after drop")
+            .storage
     }
 
     /// Share this connection with a short-lived consumer (typically
@@ -254,10 +255,7 @@ impl Storage for AuthedDb {
     async fn get_document(&self, id: &DocId) -> Result<Option<Document>> {
         self.storage().get_document(id).await
     }
-    async fn get_document_by_canonical(
-        &self,
-        canonical_id: &str,
-    ) -> Result<Option<Document>> {
+    async fn get_document_by_canonical(&self, canonical_id: &str) -> Result<Option<Document>> {
         self.storage().get_document_by_canonical(canonical_id).await
     }
     async fn delete_document(&self, id: &DocId) -> Result<()> {
@@ -269,11 +267,7 @@ impl Storage for AuthedDb {
     async fn get_content(&self, doc_id: &DocId) -> Result<Option<Content>> {
         self.storage().get_content(doc_id).await
     }
-    async fn upsert_chunks(
-        &self,
-        doc_id: &DocId,
-        chunks: &[Chunk],
-    ) -> Result<Vec<ChunkId>> {
+    async fn upsert_chunks(&self, doc_id: &DocId, chunks: &[Chunk]) -> Result<Vec<ChunkId>> {
         self.storage().upsert_chunks(doc_id, chunks).await
     }
     async fn list_chunks(&self, doc_id: &DocId) -> Result<Vec<Chunk>> {
@@ -298,12 +292,34 @@ impl Storage for AuthedDb {
     ) -> Result<Vec<ChunkSearchResult>> {
         self.storage().search_keyword(query, top_k, filters).await
     }
-    async fn list_feed(
-        &self,
-        cursor: Option<FeedCursor>,
-        limit: usize,
-    ) -> Result<Vec<Document>> {
+    async fn list_feed(&self, cursor: Option<FeedCursor>, limit: usize) -> Result<Vec<Document>> {
         self.storage().list_feed(cursor, limit).await
+    }
+    async fn create_conversation(&self, title: Option<&str>) -> Result<ConversationId> {
+        self.storage().create_conversation(title).await
+    }
+    async fn list_conversations(&self) -> Result<Vec<Conversation>> {
+        self.storage().list_conversations().await
+    }
+    async fn get_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
+        self.storage().get_conversation(id).await
+    }
+    async fn list_messages(&self, conv: &ConversationId) -> Result<Vec<ChatMessage>> {
+        self.storage().list_messages(conv).await
+    }
+    async fn append_message(
+        &self,
+        conv: &ConversationId,
+        role: &str,
+        content: &str,
+    ) -> Result<MessageId> {
+        self.storage().append_message(conv, role, content).await
+    }
+    async fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()> {
+        self.storage().rename_conversation(id, title).await
+    }
+    async fn delete_conversation(&self, id: &ConversationId) -> Result<()> {
+        self.storage().delete_conversation(id).await
     }
 }
 

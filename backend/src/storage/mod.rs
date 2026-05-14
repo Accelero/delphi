@@ -28,7 +28,8 @@ mod surreal;
 mod system;
 
 pub use models::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
+    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
+    Document, FeedCursor, Filters, MessageId,
 };
 pub use request::{AuthedDb, RequestDbPool};
 pub use surreal::SurrealStorage;
@@ -57,8 +58,7 @@ pub trait Storage: Send + Sync {
 
     async fn get_document(&self, id: &DocId) -> Result<Option<Document>>;
 
-    async fn get_document_by_canonical(&self, canonical_id: &str)
-        -> Result<Option<Document>>;
+    async fn get_document_by_canonical(&self, canonical_id: &str) -> Result<Option<Document>>;
 
     /// Cascade-deletes content, chunks, and version history.
     async fn delete_document(&self, id: &DocId) -> Result<()>;
@@ -101,9 +101,38 @@ pub trait Storage: Send + Sync {
 
     /// Cursor-paginated list of documents, newest-first by
     /// `(ingested_at, id)`. Engine scopes by tenant.
-    async fn list_feed(
+    async fn list_feed(&self, cursor: Option<FeedCursor>, limit: usize) -> Result<Vec<Document>>;
+
+    // ---- conversations -----------------------------------------------------
+
+    /// Create a new conversation owned by the caller. Engine fills
+    /// `tenant_id` and `user` from `$auth` via DEFAULT clauses.
+    async fn create_conversation(&self, title: Option<&str>) -> Result<ConversationId>;
+
+    /// All conversations visible to the caller, most-recent-first by
+    /// `updated_at`.
+    async fn list_conversations(&self) -> Result<Vec<Conversation>>;
+
+    /// Fetch one conversation by id. Returns `None` if absent or
+    /// engine-side PERMISSIONS hide it.
+    async fn get_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>>;
+
+    /// Messages in a conversation, oldest-first.
+    async fn list_messages(&self, conv: &ConversationId) -> Result<Vec<ChatMessage>>;
+
+    /// Append a message and bump the parent conversation's `updated_at`.
+    async fn append_message(
         &self,
-        cursor: Option<FeedCursor>,
-        limit: usize,
-    ) -> Result<Vec<Document>>;
+        conv: &ConversationId,
+        role: &str,
+        content: &str,
+    ) -> Result<MessageId>;
+
+    /// Update the title. Engine PERMISSIONS refuse cross-user / cross-
+    /// tenant writes.
+    async fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()>;
+
+    /// Cascade-delete a conversation and all of its messages.
+    /// Idempotent: deleting a missing id is a no-op.
+    async fn delete_conversation(&self, id: &ConversationId) -> Result<()>;
 }

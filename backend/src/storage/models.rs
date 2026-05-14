@@ -5,6 +5,8 @@ use surrealdb::RecordId;
 /// SurrealDB record id, e.g. `document:abc…`.
 pub type DocId = RecordId;
 pub type ChunkId = RecordId;
+pub type ConversationId = RecordId;
+pub type MessageId = RecordId;
 
 /// Serde adapter that puts an `Option<RecordId>` on the wire as the
 /// canonical `"table:key"` string instead of SurrealDB's structured
@@ -166,6 +168,50 @@ pub struct Filters {
     pub embedding_model: Option<String>,
     pub chunk_strategy: Option<String>,
     pub source_type: Option<String>,
+}
+
+/// A persisted chat conversation. The owning `user` field is implied by
+/// engine PERMISSIONS (`user = $auth.id`) and is not exposed on the wire —
+/// the caller is always the owner of any conversation they can see.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    /// Populated by the backend on read; ignored on write.
+    /// Wire format: `"conversation:<key>"` string.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_record_id_str"
+    )]
+    pub id: Option<RecordId>,
+
+    /// Filled engine-side from `$auth.tenant_id` on write, populated on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<RecordId>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+/// A single chat message inside a [`Conversation`]. `tenant_id` and the
+/// `conversation` link are engine-managed; on the wire we only expose
+/// what the SPA needs to render the message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_record_id_str"
+    )]
+    pub id: Option<RecordId>,
+    pub role: String,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 /// Anchor for cursor-paginated feed reads. The API layer base64-encodes

@@ -21,7 +21,8 @@ use surrealdb::{Datetime, RecordId, Surreal};
 
 use crate::error::{Error, Result};
 use crate::storage::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters, Storage,
+    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
+    Document, FeedCursor, Filters, MessageId, Storage,
 };
 
 /// Storage trait implementation against a SurrealDB connection.
@@ -131,6 +132,53 @@ fn datetime_to_chrono(d: Datetime) -> DateTime<Utc> {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConversationWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<RecordId>,
+    #[serde(default)]
+    tenant_id: Option<RecordId>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    created_at: Option<Datetime>,
+    #[serde(default)]
+    updated_at: Option<Datetime>,
+}
+
+impl From<ConversationWire> for Conversation {
+    fn from(w: ConversationWire) -> Self {
+        Self {
+            id: w.id,
+            tenant_id: w.tenant_id,
+            title: w.title,
+            created_at: w.created_at.map(datetime_to_chrono),
+            updated_at: w.updated_at.map(datetime_to_chrono),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessageWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<RecordId>,
+    role: String,
+    content: String,
+    #[serde(default)]
+    created_at: Option<Datetime>,
+}
+
+impl From<ChatMessageWire> for ChatMessage {
+    fn from(w: ChatMessageWire) -> Self {
+        Self {
+            id: w.id,
+            role: w.role,
+            content: w.content,
+            created_at: w.created_at.map(datetime_to_chrono),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct IdRow {
     id: RecordId,
 }
@@ -202,10 +250,7 @@ impl Storage for SurrealStorage {
         Ok(row.map(Document::from))
     }
 
-    async fn get_document_by_canonical(
-        &self,
-        canonical_id: &str,
-    ) -> Result<Option<Document>> {
+    async fn get_document_by_canonical(&self, canonical_id: &str) -> Result<Option<Document>> {
         let mut response = self
             .db
             .query("SELECT * FROM document WHERE canonical_id = $cid LIMIT 1")
@@ -290,11 +335,7 @@ impl Storage for SurrealStorage {
 
     // ---- chunks ------------------------------------------------------------
 
-    async fn upsert_chunks(
-        &self,
-        doc_id: &DocId,
-        chunks: &[Chunk],
-    ) -> Result<Vec<ChunkId>> {
+    async fn upsert_chunks(&self, doc_id: &DocId, chunks: &[Chunk]) -> Result<Vec<ChunkId>> {
         let mut ids = Vec::with_capacity(chunks.len());
         for c in chunks {
             let data = ChunkData {
@@ -442,13 +483,114 @@ impl Storage for SurrealStorage {
         Ok(response.take(0)?)
     }
 
+    // ---- conversations -----------------------------------------------------
+
+    async fn create_conversation(&self, title: Option<&str>) -> Result<ConversationId> {
+        // CREATE … RETURN id. tenant_id/user fill in from $auth via DEFAULT.
+        let mut response = self
+            .db
+            .query("CREATE conversation CONTENT { title: $title } RETURN id")
+            .bind(("title", title.map(|s| s.to_string())))
+            .await?;
+        let row: Option<IdRow> = response.take(0)?;
+        row.map(|r| r.id).ok_or(Error::EmptyResult)
+    }
+
+    async fn list_conversations(&self) -> Result<Vec<Conversation>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT id, tenant_id, title, created_at, updated_at \
+                 FROM conversation ORDER BY updated_at DESC",
+            )
+            .await?;
+        let wires: Vec<ConversationWire> = response.take(0)?;
+        Ok(wires.into_iter().map(Conversation::from).collect())
+    }
+
+    async fn get_conversation(&self, id: &ConversationId) -> Result<Option<Conversation>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT id, tenant_id, title, created_at, updated_at \
+                 FROM $rid LIMIT 1",
+            )
+            .bind(("rid", id.clone()))
+            .await?;
+        let row: Option<ConversationWire> = response.take(0)?;
+        Ok(row.map(Conversation::from))
+    }
+
+    async fn list_messages(&self, conv: &ConversationId) -> Result<Vec<ChatMessage>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT id, role, content, created_at \
+                 FROM message WHERE conversation = $conv \
+                 ORDER BY created_at ASC",
+            )
+            .bind(("conv", conv.clone()))
+            .await?;
+        let wires: Vec<ChatMessageWire> = response.take(0)?;
+        Ok(wires.into_iter().map(ChatMessage::from).collect())
+    }
+
+    async fn append_message(
+        &self,
+        conv: &ConversationId,
+        role: &str,
+        content: &str,
+    ) -> Result<MessageId> {
+        // Two statements in one round-trip: create the message, bump the
+        // parent's updated_at. Engine PERMISSIONS on both tables refuse
+        // the write if the caller doesn't own the conversation.
+        let mut response = self
+            .db
+            .query(
+                "CREATE message CONTENT { \
+                    conversation: $conv, \
+                    role: $role, \
+                    content: $content \
+                 } RETURN id; \
+                 UPDATE $conv SET updated_at = time::now()",
+            )
+            .bind(("conv", conv.clone()))
+            .bind(("role", role.to_string()))
+            .bind(("content", content.to_string()))
+            .await?;
+        let row: Option<IdRow> = response.take(0)?;
+        row.map(|r| r.id).ok_or(Error::EmptyResult)
+    }
+
+    async fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()> {
+        self.db
+            .query("UPDATE $rid SET title = $title, updated_at = time::now()")
+            .bind(("rid", id.clone()))
+            .bind(("title", title.to_string()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn delete_conversation(&self, id: &ConversationId) -> Result<()> {
+        // Cascade: messages first, then the conversation itself. Engine
+        // PERMISSIONS will refuse cross-tenant rows, so no application
+        // guard is needed; if the row doesn't exist, both DELETEs are
+        // no-ops — idempotent.
+        self.db
+            .query(
+                "DELETE message WHERE conversation = $rid; \
+                 DELETE $rid",
+            )
+            .bind(("rid", id.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
     // ---- discovery feed ----------------------------------------------------
 
-    async fn list_feed(
-        &self,
-        cursor: Option<FeedCursor>,
-        limit: usize,
-    ) -> Result<Vec<Document>> {
+    async fn list_feed(&self, cursor: Option<FeedCursor>, limit: usize) -> Result<Vec<Document>> {
         let where_cursor = if cursor.is_some() {
             "WHERE (ingested_at < $cursor_ts \
                     OR (ingested_at = $cursor_ts AND id < $cursor_id))"
@@ -460,10 +602,7 @@ impl Storage for SurrealStorage {
              ORDER BY ingested_at DESC, id DESC \
              LIMIT $limit"
         );
-        let mut q = self
-            .db
-            .query(sql)
-            .bind(("limit", limit as i64));
+        let mut q = self.db.query(sql).bind(("limit", limit as i64));
         if let Some(c) = cursor {
             q = q
                 .bind(("cursor_ts", Datetime::from(c.ingested_at)))

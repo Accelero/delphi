@@ -32,9 +32,7 @@ use delphi::auth::{
 };
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
-use delphi::storage::{
-    JwtAccessConfig, JwtAccessKind, RequestDbPool, SystemDb,
-};
+use delphi::storage::{JwtAccessConfig, JwtAccessKind, RequestDbPool, SystemDb};
 
 /// HS512 secret shared between the test JWT signer and SurrealDB's
 /// `app_session` access method. Test-only — not used in production builds.
@@ -70,10 +68,7 @@ impl TestApp {
                 .expect("connect in-memory surreal"),
         );
 
-        system
-            .init_schema()
-            .await
-            .expect("init schema in test db");
+        system.init_schema().await.expect("init schema in test db");
 
         // Register the `app_session` RECORD access method against the same
         // HS512 secret `AuthRequestBuilder` signs with. SurrealDB validates

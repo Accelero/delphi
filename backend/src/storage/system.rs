@@ -28,7 +28,8 @@ use surrealdb::{Datetime, RecordId, Surreal};
 use crate::error::{Error, Result};
 
 use super::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters, Storage,
+    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
+    Document, FeedCursor, Filters, MessageId, Storage,
 };
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
@@ -165,10 +166,9 @@ impl SystemDb {
     /// Configure the `app_session` JWT access method at runtime.
     pub async fn define_jwt_access(&self, cfg: &JwtAccessConfig) -> Result<()> {
         let validator = match &cfg.kind {
-            JwtAccessKind::Hs512 { secret } => format!(
-                "ALGORITHM HS512 KEY '{}'",
-                escape_surrealql_string(secret)
-            ),
+            JwtAccessKind::Hs512 { secret } => {
+                format!("ALGORITHM HS512 KEY '{}'", escape_surrealql_string(secret))
+            }
             JwtAccessKind::Jwks { url } => {
                 format!("URL '{}'", escape_surrealql_string(url))
             }
@@ -341,11 +341,7 @@ struct CursorRow {
     cursor: serde_json::Value,
 }
 
-async fn count_table(
-    db: &Surreal<Any>,
-    table: &str,
-    tenant: Option<&RecordId>,
-) -> Result<u64> {
+async fn count_table(db: &Surreal<Any>, table: &str, tenant: Option<&RecordId>) -> Result<u64> {
     let row: Option<CountRow> = match tenant {
         Some(t) => db
             .query(format!(
@@ -459,8 +455,12 @@ impl SystemStorage {
             storage_uri: w.storage_uri,
             title: w.title,
             authors: w.authors,
-            published_at: w.published_at.map(|d| -> DateTime<Utc> { d.into_inner().into() }),
-            ingested_at: w.ingested_at.map(|d| -> DateTime<Utc> { d.into_inner().into() }),
+            published_at: w
+                .published_at
+                .map(|d| -> DateTime<Utc> { d.into_inner().into() }),
+            ingested_at: w
+                .ingested_at
+                .map(|d| -> DateTime<Utc> { d.into_inner().into() }),
             language: w.language,
             summary: w.summary,
             content_hash: w.content_hash,
@@ -540,10 +540,7 @@ impl Storage for SystemStorage {
         Ok(row.map(Self::from_wire))
     }
 
-    async fn get_document_by_canonical(
-        &self,
-        canonical_id: &str,
-    ) -> Result<Option<Document>> {
+    async fn get_document_by_canonical(&self, canonical_id: &str) -> Result<Option<Document>> {
         let mut response = self
             .db
             .query(
@@ -560,7 +557,9 @@ impl Storage for SystemStorage {
     async fn delete_document(&self, id: &DocId) -> Result<()> {
         for table in ["document_content", "chunk", "document_version"] {
             self.db
-                .query(format!("DELETE {table} WHERE doc = $rid AND tenant_id = $t"))
+                .query(format!(
+                    "DELETE {table} WHERE doc = $rid AND tenant_id = $t"
+                ))
                 .bind(("rid", id.clone()))
                 .bind(("t", self.tenant.clone()))
                 .await?
@@ -625,11 +624,7 @@ impl Storage for SystemStorage {
         Ok(response.take(0)?)
     }
 
-    async fn upsert_chunks(
-        &self,
-        doc_id: &DocId,
-        chunks: &[Chunk],
-    ) -> Result<Vec<ChunkId>> {
+    async fn upsert_chunks(&self, doc_id: &DocId, chunks: &[Chunk]) -> Result<Vec<ChunkId>> {
         let mut ids = Vec::with_capacity(chunks.len());
         for c in chunks {
             let data = ChunkData {
@@ -788,11 +783,7 @@ impl Storage for SystemStorage {
         Ok(response.take(0)?)
     }
 
-    async fn list_feed(
-        &self,
-        cursor: Option<FeedCursor>,
-        limit: usize,
-    ) -> Result<Vec<Document>> {
+    async fn list_feed(&self, cursor: Option<FeedCursor>, limit: usize) -> Result<Vec<Document>> {
         let where_cursor = if cursor.is_some() {
             "AND (ingested_at < $cursor_ts \
                   OR (ingested_at = $cursor_ts AND id < $cursor_id))"
@@ -818,6 +809,57 @@ impl Storage for SystemStorage {
         let mut response = q.await?;
         let wires: Vec<DocumentWire> = response.take(0)?;
         Ok(wires.into_iter().map(Self::from_wire).collect())
+    }
+
+    // ---- conversations -----------------------------------------------------
+    //
+    // Conversations are a request-path concept (per-user chat history).
+    // The system path has no use case for them today — no scheduler / admin
+    // CLI operates on chat history — so these are explicit `NotImplemented`
+    // stubs. If a future system-path consumer appears (e.g. a scheduled
+    // cleanup job), wire them up against `$auth = NONE` queries with an
+    // explicit `tenant_id` bind, matching the pattern of the document
+    // methods above.
+
+    async fn create_conversation(&self, _title: Option<&str>) -> Result<ConversationId> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not create conversations".into(),
+        ))
+    }
+    async fn list_conversations(&self) -> Result<Vec<Conversation>> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not list conversations".into(),
+        ))
+    }
+    async fn get_conversation(&self, _id: &ConversationId) -> Result<Option<Conversation>> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not read conversations".into(),
+        ))
+    }
+    async fn list_messages(&self, _conv: &ConversationId) -> Result<Vec<ChatMessage>> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not read messages".into(),
+        ))
+    }
+    async fn append_message(
+        &self,
+        _conv: &ConversationId,
+        _role: &str,
+        _content: &str,
+    ) -> Result<MessageId> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not append messages".into(),
+        ))
+    }
+    async fn rename_conversation(&self, _id: &ConversationId, _title: &str) -> Result<()> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not rename conversations".into(),
+        ))
+    }
+    async fn delete_conversation(&self, _id: &ConversationId) -> Result<()> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not delete conversations".into(),
+        ))
     }
 }
 

@@ -87,6 +87,35 @@ export function documentFileUrl(id: string): string {
   return `/api/documents/${encodeURIComponent(documentKey(id))}/file`;
 }
 
+/** Wire shape returned by `/api/chat/conversations`. `id` is a
+ *  SurrealDB record id stringified as `conversation:<key>`. */
+export type Conversation = {
+  id: string;
+  title: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+};
+
+export type ChatMessageWire = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  created_at: string | null;
+};
+
+/** Wire shape returned by `GET /api/chat/conversations/{id}`. */
+export type ConversationWithMessages = {
+  conversation: Conversation;
+  messages: ChatMessageWire[];
+};
+
+/** Strip the `conversation:` table prefix from a Conversation.id. The
+ *  backend's per-resource routes are keyed on the record key alone. */
+export function conversationKey(id: string): string {
+  const idx = id.indexOf(":");
+  return idx >= 0 ? id.slice(idx + 1) : id;
+}
+
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   session: () => request<Session>("/api/auth/me"),
@@ -106,6 +135,32 @@ export const api = {
     /** URL for the SSE `EventSource`. Plain string because EventSource
      *  manages its own fetch, separate from `request()`. */
     eventsUrl: "/api/discovery/feed/events",
+  },
+  chat: {
+    listConversations: () =>
+      request<Conversation[]>("/api/chat/conversations"),
+    createConversation: () =>
+      request<Conversation>("/api/chat/conversations", {
+        method: "POST",
+        body: "{}",
+      }),
+    getConversation: (key: string) =>
+      request<ConversationWithMessages>(
+        `/api/chat/conversations/${encodeURIComponent(key)}`,
+      ),
+    renameConversation: (key: string, title: string) =>
+      request<void>(`/api/chat/conversations/${encodeURIComponent(key)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ title }),
+      }),
+    deleteConversation: (key: string) =>
+      request<void>(`/api/chat/conversations/${encodeURIComponent(key)}`, {
+        method: "DELETE",
+      }),
+    /** URL the `useChat()` hook POSTs to. Plain string because the AI SDK
+     *  manages its own fetch. */
+    messagesUrl: (key: string) =>
+      `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
   },
 };
 

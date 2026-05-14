@@ -26,9 +26,15 @@
  */
 
 import { useChat } from "@ai-sdk/react";
+import { useQueryClient } from "@tanstack/react-query";
 import type { ChatStatus } from "ai";
 import { ArrowDownIcon, CheckIcon, CopyIcon } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+
+import {
+  conversationKeyFor,
+  conversationsKey,
+} from "@/hooks/useConversations";
 
 import {
   Message,
@@ -51,12 +57,25 @@ import { cn } from "@/lib/utils";
 
 import { MessageBody } from "./MessageBody";
 
+type InitialMessage = {
+  id: string;
+  role: string;
+  content: string;
+};
+
 export type ChatProps = {
   api: string;
   emptyTitle?: string;
   emptyDescription?: string;
   placeholder?: string;
   className?: string;
+  /** Pre-populate the chat with persisted messages. Shape matches the
+   *  AI SDK's `Message` (id + role + content). Optional. */
+  initialMessages?: InitialMessage[];
+  /** When set, `["conversations"]` and the per-conversation cache are
+   *  invalidated after each completed turn so the sidebar picks up
+   *  freshly-persisted messages and any auto-generated title. */
+  sessionKey?: string;
 };
 
 function stripThink(text: string): string {
@@ -125,8 +144,29 @@ export function Chat({
   emptyDescription = "Send a message to start the conversation.",
   placeholder = "Type a message…",
   className,
+  initialMessages,
+  sessionKey,
 }: ChatProps) {
-  const { messages, append, isLoading, error, stop } = useChat({ api });
+  const queryClient = useQueryClient();
+  const { messages, append, isLoading, error, stop } = useChat({
+    api,
+    initialMessages: initialMessages as never,
+  });
+
+  // After a turn completes (streaming → ready), invalidate the
+  // conversation caches so the sidebar reflects any auto-generated
+  // title and the per-conversation cache picks up the just-persisted
+  // assistant message.
+  const wasLoadingRef = useRef(false);
+  useEffect(() => {
+    if (wasLoadingRef.current && !isLoading && sessionKey) {
+      queryClient.invalidateQueries({ queryKey: conversationsKey });
+      queryClient.invalidateQueries({
+        queryKey: conversationKeyFor(sessionKey),
+      });
+    }
+    wasLoadingRef.current = isLoading;
+  }, [isLoading, sessionKey, queryClient]);
 
   const status: ChatStatus = error
     ? "error"

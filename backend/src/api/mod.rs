@@ -1,6 +1,7 @@
 //! HTTP server: routes, static-SPA fallback, axum boot.
 
 mod chat;
+mod conversations;
 mod discovery;
 mod documents;
 mod health;
@@ -201,7 +202,20 @@ pub fn build_router(
 ) -> Router {
     // Routes that require an authenticated identity.
     let api_protected = Router::new()
-        .route("/api/chat", post(chat::chat))
+        .route(
+            "/api/chat/conversations",
+            get(conversations::list).post(conversations::create),
+        )
+        .route(
+            "/api/chat/conversations/{key}",
+            get(conversations::get)
+                .patch(conversations::patch)
+                .delete(conversations::delete),
+        )
+        .route(
+            "/api/chat/conversations/{key}/messages",
+            post(chat::post_message),
+        )
         .route("/api/auth/me", get(auth::me))
         .route(
             "/api/ingestion/documents",

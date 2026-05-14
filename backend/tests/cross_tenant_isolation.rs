@@ -310,6 +310,126 @@ async fn alice_cannot_create_doc_in_bobs_tenant() {
 }
 
 #[tokio::test]
+async fn alice_cannot_see_or_mutate_bobs_conversation() {
+    // PERMISSIONS on `conversation` scope by `(tenant_id, user)`, so even
+    // within the same tenant, conversations are private to their owner.
+    // Cross-tenant the engine refuses every operation — list returns
+    // empty, direct id-based reads/updates/deletes are no-ops.
+    let w = build_world("xtenant_conv").await;
+
+    // Authenticate as bob and create a conversation in tenant_b.
+    let bob_token = mint_jwt("https://idp.test/", "bob", &w.ns);
+    w.system
+        .raw()
+        .authenticate(&bob_token)
+        .await
+        .expect("authenticate as bob");
+    let mut r = w
+        .system
+        .raw()
+        .query("CREATE conversation CONTENT { title: 'bob private' } RETURN id")
+        .await
+        .expect("bob create");
+    let row: Option<IdRow> = r.take(0).expect("decode");
+    let bob_conv = row.expect("bob conversation").id;
+
+    // And append a message to it.
+    w.system
+        .raw()
+        .query("CREATE message CONTENT { conversation: $c, role: 'user', content: 'secret' }")
+        .bind(("c", bob_conv.clone()))
+        .await
+        .expect("bob append")
+        .check()
+        .expect("bob append check");
+
+    // Switch to alice.
+    let alice_token = mint_jwt("https://idp.test/", "alice", &w.ns);
+    w.system
+        .raw()
+        .authenticate(&alice_token)
+        .await
+        .expect("authenticate as alice");
+
+    // SELECT * → empty.
+    let conversations: Vec<serde_json::Value> = w
+        .system
+        .raw()
+        .query("SELECT title FROM conversation")
+        .await
+        .expect("alice list")
+        .take(0)
+        .expect("decode");
+    assert!(
+        conversations.is_empty(),
+        "alice should not see bob's conversation; got {conversations:?}"
+    );
+
+    // Direct read by id → empty.
+    let result: Option<serde_json::Value> = w
+        .system
+        .raw()
+        .query("SELECT * FROM $rid")
+        .bind(("rid", bob_conv.clone()))
+        .await
+        .expect("alice direct read")
+        .take(0)
+        .expect("decode");
+    assert!(
+        result.is_none(),
+        "alice cannot read bob's conversation by id; got {result:?}"
+    );
+
+    // Attempt to rename → engine refuses; bob still sees old title.
+    let _ = w
+        .system
+        .raw()
+        .query("UPDATE $rid SET title = 'hijacked'")
+        .bind(("rid", bob_conv.clone()))
+        .await;
+
+    // Attempt to delete → also refused (or no-op due to PERMISSIONS).
+    let _ = w
+        .system
+        .raw()
+        .query("DELETE $rid")
+        .bind(("rid", bob_conv.clone()))
+        .await;
+
+    // Re-authenticate as bob and verify nothing changed.
+    w.system
+        .raw()
+        .authenticate(&bob_token)
+        .await
+        .expect("re-auth bob");
+    let convs: Vec<serde_json::Value> = w
+        .system
+        .raw()
+        .query("SELECT title FROM conversation")
+        .await
+        .expect("bob list after attack")
+        .take(0)
+        .expect("decode");
+    assert_eq!(convs.len(), 1, "bob still has his conversation");
+    assert_eq!(
+        convs[0]["title"], "bob private",
+        "bob's title is untouched"
+    );
+
+    let msgs: Vec<serde_json::Value> = w
+        .system
+        .raw()
+        .query("SELECT content FROM message WHERE conversation = $c")
+        .bind(("c", bob_conv.clone()))
+        .await
+        .expect("bob list msgs")
+        .take(0)
+        .expect("decode");
+    assert_eq!(msgs.len(), 1, "bob still has his message");
+    assert_eq!(msgs[0]["content"], "secret");
+}
+
+#[tokio::test]
 async fn alice_can_read_her_own_document() {
     let w = build_world("xtenant_happy").await;
     let token = mint_jwt("https://idp.test/", "alice", &w.ns);
