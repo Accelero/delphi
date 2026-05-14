@@ -123,7 +123,7 @@ services:
   # First boot downloads weights to the volume (slow); subsequent boots
   # are near-instant.
   tei-chunk:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: delphi-tei-chunk
     command: ["--model-id", "BAAI/bge-small-en-v1.5"]
     environment:
@@ -136,7 +136,7 @@ services:
 
   # TEI (document-class — SPECTER2). Same shape as tei-chunk.
   tei-paper:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: delphi-tei-paper
     command: ["--model-id", "allenai/specter2_base"]
     environment:

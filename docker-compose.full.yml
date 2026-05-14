@@ -188,7 +188,7 @@ services:
 
   # RAG v1: TEI sidecars. Same images / model IDs as tier 1.
   tei-chunk:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: delphi-full-tei-chunk
     command: ["--model-id", "BAAI/bge-small-en-v1.5"]
     environment:
@@ -197,7 +197,7 @@ services:
       - tei_chunk_data_full:/data
 
   tei-paper:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.5
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
     container_name: delphi-full-tei-paper
     command: ["--model-id", "allenai/specter2_base"]
     environment:
