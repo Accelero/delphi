@@ -32,7 +32,11 @@ test("deep link `/feed?doc=&chunk=` opens the PDF viewer at the target doc", asy
     await loginViaKeycloak(page, "alice");
   }
 
-  const seeded = await seedPdf(request, tier);
+  // Tier 2 gates `/api/*` on the BFF cookie which lives on the page's
+  // context, not the default `request` fixture. Tier 1's dev-auth
+  // injector ignores cookies, so either context works there.
+  const apiRequest = tier === "tier2" ? page.request : request;
+  const seeded = await seedPdf(apiRequest, tier);
   // The viewer reads its target doc id from `?doc=`. We synthesise the
   // chunk id too — the viewer's fetch will 404, but the page chrome
   // (back button + title) must still mount, which is the contract here.
@@ -41,7 +45,7 @@ test("deep link `/feed?doc=&chunk=` opens the PDF viewer at the target doc", asy
   const docKey = seeded.canonicalId.replace(/[^a-zA-Z0-9]/g, "");
   // Find the actual document id from the feed so the deep link
   // dereferences a real row.
-  const feed = await request.get("/api/discovery/feed?limit=50");
+  const feed = await apiRequest.get("/api/discovery/feed?limit=50");
   expect(feed.ok()).toBeTruthy();
   const json = (await feed.json()) as { items: Array<{ id: string; canonical_id: string }> };
   const doc = json.items.find((d) => d.canonical_id === seeded.canonicalId);
