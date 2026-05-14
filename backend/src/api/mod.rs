@@ -21,12 +21,12 @@ use crate::auth::{
 };
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::filter::{IngestFilter, NoopFilter};
-use crate::ingestion::{self, NotifyingSink, Pipeline, DEFAULT_BROADCAST_CAPACITY};
+use crate::ingestion::{self, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
 use crate::object_store::{self, ObjectStore};
 use crate::sources::{self, IngestApiClient};
 use crate::state::AppState;
-use crate::storage::{RequestDbPool, Storage};
+use crate::storage::RequestDbPool;
 
 pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let auth_cfg = AuthConfig::from_env().context("loading auth config")?;
@@ -92,25 +92,6 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     let (events_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
 
-    // Scheduler / in-process ingest writes through the privileged
-    // `SystemStorage` — it operates above-RBAC by design (cross-tenant
-    // by configuration, no user JWT in scope). HTTP ingestion that runs
-    // under a user's identity must construct its own per-request
-    // pipeline off the `AuthedDb` from the middleware.
-    let scheduler_storage: Arc<dyn Storage> = system.storage();
-    let scheduler_pipeline: Arc<dyn ingestion::IngestSink> =
-        Arc::new(Pipeline::new(scheduler_storage.clone()));
-    // NotifyingSink reads back the canonical Document on `Created` so
-    // its broadcast carries the same Document shape /api/discovery/feed
-    // returns. Hand it the same SystemStorage handle the inner pipeline
-    // uses — read path crosses no permission boundary (no user JWT in
-    // scope here).
-    let sink: Arc<dyn ingestion::IngestSink> = Arc::new(NotifyingSink::new(
-        scheduler_pipeline,
-        scheduler_storage.clone(),
-        events_tx.clone(),
-    ));
-
     let object_store: Arc<dyn ObjectStore> = object_store::from_url(
         &std::env::var("OBJECT_STORE_URL")
             .unwrap_or_else(|_| "file:///var/lib/delphi/originals".into()),
@@ -123,22 +104,19 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     let state = AppState {
         llm,
-        sink: sink.clone(),
         object_store: object_store.clone(),
         events: events_tx,
     };
 
-    // Source-adapter scheduler runs alongside the HTTP server. It used
-    // to share an in-process `IngestSink` with the HTTP handler;
-    // post-refactor it POSTs to `/api/ingestion/documents` over
-    // loopback under a service-identity JWT — same trust boundary,
-    // same JWT pipeline, one ingestion API. The handler still uses
-    // `state.sink`, so the storage code path is unchanged. Only the
-    // identity model moved.
+    // Source-adapter scheduler runs alongside the HTTP server. It POSTs
+    // to `/api/ingestion/documents` over loopback under a service-identity
+    // JWT — the same JWT-bound write path end-user ingestion uses, so the
+    // engine enforces tenant isolation on adapter writes too.
     //
-    // Cursor persistence is still scheduler-local (system path) and
-    // must agree with the service-identity tenant; both derive from
-    // `SOURCES_DEFAULT_TENANT_SLUG`.
+    // Cursor persistence is the only system-path piece left: the
+    // scheduler holds an `Arc<SystemDb>` and writes `source_state` rows
+    // tagged with the same tenant the service identity carries (both
+    // derive from `SOURCES_DEFAULT_TENANT_SLUG`).
     let sources_enabled = std::env::var("SOURCES_ENABLED").as_deref() == Ok("true");
     let scheduler = if sources_enabled {
         let registry = sources::default_registry(object_store.clone());
@@ -166,7 +144,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
             Some(sources::run_scheduler(
                 ingest,
                 filter,
-                scheduler_storage.clone(),
+                system.clone(),
                 scheduler_tenant_id,
                 registry,
             ))

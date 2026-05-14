@@ -89,7 +89,6 @@ pub async fn chat(
     }
     info!(
         user_id = %auth.user_id,
-        tenant_id = %auth.tenant_id,
         count = messages.len(),
         "chat request received"
     );

@@ -69,11 +69,11 @@ async fn scheduler_persists_via_http_and_advances_cursor() {
     registry.register(adapter.clone());
 
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
-    let storage: Arc<dyn Storage> = app.system.storage();
+    let storage = app.system.storage_for(app.default_tenant_id.clone());
     let handle = run_scheduler(
         ingest,
         filter,
-        storage.clone(),
+        app.system.clone(),
         app.default_tenant_id.clone(),
         registry,
     );
@@ -89,13 +89,14 @@ async fn scheduler_persists_via_http_and_advances_cursor() {
 
     for canonical_id in ["doc-A", "doc-B", "doc-C"] {
         let doc = storage
-            .get_document_by_canonical(&app.default_tenant_id, canonical_id)
+            .get_document_by_canonical(canonical_id)
             .await
             .unwrap();
         assert!(doc.is_some(), "{canonical_id} not persisted");
     }
 
-    let cursor = storage
+    let cursor = app
+        .system
         .get_source_cursor(&app.default_tenant_id, "fake")
         .await
         .unwrap();

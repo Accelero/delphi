@@ -73,8 +73,8 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     assert_eq!(http_outcome["version"], 1);
     let http_doc = app_http
         .system
-        .storage()
-        .get_document_by_canonical(&app_http.default_tenant_id, "sym-1")
+        .storage_for(app_http.default_tenant_id.clone())
+        .get_document_by_canonical("sym-1")
         .await
         .unwrap()
         .expect("HTTP path persisted doc");
@@ -100,11 +100,11 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     let mut registry = AdapterRegistry::new();
     registry.register(adapter.clone());
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
-    let storage: Arc<dyn Storage> = app_sched.system.storage();
+    let storage = app_sched.system.storage_for(app_sched.default_tenant_id.clone());
     let handle = run_scheduler(
         ingest,
         filter,
-        storage.clone(),
+        app_sched.system.clone(),
         app_sched.default_tenant_id.clone(),
         registry,
     );
@@ -113,7 +113,7 @@ async fn http_and_scheduler_produce_equal_outcomes() {
     server.abort();
 
     let sched_doc = storage
-        .get_document_by_canonical(&app_sched.default_tenant_id, "sym-1")
+        .get_document_by_canonical("sym-1")
         .await
         .unwrap()
         .expect("scheduler path persisted doc");

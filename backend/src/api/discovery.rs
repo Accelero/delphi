@@ -8,10 +8,13 @@
 //!   pushes a `new_document` record every time an ingest produces a
 //!   `Created` outcome (see `ingestion::NotifyingSink`).
 //!
-//! All handlers scope to `auth.tenant_id`. The SSE handler also filters
-//! the broadcast stream against the connecting user's tenant and
-//! force-closes after ~1h with jitter so reconnects pick up any
-//! tenant/role/revocation changes (browser EventSource auto-reconnects).
+//! Tenant scoping for `feed` is engine-side: the request's
+//! JWT-authenticated `AuthedDb` runs every query under a RECORD
+//! session whose PERMISSIONS clauses constrain it to its own tenant.
+//! The SSE handler filters the broadcast stream against the
+//! connecting user's tenant claim (read from `AuthContext` at
+//! connection setup) and force-closes after ~1h with jitter so
+//! reconnects pick up any tenant/role/revocation changes.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -82,7 +85,6 @@ struct CursorWire {
 
 pub async fn feed(
     Extension(db): Extension<Arc<AuthedDb>>,
-    auth: AuthContext,
     Query(q): Query<FeedQuery>,
 ) -> Response {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
@@ -98,7 +100,7 @@ pub async fn feed(
         None => None,
     };
 
-    let items = match db.list_feed(&auth.tenant_id, cursor, limit).await {
+    let items = match db.list_feed(cursor, limit).await {
         Ok(items) => items,
         Err(e) => {
             tracing::error!(error = %e, "feed query failed");
@@ -167,7 +169,7 @@ fn broadcast_to_sse(
                     biased;
                     _ = tokio::time::sleep_until(deadline) => return None,
                     recv = rx.recv() => match recv {
-                        Ok(event) if event.document.tenant_id == tenant => {
+                        Ok(event) if event.document.tenant_id.as_ref() == Some(&tenant) => {
                             // Send the Document itself — same wire shape as
                             // /api/discovery/feed items, so SPA receivers
                             // can prepend it directly into the cache without

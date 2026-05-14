@@ -12,27 +12,23 @@
 //!   clause can resolve it)
 //! - tenant bootstrap (`resolve_default_tenant`)
 //! - admin CLI (`delphi admin status / wipe`)
-//! - in-process scheduler ingest
+//! - source-adapter scheduler cursor persistence (cross-tenant by design)
 //!
-//! In Phase 1 the per-request `RequestDbPool` borrows the same
-//! connection; isolation is application-layer. In Phase 2 the pool gets
-//! its own connections authenticated per-request via IdP JWT, and
-//! `SystemDb` stays as the small contained escape hatch above.
-
-use std::sync::Arc;
+//! Application/request code goes through [`super::AuthedDb`] instead —
+//! that handle is JWT-authenticated and `PERMISSIONS` clauses fire on
+//! every query.
 
 use async_trait::async_trait;
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
-use surrealdb::{RecordId, Surreal};
+use surrealdb::{Datetime, RecordId, Surreal};
 
 use crate::error::{Error, Result};
 
-use super::surreal::SurrealStorage;
 use super::{
-    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
-    Storage,
+    Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters, Storage,
 };
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
@@ -76,9 +72,6 @@ pub enum JwtAccessKind {
 }
 
 fn escape_surrealql_string(s: &str) -> String {
-    // SurrealDB single-quoted string literal: escape backslash and
-    // single quotes. The key / URL / issuer / audience strings we
-    // accept are operator-controlled, but be defensive anyway.
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
@@ -87,7 +80,7 @@ fn escape_surrealql_string(s: &str) -> String {
 ///
 /// `shared_engine` is `true` when the underlying connection is an embedded
 /// engine (`memory:`, `rocksdb:`, ...) whose session state is shared with
-/// the [`RequestDbPool`]'s clones — i.e. test-mode. In that case the
+/// the [`super::RequestDbPool`]'s clones — i.e. test-mode. In that case the
 /// system path must reset the session back to privileged baseline before
 /// each upsert, because a prior `db.authenticate(jwt)` on a pool clone
 /// has transitioned the shared session into RECORD mode.
@@ -163,45 +156,13 @@ impl SystemDb {
         &self.db
     }
 
-    /// Privileged [`Storage`] view. PERMISSIONS clauses **do not fire**
-    /// on writes/reads through this handle — it runs as the service
-    /// user. Reserved for callers that legitimately need cross-tenant
-    /// or pre-auth-context access: the in-process scheduler, the ingest
-    /// pipeline-from-scheduler, and integration tests.
-    ///
-    /// Request handlers never reach this; they receive an
-    /// [`crate::storage::AuthedDb`] via middleware, which runs under a
-    /// RECORD session and therefore is subject to PERMISSIONS.
-    pub fn storage(&self) -> Arc<SystemStorage> {
-        Arc::new(SystemStorage {
-            inner: SurrealStorage::from_handle(self.db.clone()),
-        })
-    }
-
-    /// Apply the canonical schema. Idempotent — every statement uses
-    /// `IF NOT EXISTS` / `IF EXISTS`.
+    /// Apply the canonical schema. Idempotent.
     pub async fn init_schema(&self) -> Result<()> {
         self.db.query(SCHEMA_SURQL).await?.check()?;
         Ok(())
     }
 
-    /// Configure the `app_session` JWT access method at runtime. Required
-    /// for the engine-enforced tenant-isolation path — without this,
-    /// `db.authenticate(jwt)` has no access definition to validate
-    /// against.
-    ///
-    /// The AUTHENTICATE clause maps the IdP JWT's `(iss, sub)` claims to
-    /// the local `app_user` record id, so PERMISSIONS clauses can read
-    /// `$auth.tenant_id` etc. The backend's pre-flight `ensure_user`
-    /// (run on `SystemDb` *before* `db.authenticate` fires) guarantees
-    /// the row exists, otherwise authentication fails closed.
-    ///
-    /// Optional `expected_issuer` / `expected_audience` checks throw
-    /// from inside the clause — defence-in-depth even though the BFF
-    /// already validated.
-    ///
-    /// Re-applies cleanly via `OVERWRITE` so a key/JWKS rotation doesn't
-    /// require a schema migration.
+    /// Configure the `app_session` JWT access method at runtime.
     pub async fn define_jwt_access(&self, cfg: &JwtAccessConfig) -> Result<()> {
         let validator = match &cfg.kind {
             JwtAccessKind::Hs512 { secret } => format!(
@@ -224,7 +185,6 @@ impl SystemDb {
         }
         if let Some(aud) = &cfg.expected_audience {
             let aud_esc = escape_surrealql_string(aud);
-            // `aud` may be a string OR an array per RFC 7519; handle both.
             checks.push_str(&format!(
                 "IF (type::is::array($token.aud) AND !($token.aud CONTAINS '{aud}')) \
                  OR (type::is::string($token.aud) AND $token.aud != '{aud}') \
@@ -233,18 +193,6 @@ impl SystemDb {
             ));
         }
 
-        // The AUTHENTICATE clause is what gives us a meaningful `$auth`
-        // record (resolved from the IdP-claimed identity). Without it,
-        // SurrealDB falls back to `$auth = $token.ID` — and IdP tokens
-        // don't carry an `ID` claim, so engine-side PERMISSIONS that
-        // read `$auth.tenant_id` would all see NONE.
-        //
-        // The clause must return the **record id** (not the full
-        // record); SurrealDB then loads it into `$auth`. The post-load
-        // PERMISSIONS check on `app_user` is bypassed by the engine
-        // when populating `$auth` from AUTHENTICATE, so the
-        // `FOR select WHERE id = $auth.id` clause on app_user is not
-        // a chicken-and-egg problem here.
         let stmt = format!(
             "DEFINE ACCESS OVERWRITE app_session ON DATABASE TYPE RECORD \
              WITH JWT {validator} \
@@ -295,11 +243,102 @@ impl SystemDb {
         }
         Ok(())
     }
+
+    // ---- source-adapter cursors -------------------------------------------
+    //
+    // Cross-tenant, system-path operation: the scheduler runs above-RBAC
+    // and writes one cursor row per (tenant, adapter). Lives on
+    // SystemDb (not the Storage trait) because it explicitly bypasses
+    // the JWT-authenticated request path.
+
+    pub async fn get_source_cursor(
+        &self,
+        tenant: &RecordId,
+        adapter: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT cursor FROM source_state \
+                 WHERE tenant_id = $t AND adapter = $name LIMIT 1",
+            )
+            .bind(("t", tenant.clone()))
+            .bind(("name", adapter.to_string()))
+            .await?;
+        let row: Option<CursorRow> = response.take(0)?;
+        Ok(row.map(|r| r.cursor))
+    }
+
+    /// Tenant-bound [`Storage`] view for system-path callers (admin CLI,
+    /// integration tests) that need to read/write domain data without
+    /// going through a JWT-authenticated session. Implements the same
+    /// tenant-free [`Storage`] surface as [`super::AuthedDb`]; internally
+    /// scopes every query to `tenant` via explicit filters, since root
+    /// sessions have no `$auth` for PERMISSIONS / DEFAULT to consult.
+    ///
+    /// **PERMISSIONS clauses do not fire** on calls through this view —
+    /// it runs as the service user. Reserved for callers that
+    /// legitimately need above-RBAC access.
+    pub fn storage_for(&self, tenant: RecordId) -> SystemStorage {
+        SystemStorage {
+            db: self.db.clone(),
+            tenant,
+        }
+    }
+
+    pub async fn put_source_cursor(
+        &self,
+        tenant: &RecordId,
+        adapter: &str,
+        cursor: &serde_json::Value,
+    ) -> Result<()> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT id FROM source_state \
+                 WHERE tenant_id = $t AND adapter = $name LIMIT 1",
+            )
+            .bind(("t", tenant.clone()))
+            .bind(("name", adapter.to_string()))
+            .await?;
+        let existing: Option<IdRow> = response.take(0)?;
+
+        if let Some(IdRow { id }) = existing {
+            self.db
+                .query("UPDATE $rid MERGE { cursor: $cursor, updated_at: time::now() }")
+                .bind(("rid", id))
+                .bind(("cursor", cursor.clone()))
+                .await?
+                .check()?;
+        } else {
+            self.db
+                .query(
+                    "CREATE source_state CONTENT \
+                     { tenant_id: $t, adapter: $name, cursor: $cursor }",
+                )
+                .bind(("t", tenant.clone()))
+                .bind(("name", adapter.to_string()))
+                .bind(("cursor", cursor.clone()))
+                .await?
+                .check()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct CountRow {
     n: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IdRow {
+    id: RecordId,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorRow {
+    cursor: serde_json::Value,
 }
 
 async fn count_table(
@@ -324,7 +363,6 @@ async fn count_table(
 }
 
 /// `memory` / `rocksdb:` are local engines that don't gate on credentials.
-/// Anything else (ws/wss/http/https/tcp/…) does.
 pub(crate) fn engine_requires_auth(url: &str) -> bool {
     !(url == "memory"
         || url.starts_with("mem://")
@@ -341,101 +379,445 @@ fn env_required(key: &str) -> Result<String> {
     std::env::var(key).map_err(|_| Error::EnvMissing(key.into()))
 }
 
-/// Privileged [`Storage`] view obtained via [`SystemDb::storage`]. Wraps
-/// the service-user [`SurrealStorage`]; **PERMISSIONS clauses do not
-/// fire on calls through this handle**.
+// ============================================================================
+// SystemStorage — tenant-bound, root-authed Storage view.
+// ============================================================================
+
+/// Bound to a specific `tenant`. Implements the tenant-free [`Storage`]
+/// trait by injecting `tenant_id = $t` filters into every query (since
+/// root sessions have no `$auth` for engine-side PERMISSIONS / DEFAULT
+/// to use).
 ///
-/// Used by:
-/// - the in-process source-adapter scheduler (cross-tenant by design),
-/// - the ingest pipeline when driven by the scheduler,
-/// - integration tests that need above-RBAC seeding.
+/// Used by admin CLI and integration tests. Not reachable from request
+/// handlers.
 pub struct SystemStorage {
-    inner: SurrealStorage,
+    db: Surreal<Any>,
+    tenant: RecordId,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DocumentWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<RecordId>,
+    tenant_id: RecordId,
+    canonical_id: String,
+    source_type: String,
+    source_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(default)]
+    authors: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published_at: Option<Datetime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ingested_at: Option<Datetime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    content_hash: String,
+    #[serde(default = "default_version")]
+    version: i64,
+    #[serde(default)]
+    metadata: serde_json::Value,
+}
+
+fn default_version() -> i64 {
+    1
+}
+
+impl SystemStorage {
+    fn into_wire(&self, d: &Document) -> DocumentWire {
+        DocumentWire {
+            id: d.id.clone(),
+            tenant_id: self.tenant.clone(),
+            canonical_id: d.canonical_id.clone(),
+            source_type: d.source_type.clone(),
+            source_uri: d.source_uri.clone(),
+            storage_uri: d.storage_uri.clone(),
+            title: d.title.clone(),
+            authors: d.authors.clone(),
+            published_at: d.published_at.map(Datetime::from),
+            ingested_at: d.ingested_at.map(Datetime::from),
+            language: d.language.clone(),
+            summary: d.summary.clone(),
+            content_hash: d.content_hash.clone(),
+            version: d.version,
+            metadata: d.metadata.clone(),
+        }
+    }
+
+    fn from_wire(w: DocumentWire) -> Document {
+        Document {
+            id: w.id,
+            tenant_id: Some(w.tenant_id),
+            canonical_id: w.canonical_id,
+            source_type: w.source_type,
+            source_uri: w.source_uri,
+            storage_uri: w.storage_uri,
+            title: w.title,
+            authors: w.authors,
+            published_at: w.published_at.map(|d| -> DateTime<Utc> { d.into_inner().into() }),
+            ingested_at: w.ingested_at.map(|d| -> DateTime<Utc> { d.into_inner().into() }),
+            language: w.language,
+            summary: w.summary,
+            content_hash: w.content_hash,
+            version: w.version,
+            metadata: w.metadata,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ContentData {
+    tenant_id: RecordId,
+    doc: RecordId,
+    format: String,
+    text: String,
+    extractor: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChunkData {
+    tenant_id: RecordId,
+    doc: RecordId,
+    ordinal: i64,
+    char_start: i64,
+    char_end: i64,
+    page: Option<i64>,
+    bbox: Option<serde_json::Value>,
+    text: String,
+    embedding: Vec<f32>,
+    embedding_model: String,
+    chunk_strategy: String,
 }
 
 #[async_trait]
 impl Storage for SystemStorage {
-    async fn upsert_document(&self, tenant: &RecordId, doc: &Document) -> Result<DocId> {
-        self.inner.upsert_document(tenant, doc).await
+    async fn upsert_document(&self, doc: &Document) -> Result<DocId> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT id FROM document \
+                 WHERE tenant_id = $t AND canonical_id = $cid LIMIT 1",
+            )
+            .bind(("t", self.tenant.clone()))
+            .bind(("cid", doc.canonical_id.clone()))
+            .await?;
+        let existing: Option<IdRow> = response.take(0)?;
+
+        let wire = self.into_wire(doc);
+
+        if let Some(IdRow { id }) = existing {
+            self.db
+                .query("UPDATE $rid MERGE $data")
+                .bind(("rid", id.clone()))
+                .bind(("data", wire))
+                .await?
+                .check()?;
+            Ok(id)
+        } else {
+            let mut response = self
+                .db
+                .query("CREATE document CONTENT $data RETURN id")
+                .bind(("data", wire))
+                .await?;
+            let row: Option<IdRow> = response.take(0)?;
+            row.map(|r| r.id).ok_or(Error::EmptyResult)
+        }
     }
-    async fn get_document(&self, tenant: &RecordId, id: &DocId) -> Result<Option<Document>> {
-        self.inner.get_document(tenant, id).await
+
+    async fn get_document(&self, id: &DocId) -> Result<Option<Document>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM $rid WHERE tenant_id = $t LIMIT 1")
+            .bind(("rid", id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?;
+        let row: Option<DocumentWire> = response.take(0)?;
+        Ok(row.map(Self::from_wire))
     }
+
     async fn get_document_by_canonical(
         &self,
-        tenant: &RecordId,
         canonical_id: &str,
     ) -> Result<Option<Document>> {
-        self.inner.get_document_by_canonical(tenant, canonical_id).await
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM document \
+                 WHERE tenant_id = $t AND canonical_id = $cid LIMIT 1",
+            )
+            .bind(("t", self.tenant.clone()))
+            .bind(("cid", canonical_id.to_string()))
+            .await?;
+        let row: Option<DocumentWire> = response.take(0)?;
+        Ok(row.map(Self::from_wire))
     }
-    async fn delete_document(&self, tenant: &RecordId, id: &DocId) -> Result<()> {
-        self.inner.delete_document(tenant, id).await
+
+    async fn delete_document(&self, id: &DocId) -> Result<()> {
+        for table in ["document_content", "chunk", "document_version"] {
+            self.db
+                .query(format!("DELETE {table} WHERE doc = $rid AND tenant_id = $t"))
+                .bind(("rid", id.clone()))
+                .bind(("t", self.tenant.clone()))
+                .await?
+                .check()?;
+        }
+        self.db
+            .query("DELETE $rid WHERE tenant_id = $t")
+            .bind(("rid", id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?
+            .check()?;
+        Ok(())
     }
-    async fn upsert_content(
-        &self,
-        tenant: &RecordId,
-        doc_id: &DocId,
-        content: &Content,
-    ) -> Result<()> {
-        self.inner.upsert_content(tenant, doc_id, content).await
+
+    async fn upsert_content(&self, doc_id: &DocId, content: &Content) -> Result<()> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT id FROM document_content \
+                 WHERE doc = $rid AND tenant_id = $t LIMIT 1",
+            )
+            .bind(("rid", doc_id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?;
+        let existing: Option<IdRow> = response.take(0)?;
+
+        let data = ContentData {
+            tenant_id: self.tenant.clone(),
+            doc: doc_id.clone(),
+            format: content.format.clone(),
+            text: content.text.clone(),
+            extractor: content.extractor.clone(),
+        };
+
+        if let Some(IdRow { id }) = existing {
+            self.db
+                .query("UPDATE $rid MERGE $data")
+                .bind(("rid", id))
+                .bind(("data", data))
+                .await?
+                .check()?;
+        } else {
+            self.db
+                .query("CREATE document_content CONTENT $data")
+                .bind(("data", data))
+                .await?
+                .check()?;
+        }
+        Ok(())
     }
-    async fn get_content(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Option<Content>> {
-        self.inner.get_content(tenant, doc_id).await
+
+    async fn get_content(&self, doc_id: &DocId) -> Result<Option<Content>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT format, text, extractor FROM document_content \
+                 WHERE doc = $rid AND tenant_id = $t LIMIT 1",
+            )
+            .bind(("rid", doc_id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?;
+        Ok(response.take(0)?)
     }
+
     async fn upsert_chunks(
         &self,
-        tenant: &RecordId,
         doc_id: &DocId,
         chunks: &[Chunk],
     ) -> Result<Vec<ChunkId>> {
-        self.inner.upsert_chunks(tenant, doc_id, chunks).await
+        let mut ids = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let data = ChunkData {
+                tenant_id: self.tenant.clone(),
+                doc: doc_id.clone(),
+                ordinal: c.ordinal,
+                char_start: c.char_start,
+                char_end: c.char_end,
+                page: c.page,
+                bbox: c.bbox.clone(),
+                text: c.text.clone(),
+                embedding: c.embedding.clone(),
+                embedding_model: c.embedding_model.clone(),
+                chunk_strategy: c.chunk_strategy.clone(),
+            };
+
+            let mut response = self
+                .db
+                .query(
+                    "SELECT id FROM chunk \
+                     WHERE doc = $rid AND tenant_id = $t \
+                       AND ordinal = $ord \
+                       AND embedding_model = $model \
+                       AND chunk_strategy = $strategy LIMIT 1",
+                )
+                .bind(("rid", doc_id.clone()))
+                .bind(("t", self.tenant.clone()))
+                .bind(("ord", c.ordinal))
+                .bind(("model", c.embedding_model.clone()))
+                .bind(("strategy", c.chunk_strategy.clone()))
+                .await?;
+            let existing: Option<IdRow> = response.take(0)?;
+
+            if let Some(IdRow { id }) = existing {
+                self.db
+                    .query("UPDATE $rid MERGE $data")
+                    .bind(("rid", id.clone()))
+                    .bind(("data", data))
+                    .await?
+                    .check()?;
+                ids.push(id);
+            } else {
+                let mut response = self
+                    .db
+                    .query("CREATE chunk CONTENT $data RETURN id")
+                    .bind(("data", data))
+                    .await?;
+                let row: Option<IdRow> = response.take(0)?;
+                ids.push(row.map(|r| r.id).ok_or(Error::EmptyResult)?);
+            }
+        }
+        Ok(ids)
     }
-    async fn list_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Vec<Chunk>> {
-        self.inner.list_chunks(tenant, doc_id).await
+
+    async fn list_chunks(&self, doc_id: &DocId) -> Result<Vec<Chunk>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM chunk \
+                 WHERE doc = $rid AND tenant_id = $t \
+                 ORDER BY ordinal ASC",
+            )
+            .bind(("rid", doc_id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?;
+        Ok(response.take(0)?)
     }
-    async fn delete_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<()> {
-        self.inner.delete_chunks(tenant, doc_id).await
+
+    async fn delete_chunks(&self, doc_id: &DocId) -> Result<()> {
+        self.db
+            .query("DELETE chunk WHERE doc = $rid AND tenant_id = $t")
+            .bind(("rid", doc_id.clone()))
+            .bind(("t", self.tenant.clone()))
+            .await?
+            .check()?;
+        Ok(())
     }
+
     async fn search_vector(
         &self,
-        tenant: &RecordId,
         query: &[f32],
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        self.inner.search_vector(tenant, query, top_k, filters).await
+        let mut clause = String::from("WHERE tenant_id = $t AND embedding <|$k|> $q");
+        if filters.embedding_model.is_some() {
+            clause.push_str(" AND embedding_model = $f_model");
+        }
+        if filters.chunk_strategy.is_some() {
+            clause.push_str(" AND chunk_strategy = $f_strategy");
+        }
+        if filters.source_type.is_some() {
+            clause.push_str(" AND doc.source_type = $f_source_type");
+        }
+        let sql = format!(
+            "SELECT id AS chunk_id, doc AS doc_id, ordinal, char_start, char_end, \
+             page, text, vector::distance::knn() AS score \
+             FROM chunk {clause} ORDER BY score ASC LIMIT $k"
+        );
+        let mut q = self
+            .db
+            .query(sql)
+            .bind(("t", self.tenant.clone()))
+            .bind(("k", top_k as i64))
+            .bind(("q", query.to_vec()));
+        if let Some(v) = &filters.embedding_model {
+            q = q.bind(("f_model", v.clone()));
+        }
+        if let Some(v) = &filters.chunk_strategy {
+            q = q.bind(("f_strategy", v.clone()));
+        }
+        if let Some(v) = &filters.source_type {
+            q = q.bind(("f_source_type", v.clone()));
+        }
+        let mut response = q.await?;
+        Ok(response.take(0)?)
     }
+
     async fn search_keyword(
         &self,
-        tenant: &RecordId,
         query: &str,
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        self.inner.search_keyword(tenant, query, top_k, filters).await
+        let mut clause = String::from("WHERE tenant_id = $t AND text @0@ $q");
+        if filters.embedding_model.is_some() {
+            clause.push_str(" AND embedding_model = $f_model");
+        }
+        if filters.chunk_strategy.is_some() {
+            clause.push_str(" AND chunk_strategy = $f_strategy");
+        }
+        if filters.source_type.is_some() {
+            clause.push_str(" AND doc.source_type = $f_source_type");
+        }
+        let sql = format!(
+            "SELECT id AS chunk_id, doc AS doc_id, ordinal, char_start, char_end, \
+             page, text, search::score(0) AS score \
+             FROM chunk {clause} ORDER BY score DESC LIMIT $k"
+        );
+        let mut q = self
+            .db
+            .query(sql)
+            .bind(("t", self.tenant.clone()))
+            .bind(("k", top_k as i64))
+            .bind(("q", query.to_string()));
+        if let Some(v) = &filters.embedding_model {
+            q = q.bind(("f_model", v.clone()));
+        }
+        if let Some(v) = &filters.chunk_strategy {
+            q = q.bind(("f_strategy", v.clone()));
+        }
+        if let Some(v) = &filters.source_type {
+            q = q.bind(("f_source_type", v.clone()));
+        }
+        let mut response = q.await?;
+        Ok(response.take(0)?)
     }
-    async fn get_source_cursor(
-        &self,
-        tenant: &RecordId,
-        adapter: &str,
-    ) -> Result<Option<serde_json::Value>> {
-        self.inner.get_source_cursor(tenant, adapter).await
-    }
-    async fn put_source_cursor(
-        &self,
-        tenant: &RecordId,
-        adapter: &str,
-        cursor: &serde_json::Value,
-    ) -> Result<()> {
-        self.inner.put_source_cursor(tenant, adapter, cursor).await
-    }
+
     async fn list_feed(
         &self,
-        tenant: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
     ) -> Result<Vec<Document>> {
-        self.inner.list_feed(tenant, cursor, limit).await
+        let where_cursor = if cursor.is_some() {
+            "AND (ingested_at < $cursor_ts \
+                  OR (ingested_at = $cursor_ts AND id < $cursor_id))"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT * FROM document \
+             WHERE tenant_id = $t {where_cursor} \
+             ORDER BY ingested_at DESC, id DESC \
+             LIMIT $limit"
+        );
+        let mut q = self
+            .db
+            .query(sql)
+            .bind(("t", self.tenant.clone()))
+            .bind(("limit", limit as i64));
+        if let Some(c) = cursor {
+            q = q
+                .bind(("cursor_ts", Datetime::from(c.ingested_at)))
+                .bind(("cursor_id", c.id));
+        }
+        let mut response = q.await?;
+        let wires: Vec<DocumentWire> = response.take(0)?;
+        Ok(wires.into_iter().map(Self::from_wire).collect())
     }
 }
 

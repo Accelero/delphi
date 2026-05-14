@@ -65,7 +65,7 @@ async fn noop_filter_lets_everything_through() {
     let app = TestApp::build().await;
     let (ingest, server) = make_ingest(&app).await;
     let filter: Arc<dyn IngestFilter> = Arc::new(NoopFilter::new());
-    let storage: Arc<dyn Storage> = app.system.storage();
+    let storage = app.system.storage_for(app.default_tenant_id.clone());
 
     let adapter = Arc::new(
         FakeAdapter::new(
@@ -81,7 +81,7 @@ async fn noop_filter_lets_everything_through() {
     let handle = run_scheduler(
         ingest,
         filter,
-        storage.clone(),
+        app.system.clone(),
         app.default_tenant_id.clone(),
         registry,
     );
@@ -91,7 +91,7 @@ async fn noop_filter_lets_everything_through() {
 
     for canonical_id in ["a", "b", "c"] {
         let doc = storage
-            .get_document_by_canonical(&app.default_tenant_id, canonical_id)
+            .get_document_by_canonical(canonical_id)
             .await
             .unwrap();
         assert!(doc.is_some(), "{canonical_id} should have reached the API");
@@ -103,7 +103,7 @@ async fn reject_all_filter_blocks_every_item() {
     let app = TestApp::build().await;
     let (ingest, server) = make_ingest(&app).await;
     let filter: Arc<dyn IngestFilter> = Arc::new(RejectAllFilter);
-    let storage: Arc<dyn Storage> = app.system.storage();
+    let storage = app.system.storage_for(app.default_tenant_id.clone());
 
     let adapter = Arc::new(FakeAdapter::new(
         "reject-test",
@@ -116,7 +116,7 @@ async fn reject_all_filter_blocks_every_item() {
     let handle = run_scheduler(
         ingest,
         filter,
-        storage.clone(),
+        app.system.clone(),
         app.default_tenant_id.clone(),
         registry,
     );
@@ -126,7 +126,7 @@ async fn reject_all_filter_blocks_every_item() {
 
     for canonical_id in ["a", "b"] {
         let doc = storage
-            .get_document_by_canonical(&app.default_tenant_id, canonical_id)
+            .get_document_by_canonical(canonical_id)
             .await
             .unwrap();
         assert!(

@@ -65,11 +65,12 @@ pub struct Document {
     )]
     pub id: Option<RecordId>,
 
-    /// Multi-tenancy: every domain row carries the tenant it belongs to.
-    /// Populated by the ingestion pipeline from `AuthContext.tenant_id`
-    /// (HTTP path) or from `SOURCES_DEFAULT_TENANT_SLUG` (scheduler).
-    /// `Storage::upsert_document` writes it; reads filter by it.
-    pub tenant_id: RecordId,
+    /// Multi-tenancy: filled engine-side from `$auth.tenant_id` via the
+    /// schema's `DEFAULT` clause on write, populated on read. Application
+    /// code does not set this — engine-side PERMISSIONS enforce tenant
+    /// scoping based on the request's JWT-authenticated session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<RecordId>,
 
     pub canonical_id: String,
     pub source_type: String,

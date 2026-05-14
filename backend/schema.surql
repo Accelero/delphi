@@ -11,16 +11,22 @@
 -- Multi-tenancy
 --
 -- Every domain row carries a `tenant_id: record<tenant>` field with
--- ASSERT $value != NONE. Layered enforcement:
+-- DEFAULT $auth.tenant_id and ASSERT $value != NONE. Enforcement is
+-- engine-side only — application code does NOT thread tenant ids
+-- through storage calls:
 --
--- 1. Application layer (Phase 1): every `Storage` method takes
---    `tenant: &RecordId` and writes / filters by it.
--- 2. Engine layer (Phase 2): `PERMISSIONS` clauses on each domain
---    table reference `$auth.tenant_id` — the tenant the authenticated
---    user belongs to, materialized onto `app_user` by `ensure_user`.
---    A request that authenticates as a record user via
---    `DEFINE ACCESS … TYPE RECORD WITH JWT` cannot read or write
---    cross-tenant — engine refuses.
+-- 1. On CREATE under a RECORD session (request path via JWT-bound
+--    AuthedDb), the DEFAULT clause fills tenant_id from $auth, so the
+--    application doesn't need to set it. The ASSERT then guarantees a
+--    tenant is present.
+-- 2. PERMISSIONS clauses on every domain table compare
+--    `tenant_id = $auth.tenant_id` — a request that authenticates as a
+--    record user via `DEFINE ACCESS … TYPE RECORD WITH JWT` cannot
+--    read or write cross-tenant; engine refuses.
+-- 3. Root / system sessions (boot, scheduler, admin) DO NOT bypass
+--    DEFAULT — `$auth` is NONE under root, so $auth.tenant_id is NONE
+--    and the ASSERT fails unless the caller explicitly sets tenant_id.
+--    This is intentional: the cross-tenant write path must be explicit.
 --
 -- Why `$auth.tenant_id` not `$token.tenant_id`: the JWT's `tenant_id`
 -- claim is a slug emitted by the IdP (e.g. `tenant-a`). Comparing it
@@ -116,7 +122,8 @@ DEFINE TABLE IF NOT EXISTS document SCHEMAFULL
         FOR select, update, delete WHERE tenant_id = $auth.tenant_id
         FOR create WHERE tenant_id = $auth.tenant_id;
 
-DEFINE FIELD IF NOT EXISTS tenant_id    ON document TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id    ON document TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS canonical_id ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS source_type  ON document TYPE string;
@@ -155,7 +162,8 @@ DEFINE TABLE IF NOT EXISTS document_content SCHEMAFULL
         FOR select, update, delete WHERE tenant_id = $auth.tenant_id
         FOR create WHERE tenant_id = $auth.tenant_id;
 
-DEFINE FIELD IF NOT EXISTS tenant_id    ON document_content TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id    ON document_content TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS doc          ON document_content TYPE record<document>;
 DEFINE FIELD IF NOT EXISTS format       ON document_content TYPE string;
@@ -176,7 +184,8 @@ DEFINE TABLE IF NOT EXISTS chunk SCHEMAFULL
         FOR select, update, delete WHERE tenant_id = $auth.tenant_id
         FOR create WHERE tenant_id = $auth.tenant_id;
 
-DEFINE FIELD IF NOT EXISTS tenant_id       ON chunk TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id       ON chunk TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS doc             ON chunk TYPE record<document>;
 DEFINE FIELD IF NOT EXISTS ordinal         ON chunk TYPE int;
@@ -204,7 +213,8 @@ DEFINE TABLE IF NOT EXISTS document_version SCHEMAFULL
         FOR select, update, delete WHERE tenant_id = $auth.tenant_id
         FOR create WHERE tenant_id = $auth.tenant_id;
 
-DEFINE FIELD IF NOT EXISTS tenant_id      ON document_version TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id      ON document_version TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS doc            ON document_version TYPE record<document>;
 DEFINE FIELD IF NOT EXISTS version        ON document_version TYPE int;
@@ -226,7 +236,8 @@ DEFINE TABLE IF NOT EXISTS source_state SCHEMAFULL
         FOR select, update, delete WHERE tenant_id = $auth.tenant_id
         FOR create WHERE tenant_id = $auth.tenant_id;
 
-DEFINE FIELD IF NOT EXISTS tenant_id  ON source_state TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id  ON source_state TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS adapter    ON source_state TYPE string;
 DEFINE FIELD IF NOT EXISTS cursor     ON source_state FLEXIBLE TYPE object DEFAULT {};
@@ -253,9 +264,12 @@ DEFINE TABLE IF NOT EXISTS conversation SCHEMAFULL
         FOR select, update, delete WHERE tenant_id = $auth.tenant_id AND user = $auth.id
         FOR create WHERE tenant_id = $auth.tenant_id AND user = $auth.id;
 REMOVE FIELD IF EXISTS tenant ON conversation;
-DEFINE FIELD IF NOT EXISTS tenant_id  ON conversation TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id  ON conversation TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
-DEFINE FIELD IF NOT EXISTS user       ON conversation TYPE record<app_user>;
+DEFINE FIELD OVERWRITE user       ON conversation TYPE record<app_user>
+    DEFAULT $auth.id
+    ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS title      ON conversation TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON conversation TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS updated_at ON conversation TYPE datetime DEFAULT time::now();
@@ -270,7 +284,8 @@ DEFINE TABLE IF NOT EXISTS message SCHEMAFULL
         FOR create WHERE tenant_id = $auth.tenant_id;
 REMOVE FIELD IF EXISTS tenant ON message;
 DEFINE FIELD IF NOT EXISTS conversation   ON message TYPE record<conversation>;
-DEFINE FIELD IF NOT EXISTS tenant_id      ON message TYPE record<tenant>
+DEFINE FIELD OVERWRITE tenant_id      ON message TYPE record<tenant>
+    DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS role           ON message TYPE string
     ASSERT $value INSIDE ['system','user','assistant','tool'];

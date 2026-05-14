@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use surrealdb::RecordId;
 
 use crate::error::{Error, Result};
 use crate::storage::{Content, DocId, Document, Storage};
@@ -19,15 +18,11 @@ use crate::storage::{Content, DocId, Document, Storage};
 /// callers POST it as JSON to `/api/ingestion/documents`. Same shape,
 /// same downstream handling.
 ///
-/// `tenant_id` is stamped by the caller — handlers from
-/// `AuthContext.tenant_id`, scheduler from
-/// `SOURCES_DEFAULT_TENANT_SLUG`. The pipeline writes it onto every
-/// `Document` row and forwards it to `NotifyingSink` so SSE consumers
-/// can filter their stream.
+/// `tenant_id` is **not** carried on this struct — the request's
+/// JWT-authenticated session determines the tenant, and the engine
+/// fills `tenant_id` from `$auth.tenant_id` on insert.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequest {
-    pub tenant_id: RecordId,
-
     pub canonical_id: String,
     pub source_type: String,
     pub source_uri: String,
@@ -84,8 +79,9 @@ pub trait IngestSink: Send + Sync {
 
 /// Reference [`IngestSink`] implementation. Owns dedup + version logic.
 ///
-/// `Clone` because `AppState` is cloned per request; the inner storage
-/// handle is itself an `Arc`, so this is cheap.
+/// Built **per request** off the request's authenticated storage handle
+/// — the engine enforces tenant isolation via PERMISSIONS on every
+/// query the pipeline issues.
 #[derive(Clone)]
 pub struct Pipeline {
     storage: Arc<dyn Storage>,
@@ -104,14 +100,14 @@ impl IngestSink for Pipeline {
 
         let existing = self
             .storage
-            .get_document_by_canonical(&req.tenant_id, &req.canonical_id)
+            .get_document_by_canonical(&req.canonical_id)
             .await?;
 
         match existing {
             None => {
                 let doc = build_document(&req, content_hash, 1);
-                let id = self.storage.upsert_document(&req.tenant_id, &doc).await?;
-                self.persist_text_if_present(&req.tenant_id, &id, &req).await?;
+                let id = self.storage.upsert_document(&doc).await?;
+                self.persist_text_if_present(&id, &req).await?;
                 Ok(IngestOutcome::Created { id, version: 1 })
             }
             Some(existing) if existing.content_hash == content_hash => {
@@ -124,8 +120,8 @@ impl IngestSink for Pipeline {
             Some(existing) => {
                 let new_version = existing.version + 1;
                 let doc = build_document(&req, content_hash, new_version);
-                let id = self.storage.upsert_document(&req.tenant_id, &doc).await?;
-                self.persist_text_if_present(&req.tenant_id, &id, &req).await?;
+                let id = self.storage.upsert_document(&doc).await?;
+                self.persist_text_if_present(&id, &req).await?;
                 Ok(IngestOutcome::Versioned {
                     id,
                     version: new_version,
@@ -138,14 +134,12 @@ impl IngestSink for Pipeline {
 impl Pipeline {
     async fn persist_text_if_present(
         &self,
-        tenant: &RecordId,
         id: &DocId,
         req: &IngestRequest,
     ) -> Result<()> {
         if let Some(text) = &req.raw_text {
             self.storage
                 .upsert_content(
-                    tenant,
                     id,
                     &Content {
                         text: text.clone(),
@@ -162,7 +156,7 @@ impl Pipeline {
 fn build_document(req: &IngestRequest, content_hash: String, version: i64) -> Document {
     Document {
         id: None,
-        tenant_id: req.tenant_id.clone(),
+        tenant_id: None,
         canonical_id: req.canonical_id.clone(),
         source_type: req.source_type.clone(),
         source_uri: req.source_uri.clone(),
@@ -200,10 +194,6 @@ fn compute_content_hash(req: &IngestRequest) -> String {
     } else if let Some(summary) = &req.summary {
         hasher.update(summary.as_bytes());
     } else {
-        // No body, no summary: hash a stable projection of identity so
-        // re-fetches of the same metadata-only record dedup. NUL
-        // separators avoid the "title=AB,uri=C" / "title=A,uri=BC"
-        // collision.
         hasher.update(req.canonical_id.as_bytes());
         hasher.update(b"\0");
         if let Some(t) = &req.title {
@@ -213,94 +203,4 @@ fn compute_content_hash(req: &IngestRequest) -> String {
         hasher.update(req.source_uri.as_bytes());
     }
     hex::encode(hasher.finalize())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage::SystemDb;
-
-    async fn fresh_pipeline() -> (Pipeline, RecordId) {
-        let system = SystemDb::in_memory("ingestion_test", "main")
-            .await
-            .expect("connect in-mem");
-        system.init_schema().await.expect("init schema");
-        // Seed a tenant for the test.
-        let mut r = system
-            .raw()
-            .query("CREATE tenant CONTENT { slug: 'test', name: 'Test' } RETURN id")
-            .await
-            .unwrap();
-        #[derive(serde::Deserialize)]
-        struct IdRow {
-            id: RecordId,
-        }
-        let row: Option<IdRow> = r.take(0).unwrap();
-        let tenant = row.unwrap().id;
-
-        // Pipeline doesn't care about RBAC; SystemStorage is the privileged
-        // path the scheduler uses in production, and that's what we test.
-        let storage: Arc<dyn Storage> = system.storage();
-        (Pipeline::new(storage), tenant)
-    }
-
-    fn req(tenant: &RecordId, canonical_id: &str, raw_text: Option<&str>) -> IngestRequest {
-        IngestRequest {
-            tenant_id: tenant.clone(),
-            canonical_id: canonical_id.into(),
-            source_type: "test".into(),
-            source_uri: format!("https://test.example/{canonical_id}"),
-            title: Some("Test Title".into()),
-            authors: vec!["A. Author".into()],
-            published_at: None,
-            language: Some("en".into()),
-            summary: None,
-            raw_text: raw_text.map(Into::into),
-            storage_uri: None,
-            metadata: serde_json::Value::Null,
-        }
-    }
-
-    #[tokio::test]
-    async fn first_ingest_creates() {
-        let (p, t) = fresh_pipeline().await;
-        let out = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
-        assert!(
-            matches!(out, IngestOutcome::Created { version: 1, .. }),
-            "expected Created, got {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn re_ingesting_identical_request_returns_unchanged() {
-        let (p, t) = fresh_pipeline().await;
-        let _ = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
-        let out = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
-        assert!(
-            matches!(out, IngestOutcome::Unchanged { version: 1, .. }),
-            "expected Unchanged, got {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn changed_text_bumps_version() {
-        let (p, t) = fresh_pipeline().await;
-        let _ = p.ingest(req(&t, "doc-1", Some("hello"))).await.unwrap();
-        let out = p.ingest(req(&t, "doc-1", Some("hello, again"))).await.unwrap();
-        assert!(
-            matches!(out, IngestOutcome::Versioned { version: 2, .. }),
-            "expected Versioned with v=2, got {out:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn metadata_only_dedup_works_when_no_text() {
-        let (p, t) = fresh_pipeline().await;
-        let _ = p.ingest(req(&t, "doc-1", None)).await.unwrap();
-        let out = p.ingest(req(&t, "doc-1", None)).await.unwrap();
-        assert!(
-            matches!(out, IngestOutcome::Unchanged { .. }),
-            "expected Unchanged, got {out:?}"
-        );
-    }
 }

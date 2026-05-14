@@ -1,23 +1,26 @@
 //! Storage layer.
 //!
-//! Two distinct entry points, on purpose:
+//! Two distinct entry points:
 //!
 //! - [`SystemDb`] — privileged singleton signed in as the service user.
 //!   Used only by the composition root (`api::serve`), bootstrap (tenant
-//!   + user upserts), the scheduler, and the admin CLI. Holds the
-//!   "above-RBAC" credential. Not in [`crate::state::AppState`] — request
-//!   handlers physically cannot reach it.
+//!   + user upserts), the scheduler (cursor persistence), and the admin
+//!   CLI. Holds the "above-RBAC" credential. Not in
+//!   [`crate::state::AppState`] — request handlers physically cannot
+//!   reach it.
 //!
-//! - [`RequestDbPool`] — what request handlers receive (via
-//!   [`crate::state::AppState`]). Phase 1: a thin wrapper around the
-//!   shared client that implements the [`Storage`] trait; tenant
-//!   isolation is application-layer (every method takes `tenant: &RecordId`
-//!   and the impl writes / filters by it). Phase 2: a pool of N
-//!   connections, each authenticated per-request via the IdP-issued JWT
-//!   so SurrealDB record-level rules enforce isolation engine-side.
+//! - [`RequestDbPool`] → [`AuthedDb`] — what request handlers receive
+//!   (via `Extension`). Each handler gets a SurrealDB session
+//!   authenticated by the request's JWT (RECORD session under the
+//!   `app_session` access method). Engine-side `PERMISSIONS` clauses
+//!   fire on every query, so a handler that builds the wrong query
+//!   cannot leak across tenants — SurrealDB refuses.
 //!
-//! Application code depends only on the [`Storage`] trait — never on a
-//! concrete backend.
+//! The [`Storage`] trait the request path consumes carries **no notion
+//! of tenancy**: methods take no `tenant: &RecordId` parameter, and
+//! queries inside the impl rely on `$auth` + PERMISSIONS for scoping.
+//! Tenant-explicit operations (scheduler cursor persistence, admin
+//! cross-tenant wipe) live on typed methods on [`SystemDb`].
 
 mod models;
 mod request;
@@ -28,107 +31,78 @@ pub use models::{
     Chunk, ChunkId, ChunkSearchResult, Content, DocId, Document, FeedCursor, Filters,
 };
 pub use request::{AuthedDb, RequestDbPool};
+pub use surreal::SurrealStorage;
 pub use system::{Counts, JwtAccessConfig, JwtAccessKind, SystemDb, SystemStorage};
 
 use async_trait::async_trait;
-use surrealdb::RecordId;
 
 use crate::error::Result;
 
-/// Per-request storage operations. Every method takes `tenant: &RecordId`
-/// to make tenant scoping a structural property of the API surface
-/// (Phase 1: enforced in-handler; Phase 2: backed by engine-level
-/// PERMISSIONS clauses).
+/// Per-request storage operations. **No tenant parameter on any
+/// method** — tenant scoping comes from the JWT-authenticated session
+/// the request is running under, via engine-side `PERMISSIONS` and
+/// the schema's `DEFAULT $auth.tenant_id` clauses on write.
 ///
-/// Schema apply, cross-tenant counts, and wipe live on [`SystemDb`] —
-/// not in this trait — because they run with elevated privilege and
-/// shouldn't be reachable from request handlers.
+/// Schema apply, cross-tenant counts/wipe, source-adapter cursor
+/// persistence, and any other system-path operation live on
+/// [`SystemDb`] — they run with elevated privilege and shouldn't be
+/// reachable from request handlers.
 #[async_trait]
 pub trait Storage: Send + Sync {
     // ---- documents ---------------------------------------------------------
 
-    /// Insert or update a document by `(tenant_id, canonical_id)`.
-    async fn upsert_document(&self, tenant: &RecordId, doc: &Document) -> Result<DocId>;
+    /// Insert or update a document by `canonical_id`. The engine fills
+    /// `tenant_id` from `$auth.tenant_id` via the schema's DEFAULT clause.
+    async fn upsert_document(&self, doc: &Document) -> Result<DocId>;
 
-    async fn get_document(&self, tenant: &RecordId, id: &DocId) -> Result<Option<Document>>;
+    async fn get_document(&self, id: &DocId) -> Result<Option<Document>>;
 
-    async fn get_document_by_canonical(
-        &self,
-        tenant: &RecordId,
-        canonical_id: &str,
-    ) -> Result<Option<Document>>;
+    async fn get_document_by_canonical(&self, canonical_id: &str)
+        -> Result<Option<Document>>;
 
     /// Cascade-deletes content, chunks, and version history.
-    async fn delete_document(&self, tenant: &RecordId, id: &DocId) -> Result<()>;
+    async fn delete_document(&self, id: &DocId) -> Result<()>;
 
     // ---- content -----------------------------------------------------------
 
-    async fn upsert_content(
-        &self,
-        tenant: &RecordId,
-        doc_id: &DocId,
-        content: &Content,
-    ) -> Result<()>;
+    async fn upsert_content(&self, doc_id: &DocId, content: &Content) -> Result<()>;
 
-    async fn get_content(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Option<Content>>;
+    async fn get_content(&self, doc_id: &DocId) -> Result<Option<Content>>;
 
     // ---- chunks ------------------------------------------------------------
 
     /// Bulk upsert. Returns chunk ids in input order.
-    async fn upsert_chunks(
-        &self,
-        tenant: &RecordId,
-        doc_id: &DocId,
-        chunks: &[Chunk],
-    ) -> Result<Vec<ChunkId>>;
+    async fn upsert_chunks(&self, doc_id: &DocId, chunks: &[Chunk]) -> Result<Vec<ChunkId>>;
 
-    async fn list_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Vec<Chunk>>;
+    async fn list_chunks(&self, doc_id: &DocId) -> Result<Vec<Chunk>>;
 
-    async fn delete_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<()>;
+    async fn delete_chunks(&self, doc_id: &DocId) -> Result<()>;
 
     // ---- search ------------------------------------------------------------
 
-    /// KNN search over chunk embeddings, scoped to the caller's tenant.
+    /// KNN search over chunk embeddings. Engine scopes by tenant via
+    /// PERMISSIONS — no application-side filter needed.
     async fn search_vector(
         &self,
-        tenant: &RecordId,
         query: &[f32],
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>>;
 
-    /// Full-text BM25 search over chunk text, scoped to the caller's tenant.
+    /// Full-text BM25 search over chunk text.
     async fn search_keyword(
         &self,
-        tenant: &RecordId,
         query: &str,
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>>;
 
-    // ---- source state ------------------------------------------------------
-
-    /// Read the persisted cursor for a (tenant, adapter) pair.
-    async fn get_source_cursor(
-        &self,
-        tenant: &RecordId,
-        adapter: &str,
-    ) -> Result<Option<serde_json::Value>>;
-
-    async fn put_source_cursor(
-        &self,
-        tenant: &RecordId,
-        adapter: &str,
-        cursor: &serde_json::Value,
-    ) -> Result<()>;
-
     // ---- discovery feed ----------------------------------------------------
 
-    /// Cursor-paginated list of documents. Sorted newest-first by
-    /// `(ingested_at, id)`. Scoped to tenant.
+    /// Cursor-paginated list of documents, newest-first by
+    /// `(ingested_at, id)`. Engine scopes by tenant.
     async fn list_feed(
         &self,
-        tenant: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
     ) -> Result<Vec<Document>>;

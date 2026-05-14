@@ -23,7 +23,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::opt::auth::Root;
-use surrealdb::{RecordId, Surreal};
+use surrealdb::Surreal;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::{Error, Result};
@@ -248,93 +248,62 @@ impl Drop for AuthedDb {
 
 #[async_trait]
 impl Storage for AuthedDb {
-    async fn upsert_document(&self, tenant: &RecordId, doc: &Document) -> Result<DocId> {
-        self.storage().upsert_document(tenant, doc).await
+    async fn upsert_document(&self, doc: &Document) -> Result<DocId> {
+        self.storage().upsert_document(doc).await
     }
-    async fn get_document(&self, tenant: &RecordId, id: &DocId) -> Result<Option<Document>> {
-        self.storage().get_document(tenant, id).await
+    async fn get_document(&self, id: &DocId) -> Result<Option<Document>> {
+        self.storage().get_document(id).await
     }
     async fn get_document_by_canonical(
         &self,
-        tenant: &RecordId,
         canonical_id: &str,
     ) -> Result<Option<Document>> {
-        self.storage()
-            .get_document_by_canonical(tenant, canonical_id)
-            .await
+        self.storage().get_document_by_canonical(canonical_id).await
     }
-    async fn delete_document(&self, tenant: &RecordId, id: &DocId) -> Result<()> {
-        self.storage().delete_document(tenant, id).await
+    async fn delete_document(&self, id: &DocId) -> Result<()> {
+        self.storage().delete_document(id).await
     }
-    async fn upsert_content(
-        &self,
-        tenant: &RecordId,
-        doc_id: &DocId,
-        content: &Content,
-    ) -> Result<()> {
-        self.storage().upsert_content(tenant, doc_id, content).await
+    async fn upsert_content(&self, doc_id: &DocId, content: &Content) -> Result<()> {
+        self.storage().upsert_content(doc_id, content).await
     }
-    async fn get_content(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Option<Content>> {
-        self.storage().get_content(tenant, doc_id).await
+    async fn get_content(&self, doc_id: &DocId) -> Result<Option<Content>> {
+        self.storage().get_content(doc_id).await
     }
     async fn upsert_chunks(
         &self,
-        tenant: &RecordId,
         doc_id: &DocId,
         chunks: &[Chunk],
     ) -> Result<Vec<ChunkId>> {
-        self.storage().upsert_chunks(tenant, doc_id, chunks).await
+        self.storage().upsert_chunks(doc_id, chunks).await
     }
-    async fn list_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<Vec<Chunk>> {
-        self.storage().list_chunks(tenant, doc_id).await
+    async fn list_chunks(&self, doc_id: &DocId) -> Result<Vec<Chunk>> {
+        self.storage().list_chunks(doc_id).await
     }
-    async fn delete_chunks(&self, tenant: &RecordId, doc_id: &DocId) -> Result<()> {
-        self.storage().delete_chunks(tenant, doc_id).await
+    async fn delete_chunks(&self, doc_id: &DocId) -> Result<()> {
+        self.storage().delete_chunks(doc_id).await
     }
     async fn search_vector(
         &self,
-        tenant: &RecordId,
         query: &[f32],
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        self.storage()
-            .search_vector(tenant, query, top_k, filters)
-            .await
+        self.storage().search_vector(query, top_k, filters).await
     }
     async fn search_keyword(
         &self,
-        tenant: &RecordId,
         query: &str,
         top_k: usize,
         filters: &Filters,
     ) -> Result<Vec<ChunkSearchResult>> {
-        self.storage()
-            .search_keyword(tenant, query, top_k, filters)
-            .await
-    }
-    async fn get_source_cursor(
-        &self,
-        tenant: &RecordId,
-        adapter: &str,
-    ) -> Result<Option<serde_json::Value>> {
-        self.storage().get_source_cursor(tenant, adapter).await
-    }
-    async fn put_source_cursor(
-        &self,
-        tenant: &RecordId,
-        adapter: &str,
-        cursor: &serde_json::Value,
-    ) -> Result<()> {
-        self.storage().put_source_cursor(tenant, adapter, cursor).await
+        self.storage().search_keyword(query, top_k, filters).await
     }
     async fn list_feed(
         &self,
-        tenant: &RecordId,
         cursor: Option<FeedCursor>,
         limit: usize,
     ) -> Result<Vec<Document>> {
-        self.storage().list_feed(tenant, cursor, limit).await
+        self.storage().list_feed(cursor, limit).await
     }
 }
 

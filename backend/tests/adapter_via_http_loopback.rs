@@ -65,8 +65,8 @@ async fn service_identity_can_ingest_via_http() {
     // `tenant_id` claim refers to.
     let doc = app
         .system
-        .storage()
-        .get_document_by_canonical(&app.default_tenant_id, "service-ingest:1")
+        .storage_for(app.default_tenant_id.clone())
+        .get_document_by_canonical("service-ingest:1")
         .await
         .unwrap()
         .expect("service-identity ingest persisted document");

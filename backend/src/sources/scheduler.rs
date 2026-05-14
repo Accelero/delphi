@@ -8,7 +8,7 @@ use tokio::time::interval_at;
 
 use crate::error::Result;
 use crate::filter::{Decision, IngestFilter};
-use crate::storage::Storage;
+use crate::storage::SystemDb;
 
 use super::{AdapterRegistry, IngestApiClient, SourceAdapter};
 
@@ -51,7 +51,7 @@ impl SchedulerHandle {
 pub fn run_scheduler(
     ingest: Arc<IngestApiClient>,
     filter: Arc<dyn IngestFilter>,
-    storage: Arc<dyn Storage>,
+    system: Arc<SystemDb>,
     cursor_tenant_id: RecordId,
     registry: AdapterRegistry,
 ) -> SchedulerHandle {
@@ -60,14 +60,14 @@ pub fn run_scheduler(
     for adapter in registry.into_inner() {
         let ingest = ingest.clone();
         let filter = filter.clone();
-        let storage = storage.clone();
+        let system = system.clone();
         let cursor_tenant_id = cursor_tenant_id.clone();
         let shutdown = shutdown.clone();
         handles.push(tokio::spawn(adapter_loop(
             adapter,
             ingest,
             filter,
-            storage,
+            system,
             cursor_tenant_id,
             shutdown,
         )));
@@ -79,7 +79,7 @@ async fn adapter_loop(
     adapter: Arc<dyn SourceAdapter>,
     ingest: Arc<IngestApiClient>,
     filter: Arc<dyn IngestFilter>,
-    storage: Arc<dyn Storage>,
+    system: Arc<SystemDb>,
     cursor_tenant_id: RecordId,
     shutdown: Arc<Notify>,
 ) {
@@ -103,7 +103,7 @@ async fn adapter_loop(
                     adapter.as_ref(),
                     ingest.as_ref(),
                     filter.as_ref(),
-                    storage.as_ref(),
+                    system.as_ref(),
                     &cursor_tenant_id,
                 )
                 .await
@@ -119,10 +119,10 @@ async fn run_once(
     adapter: &dyn SourceAdapter,
     ingest: &IngestApiClient,
     filter: &dyn IngestFilter,
-    storage: &dyn Storage,
+    system: &SystemDb,
     cursor_tenant_id: &RecordId,
 ) -> Result<()> {
-    let cursor = storage
+    let cursor = system
         .get_source_cursor(cursor_tenant_id, adapter.name())
         .await?;
     let fetched = adapter.fetch(cursor).await?;
@@ -161,7 +161,7 @@ async fn run_once(
     }
 
     if let Some(c) = fetched.next_cursor {
-        storage
+        system
             .put_source_cursor(cursor_tenant_id, adapter.name(), &c)
             .await?;
     }

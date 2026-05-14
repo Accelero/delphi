@@ -1,24 +1,21 @@
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use surrealdb::RecordId;
 
 use crate::auth::AuthContext;
 use crate::state::AppState;
+use crate::storage::AuthedDb;
 
-use super::IngestRequest;
+use super::{IngestRequest, IngestSink, NotifyingSink, Pipeline};
 
-/// Roles permitted to push documents in via the HTTP path. Scheduler-driven
-/// ingest skips this gate entirely (it has no AuthContext and is trusted as
-/// a system identity inside the binary).
+/// Roles permitted to push documents in via the HTTP path.
 const INGESTER_ROLES: &[&str] = &["ingester", "owner"];
 
-/// Wire shape: identical to [`IngestRequest`] except `tenant_id` is
-/// **not** read from the request body. The handler stamps it from
-/// `AuthContext.tenant_id` so a caller can never smuggle a foreign
-/// tenant via the JSON payload.
+/// Wire shape: identical to [`IngestRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestRequestBody {
     pub canonical_id: String,
@@ -42,32 +39,33 @@ pub struct IngestRequestBody {
     pub metadata: serde_json::Value,
 }
 
-impl IngestRequestBody {
-    fn into_request(self, tenant_id: RecordId) -> IngestRequest {
-        IngestRequest {
-            tenant_id,
-            canonical_id: self.canonical_id,
-            source_type: self.source_type,
-            source_uri: self.source_uri,
-            title: self.title,
-            authors: self.authors,
-            published_at: self.published_at,
-            language: self.language,
-            summary: self.summary,
-            raw_text: self.raw_text,
-            storage_uri: self.storage_uri,
-            metadata: self.metadata,
+impl From<IngestRequestBody> for IngestRequest {
+    fn from(b: IngestRequestBody) -> Self {
+        Self {
+            canonical_id: b.canonical_id,
+            source_type: b.source_type,
+            source_uri: b.source_uri,
+            title: b.title,
+            authors: b.authors,
+            published_at: b.published_at,
+            language: b.language,
+            summary: b.summary,
+            raw_text: b.raw_text,
+            storage_uri: b.storage_uri,
+            metadata: b.metadata,
         }
     }
 }
 
 /// `POST /api/ingestion/documents`
 ///
-/// Thin wrapper around [`super::IngestSink::ingest`]: deserialize body,
-/// role-gate, stamp tenant from auth, delegate. The same `IngestSink`
-/// instance the in-process scheduler uses serves this request.
+/// Builds a per-request [`Pipeline`] off the request's JWT-authenticated
+/// `AuthedDb`. SurrealDB PERMISSIONS clauses enforce tenant scoping on
+/// every write. The handler then publishes a `FeedItemEvent` to the
+/// process-global broadcast channel for SSE consumers.
 pub async fn ingest_documents(
     State(state): State<AppState>,
+    Extension(db): Extension<Arc<AuthedDb>>,
     auth: AuthContext,
     Json(body): Json<IngestRequestBody>,
 ) -> Response {
@@ -78,8 +76,12 @@ pub async fn ingest_documents(
     if !allowed {
         return (StatusCode::FORBIDDEN, "ingester role required").into_response();
     }
-    let req = body.into_request(auth.tenant_id);
-    match state.sink.ingest(req).await {
+
+    let storage = db.as_storage();
+    let pipeline: Arc<dyn IngestSink> = Arc::new(Pipeline::new(storage.clone()));
+    let sink = NotifyingSink::new(pipeline, storage, state.events.clone());
+
+    match sink.ingest(body.into()).await {
         Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
         Err(e) => {
             tracing::error!(error = %e, "ingestion failed");

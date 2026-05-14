@@ -30,11 +30,10 @@ use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
     JwtClaimsExtractor, JwtValidator,
 };
-use delphi::ingestion::Pipeline;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
 use delphi::storage::{
-    JwtAccessConfig, JwtAccessKind, RequestDbPool, Storage, SystemDb,
+    JwtAccessConfig, JwtAccessKind, RequestDbPool, SystemDb,
 };
 
 /// HS512 secret shared between the test JWT signer and SurrealDB's
@@ -122,20 +121,8 @@ impl TestApp {
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
-        // Scheduler / shared sink writes through the privileged
-        // SystemStorage — same as the production wiring.
-        let pipeline_storage: Arc<dyn Storage> = system.storage();
-        let pipeline: Arc<dyn delphi::ingestion::IngestSink> =
-            Arc::new(Pipeline::new(pipeline_storage.clone()));
-        let sink: Arc<dyn delphi::ingestion::IngestSink> =
-            Arc::new(delphi::ingestion::NotifyingSink::new(
-                pipeline,
-                pipeline_storage,
-                events_tx.clone(),
-            ));
         let state = AppState {
             llm: Arc::new(FakeLlmClient::default()),
-            sink,
             object_store: object_store.clone(),
             events: events_tx.clone(),
         };
