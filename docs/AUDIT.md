@@ -125,9 +125,17 @@ Mark items as `[x]` once a fix has been merged and verified.
 
   _Resolved: feature dropped from `Cargo.toml`._
 
-- [ ] **H6.** `LocalFsObjectStore::put` uses a non-unique tmp filename
+- [x] **H6.** `LocalFsObjectStore::put` uses a non-unique tmp filename
   (`<key>.<ext>.tmp`). Concurrent writers to the same key clobber each
   other's tmp file before rename. Add a unique suffix (`.<pid>.<rand>`).
+
+  _Resolved: tmp filename is now `<key>.<ext>.<pid>.<seq>.tmp` where
+  `seq` comes from a process-wide `AtomicU64` (no new deps). pid
+  disambiguates across processes sharing the root; the atomic
+  disambiguates within a process. New test
+  (`concurrent_put_same_key_all_succeed`) fans out 16 parallel puts to
+  the same key, asserts every one returns Ok, the final read returns
+  one writer's payload, and no `.tmp` siblings linger._
 
 - [ ] **H7.** `conversation` and `message` tables are defined in the schema
   but never written to by any code. Schema-as-aspiration drifts. Either
@@ -485,4 +493,4 @@ Mark items as `[x]` once a fix has been merged and verified.
    infra ([`INFRA-BACKLOG.md`](INFRA-BACKLOG.md)) — defended at the
    reverse proxy in tier-2; single-user deployments skip.
 10. ~~H2 — `mark_read` upsert race.~~ ✓
-11. **H6 — object-store tmp filename collision (concurrent PUT clobber).**
+11. ~~H6 — object-store tmp filename collision (concurrent PUT clobber).~~ ✓

@@ -1,6 +1,7 @@
 //! Filesystem-backed `ObjectStore`. Default for single-user deploys.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -10,8 +11,14 @@ use crate::error::{Error, Result};
 
 use super::ObjectStore;
 
+/// Per-process counter that disambiguates tmp filenames when two `put`
+/// calls land on the same key concurrently. Combined with `process::id()`
+/// it's also unique across processes sharing the same root.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// Files live under `root/{key}`. `put` writes atomically: stage to a
-/// `.tmp` sibling, then `rename` (atomic within the same filesystem).
+/// uniquely-named `.tmp` sibling, then `rename` (atomic within the same
+/// filesystem).
 pub struct LocalFsObjectStore {
     root: PathBuf,
 }
@@ -50,12 +57,14 @@ impl ObjectStore for LocalFsObjectStore {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
+        let base_ext = target
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("part");
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = target.with_extension(format!(
-            "{}.tmp",
-            target
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("part")
+            "{base_ext}.{pid}.{seq}.tmp",
+            pid = std::process::id(),
         ));
         fs::write(&tmp, &bytes).await?;
         fs::rename(&tmp, &target).await?;
@@ -105,6 +114,7 @@ fn ensure_safe_key(key: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn key_safety_rejects_traversal() {
@@ -112,5 +122,45 @@ mod tests {
         assert!(ensure_safe_key("/abs/path").is_err());
         assert!(ensure_safe_key("a/../etc/passwd").is_err());
         assert!(ensure_safe_key("").is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_put_same_key_all_succeed() {
+        // Before the unique-suffix fix, the second writer would clobber
+        // the first writer's tmp file mid-flight; one of the two renames
+        // then races against a missing source. This test asserts every
+        // concurrent put returns Ok, and that the final file contents
+        // match one of the writers (rename is last-writer-wins, which
+        // is the intended semantic).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFsObjectStore::new(dir.path()).unwrap());
+
+        let n = 16;
+        let mut handles = Vec::with_capacity(n);
+        for i in 0..n {
+            let store = Arc::clone(&store);
+            let payload = format!("writer-{i}");
+            handles.push(tokio::spawn(async move {
+                store.put("shared.bin", Bytes::from(payload)).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().expect("concurrent put should succeed");
+        }
+
+        let got = store.get("shared.bin").await.unwrap();
+        let s = std::str::from_utf8(&got).unwrap();
+        assert!(
+            s.starts_with("writer-"),
+            "final contents should be one writer's payload, got {s:?}"
+        );
+
+        // No tmp files should linger — every put renamed its own tmp.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let tmp_left: Vec<_> = entries.iter().filter(|n| n.ends_with(".tmp")).collect();
+        assert!(tmp_left.is_empty(), "tmp files left behind: {tmp_left:?}");
     }
 }
