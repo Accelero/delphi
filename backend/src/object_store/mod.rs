@@ -50,4 +50,9 @@ pub trait ObjectStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<()>;
 
     async fn exists(&self, key: &str) -> Result<bool>;
+
+    /// Read back an object given the URL `put` previously returned.
+    /// Implementations parse their own URL form (`file://…`,
+    /// `mem://…`, eventually `s3://…`) and reject URLs they don't own.
+    async fn get_by_url(&self, url: &str) -> Result<Bytes>;
 }

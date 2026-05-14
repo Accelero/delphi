@@ -19,9 +19,15 @@ type Props = {
   /** Fires on `mouseenter` to clear the glow. The parent decides what
    *  to do (typically: drop the id from its newSet). */
   onClearNew: () => void;
+  /** Fires when the user wants to open the stored original in the
+   *  in-app PDF viewer. The parent (Feed) tracks which document is
+   *  open. Omitted ⇒ title falls back to a link to `source_uri`. Only
+   *  invoked when `item.storage_uri` is present. */
+  onOpen?: (item: FeedDocument) => void;
 };
 
-export function DocumentCard({ item, isNew, onClearNew }: Props) {
+export function DocumentCard({ item, isNew, onClearNew, onOpen }: Props) {
+  const canOpen = !!onOpen && !!item.storage_uri;
   return (
     <Card
       onMouseEnter={isNew ? onClearNew : undefined}
@@ -34,14 +40,24 @@ export function DocumentCard({ item, isNew, onClearNew }: Props) {
       <CardHeader>
         <div className="flex items-start justify-between gap-3">
           <CardTitle className="text-base leading-snug">
-            <a
-              href={item.source_uri}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="hover:underline"
-            >
-              {item.title ?? item.canonical_id}
-            </a>
+            {canOpen ? (
+              <button
+                type="button"
+                onClick={() => onOpen!(item)}
+                className="text-left hover:underline"
+              >
+                {item.title ?? item.canonical_id}
+              </button>
+            ) : (
+              <a
+                href={item.source_uri}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="hover:underline"
+              >
+                {item.title ?? item.canonical_id}
+              </a>
+            )}
           </CardTitle>
           {isNew && (
             <div className="flex shrink-0 items-center gap-2">

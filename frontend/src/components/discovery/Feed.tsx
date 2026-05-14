@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { DocumentCard } from "@/components/discovery/DocumentCard";
+import { PdfViewer } from "@/components/discovery/PdfViewer";
 import { api, type FeedDocument, type FeedPage, type FeedSort } from "@/lib/api";
 import { useFeedEvents } from "@/hooks/useFeedEvents";
 
@@ -92,6 +93,11 @@ export function Feed() {
 
   const { showPill, scrollToTop } = usePillState(newSet.size);
 
+  // Selected document → renders the PdfViewer on top. The feed below
+  // stays mounted (just hidden) so scroll position and any in-memory
+  // state survive the round-trip.
+  const [selected, setSelected] = useState<FeedDocument | null>(null);
+
   return (
     <div className="space-y-4 max-w-3xl mx-auto">
       <div className="flex items-center justify-between">
@@ -143,6 +149,7 @@ export function Feed() {
               item={item}
               isNew={newSet.has(item.id)}
               onClearNew={() => clearNew(item.id)}
+              onOpen={setSelected}
             />
           </li>
         ))}
@@ -158,6 +165,14 @@ export function Feed() {
             {query.isFetchingNextPage ? <Spinner /> : "Load more"}
           </Button>
         </div>
+      )}
+
+      {selected && (
+        <PdfViewer
+          documentId={selected.id}
+          title={selected.title ?? selected.canonical_id}
+          onBack={() => setSelected(null)}
+        />
       )}
     </div>
   );

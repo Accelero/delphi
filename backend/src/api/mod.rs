@@ -2,6 +2,7 @@
 
 mod chat;
 mod discovery;
+mod documents;
 mod health;
 mod stream;
 
@@ -207,7 +208,8 @@ pub fn build_router(
             post(ingestion::ingest_documents),
         )
         .route("/api/discovery/feed", get(discovery::feed))
-        .route("/api/discovery/feed/events", get(discovery::events));
+        .route("/api/discovery/feed/events", get(discovery::events))
+        .route("/api/documents/{key}/file", get(documents::file));
 
     // Routes that don't require an authenticated identity.
     let api_public = Router::new().route("/healthz", get(health::healthz));
