@@ -1,18 +1,26 @@
 /**
- * `/corpus` — index route for the corpus-chat surface. Never renders;
- * redirects to the most-recently-updated conversation, or creates one
- * if the user has none yet.
+ * `/corpus` — parent route for the corpus-chat surface. The bare URL
+ * redirects to the most-recently-updated conversation (or mints one).
+ * For nested URLs like `/corpus/$sessionId` this route is a transparent
+ * layout: its component is just `<Outlet />` so the child renders.
  *
  * Per-conversation state lives at `/corpus/$sessionId` — see
  * `corpus.$sessionId.tsx`.
  */
-import { createFileRoute, redirect } from "@tanstack/react-router";
+import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
 
 import { api, conversationKey } from "@/lib/api";
 import { conversationsKey } from "@/hooks/useConversations";
 
 export const Route = createFileRoute("/corpus")({
-  beforeLoad: async ({ context }) => {
+  beforeLoad: async ({ context, location }) => {
+    // This route is also the parent of `/corpus/$sessionId`, so its
+    // beforeLoad runs on every navigation under `/corpus/*`. Only the
+    // bare `/corpus` URL should trigger the redirect; otherwise we'd
+    // bounce back to ourselves and loop.
+    if (location.pathname !== "/corpus" && location.pathname !== "/corpus/") {
+      return;
+    }
     const list = await context.queryClient.ensureQueryData({
       queryKey: conversationsKey,
       queryFn: api.chat.listConversations,
@@ -32,7 +40,5 @@ export const Route = createFileRoute("/corpus")({
       params: { sessionId: conversationKey(created.id) },
     });
   },
-  // Component is unreachable — beforeLoad always redirects — but TanStack
-  // Router requires one.
-  component: () => null,
+  component: Outlet,
 });
