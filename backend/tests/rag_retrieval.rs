@@ -1,20 +1,26 @@
 //! Chat retrieval over a controlled chunk set.
 //!
 //! Seeds N chunks for one document with deterministic vectors via the
-//! FakeEmbedder, queries with a synthetic vector matching chunk #4, and
+//! FakeEmbedder, queries with a synthetic vector matching chunk #2, and
 //! asserts:
 //!
-//! - chat returns 200 with the AI SDK stream protocol headers,
-//! - the response opens with a `2:` data block listing the citations,
+//! - the SSE stream opens with a `2:` data block listing the citations,
 //! - neighbor expansion (radius=1) widens the citation set to include
-//!   adjacent ordinals.
+//!   adjacent ordinals,
+//! - the stream ends with the expected `0:`/`d:` records.
+//!
+//! Note the contract since the POST/GET split (chat-streaming redesign):
+//! POST `/messages` returns 202 immediately and the bytes arrive on the
+//! separate GET `/stream` subscription. The test therefore opens the
+//! stream first, fires the POST, then drains the stream until the
+//! trailing `d:` finish frame and closes.
 
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use futures::StreamExt;
 use serde_json::json;
 
 use common::fake_embedder::FakeEmbedder;
@@ -32,12 +38,40 @@ fn key_of(id_str: &str) -> String {
         .unwrap_or_else(|| id_str.to_string())
 }
 
+/// Default test identity claims — same shape the `AuthRequestBuilder`
+/// produces, but assembled into a fresh JWT we hand to reqwest.
+fn test_bearer() -> String {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use serde_json::json as j;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = j!({
+        "sub": "test-user",
+        "iss": "https://idp.test/",
+        "email": "test@delphi.test",
+        "preferred_username": "Test User",
+        "ac": "app_session",
+        "ns": "delphi_test",
+        "db": "main",
+        "iat": now,
+        "exp": now + 3600,
+    });
+    encode(
+        &Header::new(jsonwebtoken::Algorithm::HS512),
+        &claims,
+        &EncodingKey::from_secret(common::TEST_JWT_SECRET.as_bytes()),
+    )
+    .expect("encode jwt")
+}
+
 #[tokio::test]
 async fn chat_streams_citations_block_before_text() {
-    // Build app with our deterministic chunk embedder so the chat
-    // handler's retrieval path runs end-to-end. The default FakeLlmClient
-    // emits a single "ok" delta — small, predictable, and lets us verify
-    // ordering (citations data block before text delta).
+    // Build app with our deterministic chunk embedder so the worker's
+    // retrieval path runs end-to-end. The default FakeLlmClient emits a
+    // single "ok" delta — small, predictable, and lets us verify ordering
+    // (citations data block before text delta).
     let chunk_embedder: Arc<dyn Embedder> =
         Arc::new(FakeEmbedder::new("bge-small-en-v1.5", 384));
     let app = TestApp::build_with_rag(None, Some(chunk_embedder.clone()), None).await;
@@ -68,9 +102,7 @@ async fn chat_streams_citations_block_before_text() {
 
     // Seed 30 chunks. Their vectors are the same that the chunk embedder
     // would produce for their text — so a query whose vector matches
-    // chunk #2's text returns chunk #2 first. We use more than EFC's
-    // sweep size (200 here is the default; we keep N comfortably below
-    // since HNSW degenerates on tiny corpora).
+    // chunk #2's text returns chunk #2 first.
     let mut chunks = Vec::new();
     for ord in 0..30i64 {
         let text = format!("chunk content {ord}");
@@ -96,9 +128,7 @@ async fn chat_streams_citations_block_before_text() {
     }
     storage.upsert_chunks(&doc_id, &chunks).await.unwrap();
 
-    // Sanity: vector search returns hits directly. If this is empty,
-    // the in-memory engine probably doesn't support HNSW or the test
-    // setup is wrong; the failure is informative.
+    // Sanity: vector search returns hits directly.
     let q = chunk_embedder.query("chunk content 2").await.unwrap();
     let hits = storage
         .search_vector(&q, 5, &delphi::storage::Filters {
@@ -108,59 +138,107 @@ async fn chat_streams_citations_block_before_text() {
         .await
         .expect("search_vector");
     assert!(!hits.is_empty(), "expected KNN hits");
-    // Top hit should be ordinal 2 (vectors are deterministic).
     assert_eq!(hits[0].ordinal, 2, "top hit should be chunk #2");
 
-    // Post-rebase, the chat handler lives behind a conversation-keyed
-    // route. Create a conversation first, then POST the user message to
-    // its `messages` endpoint.
-    let create = Request::builder()
-        .method("POST")
-        .uri("/api/chat/conversations")
+    // Spin up the router behind a real socket so we can stream the body
+    // (oneshot collects the full response and would hang on the stream's
+    // no-EOF semantics).
+    let (base_url, server) = app.serve_local().await;
+    let bearer = test_bearer();
+    let client = reqwest::Client::builder()
+        .build()
+        .expect("reqwest client");
+
+    // Create a conversation.
+    let create = client
+        .post(format!("{base_url}/api/chat/conversations"))
+        .bearer_auth(&bearer)
         .header("content-type", "application/json")
-        .body(Body::from("{}".to_string()))
-        .unwrap();
-    let create = common::AuthRequestBuilder::default().apply(create);
-    let created = app.send(create).await;
-    assert_eq!(created.status, StatusCode::CREATED, "{}", created.text());
-    let conv_id = created.json::<serde_json::Value>()["id"]
-        .as_str()
-        .expect("conversation id")
-        .to_string();
+        .body("{}")
+        .send()
+        .await
+        .expect("create conversation");
+    assert_eq!(create.status().as_u16(), 201);
+    let created: serde_json::Value = create.json().await.expect("conv json");
+    let conv_id = created["id"].as_str().expect("conv id").to_string();
     let key = key_of(&conv_id);
 
-    // Query for chunk #2's text — KNN should return chunk #2 first; with
-    // RAG_RETRIEVAL_NEIGHBOR_RADIUS=1 expansion adds #1 and #3.
+    // Open the stream FIRST, before the POST, so we don't miss any bytes.
+    let stream_resp = client
+        .get(format!("{base_url}/api/chat/conversations/{key}/stream"))
+        .bearer_auth(&bearer)
+        .send()
+        .await
+        .expect("open stream");
+    assert_eq!(stream_resp.status().as_u16(), 200);
+    assert_eq!(
+        stream_resp
+            .headers()
+            .get("x-vercel-ai-data-stream")
+            .and_then(|v| v.to_str().ok()),
+        Some("v1"),
+        "stream must announce the AI SDK data-stream protocol",
+    );
+    let mut bytes = stream_resp.bytes_stream();
+
+    // Submit the user message.
     let body = json!({
         "messages": [{ "role": "user", "content": "chunk content 2" }]
     });
-    let req = Request::builder()
-        .method("POST")
-        .uri(&format!("/api/chat/conversations/{key}/messages"))
+    let post = client
+        .post(format!("{base_url}/api/chat/conversations/{key}/messages"))
+        .bearer_auth(&bearer)
         .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-    let req = common::AuthRequestBuilder::default().apply(req);
-    let res = app.send(req).await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("post message");
+    assert_eq!(
+        post.status().as_u16(),
+        202,
+        "POST should be fire-and-forget; got {}: {}",
+        post.status(),
+        post.text().await.unwrap_or_default()
+    );
 
-    let text = res.text();
+    // Drain the stream until we see the trailing `d:` frame, then bail.
+    let mut acc = Vec::<u8>::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "did not receive finish frame within deadline; got so far: {}",
+                String::from_utf8_lossy(&acc)
+            );
+        }
+        let chunk_fut = tokio::time::timeout(Duration::from_millis(500), bytes.next());
+        match chunk_fut.await {
+            Ok(Some(Ok(chunk))) => acc.extend_from_slice(&chunk),
+            Ok(Some(Err(e))) => panic!("stream error: {e}"),
+            Ok(None) => break, // server closed (shouldn't happen but harmless)
+            Err(_) => {}       // tick — re-check accumulator for terminal frame
+        }
+        if let Ok(s) = std::str::from_utf8(&acc) {
+            if s.contains("\"finishReason\":") {
+                break;
+            }
+        }
+    }
+    drop(bytes);
+    server.abort();
+
+    let text = String::from_utf8(acc).expect("utf-8");
+
     // The protocol opens with a `2:` data block carrying the citations.
     let first_line = text.lines().next().unwrap_or_default();
     assert!(
         first_line.starts_with("2:"),
         "expected leading `2:` citations block; got first line {first_line:?}\nfull: {text}",
     );
-    // Parse the data-block body and assert chunk #2 appears in citations.
     let body_json = &first_line[2..];
     let parsed: serde_json::Value = serde_json::from_str(body_json).expect("json");
     let chunks_arr = parsed[0]["chunks"].as_array().expect("chunks array");
     assert!(!chunks_arr.is_empty(), "no citations: {first_line}");
-    let texts: Vec<i64> = chunks_arr
-        .iter()
-        .filter_map(|c| c["page"].as_i64())
-        .collect();
-    let _ = texts; // we don't assert page numbers here (no bboxes seeded)
 
     // Text-delta + finish marker round out the stream.
     assert!(text.contains("0:\"ok\""), "expected text delta in: {text}");

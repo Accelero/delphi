@@ -1,6 +1,7 @@
 //! HTTP server: routes, static-SPA fallback, axum boot.
 
 mod chat;
+mod chat_stream;
 mod chunks;
 mod conversations;
 mod discovery;
@@ -234,6 +235,10 @@ pub fn build_router(
         .route(
             "/api/chat/conversations/{key}/messages",
             post(chat::post_message),
+        )
+        .route(
+            "/api/chat/conversations/{key}/stream",
+            get(chat_stream::stream),
         )
         .route("/api/auth/me", get(auth::me))
         .route(
