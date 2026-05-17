@@ -65,21 +65,10 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     Ok(RecordId::from(("conversation", k)))
 }
 
-/// Cheap syntactic check on the user-supplied ULID: 26 chars, valid
-/// Crockford-base32 charset. Anything else → 400.
+/// Cheap syntactic check on the user-supplied ULID. Delegates to the
+/// `ulid` crate so we agree with the client's `ulid()` exactly.
 fn looks_like_ulid(s: &str) -> bool {
-    if s.len() != 26 {
-        return false;
-    }
-    // Crockford excludes I, L, O, U from the alphabet; we accept upper
-    // and lower case (ULIDs are usually upper, but the spec is case-
-    // insensitive on decode).
-    s.bytes().all(|b| {
-        matches!(b,
-            b'0'..=b'9' |
-            b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z' |
-            b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z')
-    })
+    ulid::Ulid::from_string(s).is_ok()
 }
 
 /// Parse a `parent_id` from the request body. Accepts `"message:<key>"`
