@@ -25,16 +25,19 @@
  *   normal scrolling do the rest. No custom spacer math.
  */
 
-import { useChat } from "@ai-sdk/react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { ChatStatus } from "ai";
 import { ArrowDownIcon, CheckIcon, CopyIcon } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
   conversationKeyFor,
   conversationsKey,
 } from "@/hooks/useConversations";
+import {
+  useSessionStream,
+  type LocalMessage,
+} from "@/hooks/useSessionStream";
 
 import {
   Message,
@@ -55,7 +58,7 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
-import { MessageBody, type CitationEntry } from "./MessageBody";
+import { MessageBody } from "./MessageBody";
 
 type InitialMessage = {
   id: string;
@@ -64,18 +67,17 @@ type InitialMessage = {
 };
 
 export type ChatProps = {
-  api: string;
+  /** Conversation record key (no `conversation:` prefix). The chat
+   *  surface uses it to open the GET stream, POST submissions, and
+   *  POST stops. */
+  sessionKey: string;
   emptyTitle?: string;
   emptyDescription?: string;
   placeholder?: string;
   className?: string;
-  /** Pre-populate the chat with persisted messages. Shape matches the
-   *  AI SDK's `Message` (id + role + content). Optional. */
+  /** Pre-populate the chat with persisted messages. The hook layers
+   *  in-flight stream bytes on top of this initial list. */
   initialMessages?: InitialMessage[];
-  /** When set, `["conversations"]` and the per-conversation cache are
-   *  invalidated after each completed turn so the sidebar picks up
-   *  freshly-persisted messages and any auto-generated title. */
-  sessionKey?: string;
 };
 
 function stripThink(text: string): string {
@@ -115,7 +117,7 @@ function CopyMessageAction({ text }: { text: string }) {
 
 type ChatMessage = {
   id: string;
-  role: "user" | "assistant" | "system" | "data";
+  role: "user" | "assistant" | "system";
   content: string;
 };
 
@@ -139,66 +141,64 @@ function groupTurns(messages: ChatMessage[]): Turn[] {
 }
 
 export function Chat({
-  api,
+  sessionKey,
   emptyTitle = "No messages yet",
   emptyDescription = "Send a message to start the conversation.",
   placeholder = "Type a message…",
   className,
   initialMessages,
-  sessionKey,
 }: ChatProps) {
   const queryClient = useQueryClient();
-  const { messages, append, isLoading, error, stop, data } = useChat({
-    api,
-    initialMessages: initialMessages as never,
-  });
 
-  // After a turn completes (streaming → ready), invalidate the
+  // After a turn ends (we saw a `d:` frame), invalidate the
   // conversation caches so the sidebar reflects any auto-generated
   // title and the per-conversation cache picks up the just-persisted
   // assistant message.
-  const wasLoadingRef = useRef(false);
-  useEffect(() => {
-    if (wasLoadingRef.current && !isLoading && sessionKey) {
-      queryClient.invalidateQueries({ queryKey: conversationsKey });
-      queryClient.invalidateQueries({
-        queryKey: conversationKeyFor(sessionKey),
-      });
-    }
-    wasLoadingRef.current = isLoading;
-  }, [isLoading, sessionKey, queryClient]);
+  const onTurnEnd = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: conversationsKey });
+    queryClient.invalidateQueries({
+      queryKey: conversationKeyFor(sessionKey),
+    });
+  }, [queryClient, sessionKey]);
 
-  // RAG v1: the backend streams a `citations` data block at the head of
-  // each chat response. `useChat` collects all data records into `data`;
-  // we look for the most recent `{ type: 'citations', chunks: [...] }`
-  // entry and apply it to the tail assistant message so its `[N]`
-  // markers can resolve to deep links into the PDF viewer.
-  const citations: CitationEntry[] = useMemo(() => {
-    if (!Array.isArray(data)) return [];
-    for (let i = data.length - 1; i >= 0; i--) {
-      const entry = data[i] as unknown;
-      if (
-        entry &&
-        typeof entry === "object" &&
-        (entry as { type?: string }).type === "citations"
-      ) {
-        const chunks = (entry as { chunks?: CitationEntry[] }).chunks;
-        if (Array.isArray(chunks)) return chunks;
-      }
-    }
-    return [];
-  }, [data]);
+  const seed: LocalMessage[] = useMemo(
+    () =>
+      (initialMessages ?? [])
+        .filter((m): m is InitialMessage =>
+          ["user", "assistant", "system"].includes(m.role),
+        )
+        .map((m) => ({
+          id: m.id,
+          role: m.role as LocalMessage["role"],
+          content: m.content,
+        })),
+    [initialMessages],
+  );
 
-  const status: ChatStatus = error
-    ? "error"
-    : isLoading
-      ? "streaming"
-      : "ready";
+  const {
+    messages,
+    status: streamStatus,
+    citations,
+    error,
+    submit,
+    stop,
+  } = useSessionStream(sessionKey, {
+    initialMessages: seed,
+    onTurnEnd,
+  });
+
+  const status: ChatStatus =
+    streamStatus === "error"
+      ? "error"
+      : streamStatus === "streaming" || streamStatus === "submitted"
+        ? "streaming"
+        : "ready";
+  const isLoading = status === "streaming";
 
   const handleSubmit = (msg: PromptInputMessage) => {
     const text = msg.text.trim();
     if (!text) return;
-    void append({ role: "user", content: text });
+    void submit(text);
   };
 
   const turns = useMemo(
@@ -397,7 +397,7 @@ export function Chat({
 
             {error && (
               <div className="rounded-md p-3 border border-red-500/50 text-sm text-red-500">
-                {error.message}
+                {error}
               </div>
             )}
 
@@ -432,7 +432,12 @@ export function Chat({
         </PromptInputBody>
         <PromptInputFooter>
           <PromptInputTools />
-          <PromptInputSubmit status={status} onStop={stop} />
+          <PromptInputSubmit
+            status={status}
+            onStop={() => {
+              void stop();
+            }}
+          />
         </PromptInputFooter>
       </PromptInput>
     </div>

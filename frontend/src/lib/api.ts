@@ -183,10 +183,40 @@ export const api = {
       request<void>(`/api/chat/conversations/${encodeURIComponent(key)}`, {
         method: "DELETE",
       }),
-    /** URL the `useChat()` hook POSTs to. Plain string because the AI SDK
-     *  manages its own fetch. */
-    messagesUrl: (key: string) =>
-      `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
+    /** Fire-and-forget submit. Returns when the backend's 202 ACK
+     *  lands — by that point the user message is persisted and the
+     *  worker is dispatched. The assistant reply arrives on the
+     *  separate `/stream` subscription, not in this response.
+     *
+     *  Used directly by `useSessionStream` for its optimistic-insert
+     *  + POST flow. Callers outside the hook should prefer that. */
+    submitMessage: (key: string, text: string) =>
+      request<void>(
+        `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            messages: [{ role: "user", content: text }],
+          }),
+        },
+      ),
+    /** Open the long-lived `GET /stream` body. Returns the raw
+     *  `Response` so the caller can `getReader()` and consume the
+     *  AI SDK data-stream format incrementally. */
+    openMessageStream: (key: string, signal?: AbortSignal) =>
+      fetch(`/api/chat/conversations/${encodeURIComponent(key)}/stream`, {
+        credentials: "same-origin",
+        signal,
+      }),
+    /** Stop the in-flight turn. Idempotent (204 in all cases). The
+     *  resulting `d:{"finishReason":"stop"}` frame arrives on the
+     *  open stream subscription, which flips local state back to
+     *  `ready` on every tab simultaneously. */
+    stopMessage: (key: string) =>
+      request<void>(
+        `/api/chat/conversations/${encodeURIComponent(key)}/stop`,
+        { method: "POST" },
+      ),
   },
 };
 

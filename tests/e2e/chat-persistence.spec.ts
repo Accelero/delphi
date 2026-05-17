@@ -3,10 +3,12 @@
  * navigate away, return to the same session, and verify the message
  * survived the round trip through the database.
  *
- * The backend persists the user message *before* invoking the LLM
- * (see `backend/src/api/chat.rs`), so this test does not depend on the
- * LLM provider being configured — only on the conversation + messages
- * tables being correctly read back by the route loader.
+ * Post chat-streaming redesign: the backend persists the user message
+ * synchronously inside `POST /api/chat/conversations/{id}/messages`
+ * and returns 202 Accepted; the assistant reply streams asynchronously
+ * over the separate `GET /stream` subscription. This test waits for
+ * the POST's 202 (= user row written) before navigating away, so it
+ * does not depend on the LLM provider being configured.
  *
  * Untagged: runs in tier1 and tier2 (tier2 needs the Keycloak login
  * dance).
@@ -70,11 +72,12 @@ test("user message persists across navigation away and back", async ({
   await expect(page.getByText(message, { exact: true })).toBeVisible();
 
   const res = await messagesResponse;
-  // Even if the LLM bails (no key, provider down), the user row is
-  // persisted before stream_chat() is invoked, so any 2xx/4xx/5xx
-  // response means the write happened. We don't gate the test on the
-  // assistant stream completing.
-  expect(res.status()).toBeGreaterThanOrEqual(200);
+  // POST is fire-and-forget under the new contract: a 202 means the
+  // user row is persisted and the worker is dispatched. The assistant
+  // reply arrives separately on the GET /stream subscription, which
+  // this test deliberately doesn't gate on (LLM may be unavailable in
+  // CI without provider credentials).
+  expect(res.status()).toBe(202);
 
   // Navigate away, then back via URL — this remounts the route and
   // forces the loader to fetch the conversation from the backend.

@@ -91,19 +91,40 @@ LLM_ROUNDTRIP(
       test.skip();
     }
 
-    // Drive POST /api/chat directly. The deterministic backend test
-    // (`rag_retrieval.rs`) already covers the data-stream protocol
-    // shape end-to-end; this version just verifies that the running
-    // backend agrees with the wire format the test expects.
-    const res = await request.post("/api/chat", {
-      data: {
-        messages: [
-          { role: "user", content: "what does this paper say about chunks?" },
-        ],
-      },
+    // Post chat-streaming redesign: the chat surface lives behind a
+    // conversation-keyed pair of endpoints. Create the conversation
+    // first, then POST the user message (returns 202) and *separately*
+    // open the GET /stream subscription to read the worker's reply.
+    // The deterministic backend test (`rag_retrieval.rs`) already
+    // covers the data-stream protocol end-to-end; this version just
+    // verifies the running backend agrees with the wire format.
+    const created = await request.post("/api/chat/conversations", {
+      data: {},
     });
-    expect(res.ok()).toBeTruthy();
-    const body = await res.text();
+    expect(created.ok()).toBeTruthy();
+    const conv = (await created.json()) as { id: string };
+    const key = conv.id.split(":").slice(1).join(":");
+
+    // Open the stream first so we don't race the worker.
+    const streamPromise = request.get(
+      `/api/chat/conversations/${encodeURIComponent(key)}/stream`,
+    );
+
+    const submit = await request.post(
+      `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
+      {
+        data: {
+          messages: [
+            { role: "user", content: "what does this paper say about chunks?" },
+          ],
+        },
+      },
+    );
+    expect(submit.status()).toBe(202);
+
+    const stream = await streamPromise;
+    expect(stream.ok()).toBeTruthy();
+    const body = await stream.text();
     // The protocol's finish marker should appear regardless of whether
     // any chunks matched.
     expect(body).toMatch(/d:\{"finishReason"/);

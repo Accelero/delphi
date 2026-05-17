@@ -47,8 +47,14 @@ function CorpusConversation() {
         )}
         {q.isSuccess && (
           <div className="flex-1 min-h-0 flex flex-col max-w-3xl mx-auto w-full p-4">
+            {/* `key={sessionId}` forces a fresh mount when the user
+                switches sessions. Without it the same <Chat> instance
+                keeps the `useSessionStream` hook's internal `messages`
+                array and the in-flight stream alive across navigations
+                — tokens for the previous session bleed into the new
+                one's UI. */}
             <Chat
-              api={api.chat.messagesUrl(sessionId)}
+              key={sessionId}
               sessionKey={sessionId}
               initialMessages={q.data.messages.map((m) => ({
                 id: m.id,
