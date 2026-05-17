@@ -119,6 +119,14 @@ impl SessionState {
         self.notify.notify_waiters();
     }
 
+    /// Acquire the finalize lock. The worker holds this around its
+    /// DB-commit + [`Self::clear_after_commit`] critical section; the
+    /// new-tab handshake acquires it before snapshotting history so it
+    /// can't observe a "neither in DB nor in buffer" state.
+    pub async fn lock_finalize(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.finalize_lock.lock().await
+    }
+
     /// Truncate the buffer at the end of a committed turn. Bumps
     /// `base_offset` by the cleared length so reader cursors stay
     /// consistent across the boundary — a reader whose cursor is past
@@ -209,6 +217,49 @@ mod tests {
             .expect("woke")
             .expect("read ok");
         assert_eq!(&out[..n], b"turnB-bytes");
+    }
+
+    #[tokio::test]
+    async fn finalize_lock_serialises_commit_and_handshake() {
+        use tokio::time::{sleep, timeout, Duration};
+
+        let s = Arc::new(SessionState::new());
+
+        // "Worker" task takes the finalize lock and holds it briefly.
+        let s_worker = s.clone();
+        let worker = tokio::spawn(async move {
+            let _g = s_worker.lock_finalize().await;
+            sleep(Duration::from_millis(80)).await;
+            // Commit + clear under the lock.
+            s_worker.clear_after_commit().await;
+        });
+
+        // Give the worker a head start to acquire the lock.
+        sleep(Duration::from_millis(10)).await;
+
+        // "Handshake" must block on the lock until the worker releases.
+        let s_hs = s.clone();
+        let handshake = tokio::spawn(async move {
+            let _g = s_hs.lock_finalize().await;
+            // Returns the moment the lock is free.
+            std::time::Instant::now()
+        });
+
+        let start = std::time::Instant::now();
+        let when_unblocked = timeout(Duration::from_secs(1), handshake)
+            .await
+            .expect("handshake didn't deadlock")
+            .expect("join");
+        worker.await.unwrap();
+
+        // The handshake should have been blocked for at least ~50ms.
+        // We don't check the exact 80ms to leave slack for CI jitter,
+        // but anything < 40ms means the locks weren't serialising.
+        let blocked_for = when_unblocked - start;
+        assert!(
+            blocked_for >= Duration::from_millis(40),
+            "handshake unblocked too quickly: {blocked_for:?}"
+        );
     }
 
     #[tokio::test]
