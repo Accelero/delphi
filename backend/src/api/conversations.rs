@@ -12,13 +12,14 @@
 
 use std::sync::Arc;
 
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use surrealdb::RecordId;
 
+use crate::state::AppState;
 use crate::storage::{AuthedDb, ChatMessage, Conversation, ConversationId, Storage};
 
 /// Reject obviously-malformed keys at the API boundary (no `:`, no
@@ -80,11 +81,32 @@ pub struct GetResponse {
     pub messages: Vec<ChatMessage>,
 }
 
-pub async fn get(Extension(db): Extension<Arc<AuthedDb>>, Path(key): Path<String>) -> Response {
+pub async fn get(
+    State(app): State<AppState>,
+    Extension(db): Extension<Arc<AuthedDb>>,
+    Path(key): Path<String>,
+) -> Response {
     let id = match parse_conversation_id(&key) {
         Ok(id) => id,
         Err(r) => return r,
     };
+
+    // Acquire the per-session `finalize_lock` around the history snapshot
+    // if there's a live session for this conversation. Inside that
+    // critical section the worker cannot run its "commit assistant
+    // message + clear buffer" step — so the response is consistent with
+    // *some* point in the conversation's timeline rather than catching
+    // the worker mid-commit. See `docs/architecture/chat-streaming.md`
+    // (Handshake) for the duplicate-message race this avoids.
+    //
+    // `lookup` is `None` when no worker is in flight, in which case
+    // there's nothing to coordinate against and we just read.
+    let session = app.session_registry.lookup(&id).await;
+    let _finalize_guard = match session.as_ref() {
+        Some(s) => Some(s.lock_finalize().await),
+        None => None,
+    };
+
     let conversation = match db.get_conversation(&id).await {
         Ok(Some(c)) => c,
         Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -100,6 +122,7 @@ pub async fn get(Extension(db): Extension<Arc<AuthedDb>>, Path(key): Path<String
             return (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response();
         }
     };
+    drop(_finalize_guard);
     (
         StatusCode::OK,
         Json(GetResponse {
