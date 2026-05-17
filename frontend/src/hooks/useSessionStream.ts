@@ -1,41 +1,32 @@
 /**
- * `useSessionStream(conversationKey)` — subscribe to the per-session
- * byte log produced by the backend chat worker.
+ * `useSessionStream(conversationKey, opts)` — drive one chat
+ * conversation, ChatGPT-style.
  *
- * Replaces `@ai-sdk/react`'s `useChat` for our split protocol:
+ *   - `submit(text)` does the whole turn: generate a ULID for the user
+ *     message, optimistic insert, POST the turn, consume the response
+ *     body as the AI SDK data-stream.
+ *   - `stop()` POSTs `/tasks/{taskId}/stop` and aborts the read loop.
  *
- *  - `POST /api/chat/conversations/{key}/messages` is fire-and-forget
- *    (returns 202). The hook calls it from `submit(text)` and
- *    optimistically appends the user message to local state — the
- *    backend persists it synchronously before returning 202, so the
- *    mirror is safe.
- *  - `GET /api/chat/conversations/{key}/stream` is a long-lived
- *    response whose body is the AI SDK data-stream format (`0:` /
- *    `2:` / `3:` / `d:` newline-delimited records). The hook opens
- *    this on mount and tails it for the component's lifetime.
- *  - `POST /api/chat/conversations/{key}/stop` cancels the in-flight
- *    turn. Idempotent — every tab can call it.
+ * There is **no** persistent connection. No `useEffect` opens a stream
+ * on mount. The hook is idle between turns; refetching the
+ * conversation (`onTurnEnd` triggered by the caller) is what surfaces
+ * cross-tab updates.
  *
- * Multi-tab fan-out is free: every tab that mounts opens its own
- * `/stream` subscription, the backend tees the same bytes to all of
- * them, so two tabs of the same chat see the same live tokens.
- *
- * The hook is intentionally *minimal*. Persisted message history is
- * loaded once by the route loader (`getConversation`) and passed in
- * via `initialMessages`; the hook then layers in-flight text from the
- * stream on top. State that needs to survive HMR / route swaps lives
- * in TanStack Query's cache, not here.
+ * The hook stays minimal: it owns the local message list, in-flight
+ * assistant overlay, the current `taskId`, `lastKnownMessageId`
+ * (threading the next turn's `parent_id`), and the abort controller.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { ulid } from "ulid";
 
 import type { CitationEntry } from "@/components/chat/MessageBody";
-import { ApiError, type ChatMessageWire } from "@/lib/api";
+import { ApiError, api, type ChatMessageWire } from "@/lib/api";
 
 /** Status enum shaped like `@ai-sdk/react`'s so callers don't have to
  *  learn a new word. `submitted` is the brief gap between POST and the
- *  first `0:` / `2:` arriving on the stream; UIs typically render the
- *  same "thinking…" placeholder for both `submitted` and `streaming`. */
+ *  first `0:` arriving; UIs typically render the same "thinking…"
+ *  placeholder for both `submitted` and `streaming`. */
 export type StreamStatus = "ready" | "submitted" | "streaming" | "error";
 
 export type LocalMessage = {
@@ -46,11 +37,14 @@ export type LocalMessage = {
 
 export type UseSessionStreamOptions = {
   /** Persisted history from the conversation GET response. Rendered as
-   *  the initial `messages` until the live stream replaces/extends it. */
+   *  the initial `messages` until the live stream replaces/extends it.
+   *  When the hook is `ready` (no in-flight turn) and the prop
+   *  reference changes — typically because `onTurnEnd` triggered a
+   *  refetch — the hook replaces its local state wholesale. */
   initialMessages?: LocalMessage[];
-  /** Fires after each completed turn (we saw a `d:` frame). Callers use
-   *  it to invalidate sidebar caches so the auto-generated title and
-   *  newly-persisted assistant message show up. */
+  /** Fires after each successful turn (we saw a `d:` frame). Callers
+   *  use it to invalidate the conversation query so the persisted pair
+   *  replaces the optimistic+streaming overlay. */
   onTurnEnd?: () => void;
 };
 
@@ -59,12 +53,13 @@ export type UseSessionStreamReturn = {
   status: StreamStatus;
   citations: CitationEntry[];
   error: string | null;
-  /** Submit a user message. Optimistically inserts it locally, then
-   *  POSTs to `/messages`. Throws on non-2xx. The assistant reply
-   *  arrives via the open stream. */
+  /** Submit one turn. Optimistically inserts the user message, POSTs,
+   *  and consumes the streaming response. On 409 (stale parent),
+   *  rolls back and surfaces an error. */
   submit: (text: string) => Promise<void>;
-  /** Ask the backend to abort the in-flight turn. The worker's
-   *  `proto::finish("stop")` frame closes out the turn for every tab. */
+  /** Cancel the in-flight turn. POSTs `/tasks/{taskId}/stop` and
+   *  aborts the read loop. Rolls back the optimistic user message —
+   *  the turn was never persisted. */
   stop: () => Promise<void>;
 };
 
@@ -75,7 +70,9 @@ export type UseSessionStreamReturn = {
  *   0:"hello world"\n      ← text delta (JSON-encoded string)
  *   2:[{...}]\n            ← data block (JSON array)
  *   3:"error text"\n       ← error (JSON-encoded string)
- *   d:{"finishReason":"stop"}\n ← finish marker (JSON object)
+ *   8:{"taskId":"…"}\n     ← task announcement (delphi extension)
+ *   d:{"finishReason":"stop","assistantMessageId":"message:…"}\n
+ *                            ← finish marker
  *
  * The parser is a tiny incremental machine: feed it `Uint8Array`
  * chunks via `push()`, drain complete records out via `take()`. Lines
@@ -87,7 +84,15 @@ export type ParsedRecord =
   | { type: "text"; value: string }
   | { type: "data"; value: unknown[] }
   | { type: "error"; value: string }
-  | { type: "finish"; value: { finishReason?: string; [k: string]: unknown } };
+  | { type: "task"; value: { taskId: string } }
+  | {
+      type: "finish";
+      value: {
+        finishReason?: string;
+        assistantMessageId?: string;
+        [k: string]: unknown;
+      };
+    };
 
 export class StreamParser {
   private decoder = new TextDecoder("utf-8");
@@ -107,9 +112,7 @@ export class StreamParser {
     return o;
   }
 
-  /** Flush any in-flight TextDecoder state (call on stream end). After
-   *  flush, an incomplete trailing line is discarded — the wire format
-   *  requires every record to end in `\n`. */
+  /** Flush any in-flight TextDecoder state (call on stream end). */
   flush(): void {
     this.buf += this.decoder.decode();
     this.drainLines();
@@ -122,7 +125,7 @@ export class StreamParser {
       this.buf = this.buf.slice(nl + 1);
       if (line.length === 0) continue;
       const sep = line.indexOf(":");
-      if (sep < 0) continue; // malformed — drop silently, same as the AI SDK
+      if (sep < 0) continue;
       const tag = line.slice(0, sep);
       const body = line.slice(sep + 1);
       try {
@@ -140,18 +143,27 @@ export class StreamParser {
             if (typeof parsed === "string")
               this.out.push({ type: "error", value: parsed });
             break;
+          case "8":
+            if (
+              parsed &&
+              typeof parsed === "object" &&
+              typeof (parsed as { taskId?: unknown }).taskId === "string"
+            ) {
+              this.out.push({
+                type: "task",
+                value: { taskId: (parsed as { taskId: string }).taskId },
+              });
+            }
+            break;
           case "d":
             if (parsed && typeof parsed === "object")
               this.out.push({ type: "finish", value: parsed });
             break;
           default:
-            // Unknown tag — ignore. AI SDK occasionally adds new ones.
             break;
         }
       } catch {
-        // Malformed JSON — drop. The wire format is well-defined; if we
-        // see a bad record it's a backend bug, not something to crash
-        // the chat over.
+        // Malformed JSON — drop.
       }
     }
   }
@@ -161,21 +173,14 @@ export class StreamParser {
  * Hook
  * ----------------------------------------------------------------- */
 
-function messagesUrl(key: string): string {
-  return `/api/chat/conversations/${encodeURIComponent(key)}/messages`;
-}
-function streamUrl(key: string): string {
-  return `/api/chat/conversations/${encodeURIComponent(key)}/stream`;
-}
-function stopUrl(key: string): string {
-  return `/api/chat/conversations/${encodeURIComponent(key)}/stop`;
+/** Derive the initial `lastKnownMessageId` from the seeded history.
+ *  The tail message's id threads the next turn's `parent_id`. */
+function tailMessageId(messages: LocalMessage[]): string | null {
+  const tail = messages[messages.length - 1];
+  return tail ? tail.id : null;
 }
 
-/** Random id for optimistic / streaming assistant message rows. The
- *  backend's persisted ids replace these on the next history GET. */
-function ephemeralId(prefix: string): string {
-  return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
-}
+const STREAMING_ID_PREFIX = "streaming-";
 
 export function useSessionStream(
   conversationKey: string,
@@ -187,176 +192,282 @@ export function useSessionStream(
   const [citations, setCitations] = useState<CitationEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
 
-  // Keep the latest onTurnEnd in a ref so the stream loop can call it
-  // without resubscribing on every render.
+  // Track the parent_id for the next submit. Updated from history on
+  // every refetch while idle, and from each `d:` frame mid-turn.
+  const lastKnownMessageIdRef = useRef<string | null>(
+    tailMessageId(initialMessages),
+  );
+  const currentTaskIdRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  // Holds the optimistic user-message id mid-turn so `stop()` can
+  // roll it back. Cleared at turn end.
+  const optimisticUserIdRef = useRef<string | null>(null);
+  // Stable id for the in-flight streaming assistant placeholder.
+  // Tracked in a ref because setMessages updates would otherwise need
+  // to scan the array on every delta.
+  const streamingAssistantIdRef = useRef<string | null>(null);
+
   const onTurnEndRef = useRef(onTurnEnd);
   useEffect(() => {
     onTurnEndRef.current = onTurnEnd;
   }, [onTurnEnd]);
 
-  // Tracking the in-flight assistant message id is the cleanest way to
-  // append text deltas without scanning the message array on every
-  // record. Reset on each `d:` (turn boundary).
-  const inFlightAssistantIdRef = useRef<string | null>(null);
-
-  /**
-   * Open the stream and consume it until the component unmounts.
-   * `initialMessages` is captured by ref so it can be updated by
-   * `setMessages` without resubscribing. We resubscribe ONLY when
-   * `conversationKey` changes.
-   */
+  // Track status in a ref so the prop-driven seed effect can read it
+  // without taking a dependency (which would loop).
+  const statusRef = useRef(status);
   useEffect(() => {
-    let cancelled = false;
-    const controller = new AbortController();
+    statusRef.current = status;
+  }, [status]);
 
-    const run = async () => {
-      try {
-        const res = await fetch(streamUrl(conversationKey), {
-          credentials: "same-origin",
-          signal: controller.signal,
-        });
-        if (!res.ok || !res.body) {
-          if (res.status === 401) {
-            // Let the global handler kick the OIDC redirect; the route
-            // will be remounted afterwards and the stream re-opens.
-            return;
-          }
-          throw new ApiError(res.status, `stream open: ${res.status}`);
-        }
-        const reader = res.body.getReader();
-        const parser = new StreamParser();
-
-        while (!cancelled) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          if (value) parser.push(value);
-          for (const rec of parser.take()) applyRecord(rec);
-        }
-        parser.flush();
-        for (const rec of parser.take()) applyRecord(rec);
-      } catch (e) {
-        if (cancelled) return;
-        if (e instanceof DOMException && e.name === "AbortError") return;
-        setError(e instanceof Error ? e.message : "stream error");
-        setStatus("error");
-      }
-    };
-
-    const applyRecord = (rec: ParsedRecord) => {
-      switch (rec.type) {
-        case "text": {
-          setStatus("streaming");
-          setMessages((prev) => {
-            const id = inFlightAssistantIdRef.current;
-            if (id) {
-              return prev.map((m) =>
-                m.id === id ? { ...m, content: m.content + rec.value } : m,
-              );
-            }
-            const fresh: LocalMessage = {
-              id: ephemeralId("a"),
-              role: "assistant",
-              content: rec.value,
-            };
-            inFlightAssistantIdRef.current = fresh.id;
-            return [...prev, fresh];
-          });
-          break;
-        }
-        case "data": {
-          // RAG v1: the worker emits one `2:` block per turn carrying
-          // citations. Replace local citations wholesale; if a future
-          // turn lacks any, citations clear on the next `d:`.
-          for (const entry of rec.value) {
-            if (
-              entry &&
-              typeof entry === "object" &&
-              (entry as { type?: string }).type === "citations"
-            ) {
-              const chunks = (entry as { chunks?: CitationEntry[] }).chunks;
-              if (Array.isArray(chunks)) setCitations(chunks);
-            }
-          }
-          break;
-        }
-        case "error": {
-          setError(rec.value);
-          setStatus("error");
-          break;
-        }
-        case "finish": {
-          inFlightAssistantIdRef.current = null;
-          setStatus("ready");
-          onTurnEndRef.current?.();
-          break;
-        }
-      }
-    };
-
-    void run();
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [conversationKey]);
+  // When the seed changes (caller refetched), replace local state ONLY
+  // when we're idle. A mid-stream prop refresh must not wipe in-flight
+  // overlay state. Also re-anchors `lastKnownMessageId` to the new
+  // tail — so a tab that refetches after another tab's commit picks
+  // up the new parent for free.
+  useEffect(() => {
+    if (statusRef.current !== "ready") return;
+    setMessages(initialMessages);
+    lastKnownMessageIdRef.current = tailMessageId(initialMessages);
+    // initialMessages is the caller's memoised array; identity
+    // changes only when the underlying history changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialMessages]);
 
   const submit = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
-      // Optimistic insert — the backend persists the user message
-      // synchronously before returning 202, so the local mirror won't
-      // diverge unless the POST itself fails (rolled back below).
-      const userId = ephemeralId("u");
-      setMessages((prev) => [
-        ...prev,
-        { id: userId, role: "user", content: trimmed },
-      ]);
+
+      const userIdRaw = ulid();
+      const userIdRecord = `message:${userIdRaw}`;
+      const optimistic: LocalMessage = {
+        id: userIdRecord,
+        role: "user",
+        content: trimmed,
+      };
+      optimisticUserIdRef.current = userIdRecord;
+      setMessages((prev) => [...prev, optimistic]);
       setStatus("submitted");
       setError(null);
-      inFlightAssistantIdRef.current = null;
+      setCitations([]);
 
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+      currentTaskIdRef.current = null;
+      streamingAssistantIdRef.current = null;
+
+      let res: Response;
       try {
-        const res = await fetch(messagesUrl(conversationKey), {
-          method: "POST",
-          credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            messages: [{ role: "user", content: trimmed }],
-          }),
-        });
-        if (!res.ok) {
-          throw new ApiError(res.status, `submit: ${res.status}`);
-        }
+        res = await api.chat.submitMessage(
+          conversationKey,
+          {
+            id: userIdRaw,
+            text: trimmed,
+            parent_id: lastKnownMessageIdRef.current,
+          },
+          controller.signal,
+        );
       } catch (e) {
-        // Roll back the optimistic message; surface the error.
-        setMessages((prev) => prev.filter((m) => m.id !== userId));
+        if (e instanceof DOMException && e.name === "AbortError") return;
+        rollbackOptimistic(
+          setMessages,
+          optimisticUserIdRef,
+          streamingAssistantIdRef,
+        );
         setStatus("error");
         setError(e instanceof Error ? e.message : "submit failed");
-        throw e;
+        return;
+      }
+
+      if (res.status === 409) {
+        rollbackOptimistic(
+          setMessages,
+          optimisticUserIdRef,
+          streamingAssistantIdRef,
+        );
+        setStatus("error");
+        setError("Conversation changed; refreshing…");
+        onTurnEndRef.current?.();
+        return;
+      }
+      if (!res.ok || !res.body) {
+        rollbackOptimistic(
+          setMessages,
+          optimisticUserIdRef,
+          streamingAssistantIdRef,
+        );
+        setStatus("error");
+        setError(
+          res.status === 401 ? "Not authenticated" : `submit: ${res.status}`,
+        );
+        if (res.status !== 401) {
+          throw new ApiError(res.status, `submit: ${res.status}`);
+        }
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const parser = new StreamParser();
+      try {
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) parser.push(value);
+          for (const rec of parser.take()) {
+            applyRecord(rec, {
+              setMessages,
+              setStatus,
+              setCitations,
+              setError,
+              userIdRaw,
+              lastKnownMessageIdRef,
+              currentTaskIdRef,
+              optimisticUserIdRef,
+              streamingAssistantIdRef,
+              onTurnEnd: onTurnEndRef.current,
+            });
+          }
+        }
+        parser.flush();
+        for (const rec of parser.take()) {
+          applyRecord(rec, {
+            setMessages,
+            setStatus,
+            setCitations,
+            setError,
+            userIdRaw,
+            lastKnownMessageIdRef,
+            currentTaskIdRef,
+            optimisticUserIdRef,
+            streamingAssistantIdRef,
+            onTurnEnd: onTurnEndRef.current,
+          });
+        }
+      } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") return;
+        setStatus("error");
+        setError(e instanceof Error ? e.message : "stream error");
+      } finally {
+        abortControllerRef.current = null;
       }
     },
     [conversationKey],
   );
 
   const stop = useCallback(async () => {
-    try {
-      await fetch(stopUrl(conversationKey), {
-        method: "POST",
-        credentials: "same-origin",
-      });
-      // Don't flip status here — the worker emits a `d:` frame that
-      // the stream loop folds into `status = "ready"` on every tab.
-    } catch {
-      // Stop is best-effort; if the request itself fails the user can
-      // retry. The next `d:` (or component unmount) will clean up
-      // status regardless.
+    const taskId = currentTaskIdRef.current;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+
+    if (taskId) {
+      try {
+        await api.chat.stopTask(conversationKey, taskId);
+      } catch {
+        // Best-effort.
+      }
     }
+
+    rollbackOptimistic(
+      setMessages,
+      optimisticUserIdRef,
+      streamingAssistantIdRef,
+    );
+    currentTaskIdRef.current = null;
+    setStatus("ready");
+    setCitations([]);
   }, [conversationKey]);
 
   return { messages, status, citations, error, submit, stop };
 }
 
-/** Re-exported for the convenience of components that want to type
- *  `ChatMessageWire`-shaped initial data. */
+function rollbackOptimistic(
+  setMessages: React.Dispatch<React.SetStateAction<LocalMessage[]>>,
+  optimisticUserIdRef: React.MutableRefObject<string | null>,
+  streamingAssistantIdRef: React.MutableRefObject<string | null>,
+) {
+  const userId = optimisticUserIdRef.current;
+  const asstId = streamingAssistantIdRef.current;
+  if (!userId && !asstId) return;
+  setMessages((prev) =>
+    prev.filter((m) => m.id !== userId && m.id !== asstId),
+  );
+  optimisticUserIdRef.current = null;
+  streamingAssistantIdRef.current = null;
+}
+
+type ApplyContext = {
+  setMessages: React.Dispatch<React.SetStateAction<LocalMessage[]>>;
+  setStatus: React.Dispatch<React.SetStateAction<StreamStatus>>;
+  setCitations: React.Dispatch<React.SetStateAction<CitationEntry[]>>;
+  setError: React.Dispatch<React.SetStateAction<string | null>>;
+  userIdRaw: string;
+  lastKnownMessageIdRef: React.MutableRefObject<string | null>;
+  currentTaskIdRef: React.MutableRefObject<string | null>;
+  optimisticUserIdRef: React.MutableRefObject<string | null>;
+  streamingAssistantIdRef: React.MutableRefObject<string | null>;
+  onTurnEnd: (() => void) | undefined;
+};
+
+function applyRecord(rec: ParsedRecord, ctx: ApplyContext) {
+  switch (rec.type) {
+    case "task":
+      ctx.currentTaskIdRef.current = rec.value.taskId;
+      break;
+    case "text": {
+      ctx.setStatus("streaming");
+      const delta = rec.value;
+      const existing = ctx.streamingAssistantIdRef.current;
+      if (existing == null) {
+        const id = `${STREAMING_ID_PREFIX}${ctx.userIdRaw}`;
+        ctx.streamingAssistantIdRef.current = id;
+        ctx.setMessages((prev) => [
+          ...prev,
+          { id, role: "assistant", content: delta },
+        ]);
+      } else {
+        ctx.setMessages((prev) =>
+          prev.map((m) =>
+            m.id === existing
+              ? { ...m, content: m.content + delta }
+              : m,
+          ),
+        );
+      }
+      break;
+    }
+    case "data":
+      for (const entry of rec.value) {
+        if (
+          entry &&
+          typeof entry === "object" &&
+          (entry as { type?: string }).type === "citations"
+        ) {
+          const chunks = (entry as { chunks?: CitationEntry[] }).chunks;
+          if (Array.isArray(chunks)) ctx.setCitations(chunks);
+        }
+      }
+      break;
+    case "error":
+      ctx.setError(rec.value);
+      ctx.setStatus("error");
+      break;
+    case "finish": {
+      const asstId = rec.value.assistantMessageId;
+      if (typeof asstId === "string" && asstId.length > 0) {
+        ctx.lastKnownMessageIdRef.current = asstId;
+      }
+      ctx.currentTaskIdRef.current = null;
+      ctx.optimisticUserIdRef.current = null;
+      ctx.streamingAssistantIdRef.current = null;
+      ctx.setStatus("ready");
+      // Caller's onTurnEnd invalidates the conversation query; the
+      // resulting prop refresh replaces the optimistic+streaming pair
+      // with the persisted rows.
+      ctx.onTurnEnd?.();
+      break;
+    }
+  }
+}
+
 export type { ChatMessageWire };

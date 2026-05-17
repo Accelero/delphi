@@ -91,13 +91,12 @@ LLM_ROUNDTRIP(
       test.skip();
     }
 
-    // Post chat-streaming redesign: the chat surface lives behind a
-    // conversation-keyed pair of endpoints. Create the conversation
-    // first, then POST the user message (returns 202) and *separately*
-    // open the GET /stream subscription to read the worker's reply.
-    // The deterministic backend test (`rag_retrieval.rs`) already
-    // covers the data-stream protocol end-to-end; this version just
-    // verifies the running backend agrees with the wire format.
+    // Post chat-streaming redesign: POST /messages IS the stream. Body
+    // shape is `{ id, text, parent_id }` with a client-minted ULID for
+    // the user message id. The deterministic backend test
+    // (`rag_retrieval.rs`) already covers the data-stream protocol
+    // end-to-end; this version just verifies the running backend agrees
+    // with the wire format.
     const created = await request.post("/api/chat/conversations", {
       data: {},
     });
@@ -105,28 +104,24 @@ LLM_ROUNDTRIP(
     const conv = (await created.json()) as { id: string };
     const key = conv.id.split(":").slice(1).join(":");
 
-    // Open the stream first so we don't race the worker.
-    const streamPromise = request.get(
-      `/api/chat/conversations/${encodeURIComponent(key)}/stream`,
-    );
+    // Crockford ULID — generated client-side to thread the optimistic
+    // insert / server commit with the same record id.
+    const userId = "01HXY0000000000000000000ZZ";
 
     const submit = await request.post(
       `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
       {
         data: {
-          messages: [
-            { role: "user", content: "what does this paper say about chunks?" },
-          ],
+          id: userId,
+          text: "what does this paper say about chunks?",
+          parent_id: null,
         },
       },
     );
-    expect(submit.status()).toBe(202);
-
-    const stream = await streamPromise;
-    expect(stream.ok()).toBeTruthy();
-    const body = await stream.text();
-    // The protocol's finish marker should appear regardless of whether
-    // any chunks matched.
+    expect(submit.status()).toBe(200);
+    const body = await submit.text();
+    // The protocol opens with the `8:` task frame and ends with `d:`.
+    expect(body).toMatch(/^8:\{"taskId"/m);
     expect(body).toMatch(/d:\{"finishReason"/);
   },
 );

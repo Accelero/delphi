@@ -183,38 +183,34 @@ export const api = {
       request<void>(`/api/chat/conversations/${encodeURIComponent(key)}`, {
         method: "DELETE",
       }),
-    /** Fire-and-forget submit. Returns when the backend's 202 ACK
-     *  lands — by that point the user message is persisted and the
-     *  worker is dispatched. The assistant reply arrives on the
-     *  separate `/stream` subscription, not in this response.
+    /** POST one turn. The response body **is** the AI SDK
+     *  data-stream — caller `.body.getReader()`s and parses frames
+     *  incrementally. Returns the raw `Response` (so the caller can
+     *  inspect status + body together; a 409 reads as `stale_parent`).
      *
-     *  Used directly by `useSessionStream` for its optimistic-insert
-     *  + POST flow. Callers outside the hook should prefer that. */
-    submitMessage: (key: string, text: string) =>
-      request<void>(
-        `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
-        {
-          method: "POST",
-          body: JSON.stringify({
-            messages: [{ role: "user", content: text }],
-          }),
-        },
-      ),
-    /** Open the long-lived `GET /stream` body. Returns the raw
-     *  `Response` so the caller can `getReader()` and consume the
-     *  AI SDK data-stream format incrementally. */
-    openMessageStream: (key: string, signal?: AbortSignal) =>
-      fetch(`/api/chat/conversations/${encodeURIComponent(key)}/stream`, {
+     *  Body shape: `{ id, text, parent_id }`. The `id` is a
+     *  client-generated ULID; the server takes it verbatim as the
+     *  message record key. `parent_id` is the last known assistant
+     *  message id (`"message:..."`) or `null` for the first turn. */
+    submitMessage: (
+      key: string,
+      body: { id: string; text: string; parent_id: string | null },
+      signal?: AbortSignal,
+    ) =>
+      fetch(`/api/chat/conversations/${encodeURIComponent(key)}/messages`, {
+        method: "POST",
         credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
         signal,
       }),
-    /** Stop the in-flight turn. Idempotent (204 in all cases). The
-     *  resulting `d:{"finishReason":"stop"}` frame arrives on the
-     *  open stream subscription, which flips local state back to
-     *  `ready` on every tab simultaneously. */
-    stopMessage: (key: string) =>
+    /** Cancel an in-flight task by id. Idempotent — server returns
+     *  204 whether or not the task is still around. Fire-and-forget. */
+    stopTask: (key: string, taskId: string) =>
       request<void>(
-        `/api/chat/conversations/${encodeURIComponent(key)}/stop`,
+        `/api/chat/conversations/${encodeURIComponent(
+          key,
+        )}/tasks/${encodeURIComponent(taskId)}/stop`,
         { method: "POST" },
       ),
   },

@@ -37,19 +37,41 @@ describe("StreamParser", () => {
     expect(collect(p)).toEqual([{ type: "text", value: "hello" }]);
   });
 
-  it("parses a full turn end-to-end", () => {
+  it("parses a full turn end-to-end including the task frame", () => {
     const p = new StreamParser();
     p.push(
       enc.encode(
-        '2:[{"type":"citations","chunks":[{"n":1}]}]\n0:"part 1 "\n0:"part 2"\nd:{"finishReason":"stop"}\n',
+        '8:{"taskId":"01HXY0000000000000000000ZZ"}\n' +
+          '2:[{"type":"citations","chunks":[{"n":1}]}]\n' +
+          '0:"part 1 "\n0:"part 2"\n' +
+          'd:{"finishReason":"stop","assistantMessageId":"message:abc"}\n',
       ),
     );
     expect(collect(p)).toEqual([
+      { type: "task", value: { taskId: "01HXY0000000000000000000ZZ" } },
       { type: "data", value: [{ type: "citations", chunks: [{ n: 1 }] }] },
       { type: "text", value: "part 1 " },
       { type: "text", value: "part 2" },
-      { type: "finish", value: { finishReason: "stop" } },
+      {
+        type: "finish",
+        value: {
+          finishReason: "stop",
+          assistantMessageId: "message:abc",
+        },
+      },
     ]);
+  });
+
+  it("parses the task frame in isolation", () => {
+    const p = new StreamParser();
+    p.push(enc.encode('8:{"taskId":"01J"}\n'));
+    expect(collect(p)).toEqual([{ type: "task", value: { taskId: "01J" } }]);
+  });
+
+  it("ignores task frame missing taskId field", () => {
+    const p = new StreamParser();
+    p.push(enc.encode('8:{"not_taskId":"x"}\n'));
+    expect(collect(p)).toEqual([]);
   });
 
   it("buffers a split across the newline", () => {
@@ -70,7 +92,7 @@ describe("StreamParser", () => {
 
   it("handles many tiny chunk splits", () => {
     const full =
-      '0:"hello "\n0:"world"\nd:{"finishReason":"stop"}\n';
+      '0:"hello "\n0:"world"\nd:{"finishReason":"stop","assistantMessageId":"message:k9"}\n';
     const p = new StreamParser();
     // Split at every single byte.
     const splits = Array.from({ length: full.length - 1 }, (_, i) => i + 1);
@@ -78,7 +100,10 @@ describe("StreamParser", () => {
     expect(collect(p)).toEqual([
       { type: "text", value: "hello " },
       { type: "text", value: "world" },
-      { type: "finish", value: { finishReason: "stop" } },
+      {
+        type: "finish",
+        value: { finishReason: "stop", assistantMessageId: "message:k9" },
+      },
     ]);
   });
 

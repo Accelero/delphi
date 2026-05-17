@@ -1,14 +1,13 @@
 /**
  * Chat persistence: create a new conversation, send a user message,
- * navigate away, return to the same session, and verify the message
+ * wait for the stream to complete (which signals `commit_turn` has
+ * persisted both rows), navigate away, return, and verify the message
  * survived the round trip through the database.
  *
- * Post chat-streaming redesign: the backend persists the user message
- * synchronously inside `POST /api/chat/conversations/{id}/messages`
- * and returns 202 Accepted; the assistant reply streams asynchronously
- * over the separate `GET /stream` subscription. This test waits for
- * the POST's 202 (= user row written) before navigating away, so it
- * does not depend on the LLM provider being configured.
+ * Post chat-streaming redesign: POST `/messages` IS the stream. The
+ * worker writes the user+assistant pair atomically via `commit_turn`
+ * only after the LLM finishes. We wait for the trailing `d:` frame
+ * (response body close) before navigating away.
  *
  * Untagged: runs in tier1 and tier2 (tier2 needs the Keycloak login
  * dance).
@@ -30,19 +29,13 @@ test("user message persists across navigation away and back", async ({
     await loginViaKeycloak(page);
   }
 
-  // Land somewhere under /corpus — beforeLoad will pick the most recent
-  // conversation or mint one.
   await page.goto("/corpus");
   await expect(page).toHaveURL(/\/corpus\/[\w-]+$/, { timeout: 10_000 });
 
-  // Sidebar must be present before we can click "New chat".
   const newChatButton = page.getByRole("button", { name: /new chat/i });
   await expect(newChatButton).toBeVisible();
   const urlBeforeClick = page.url();
 
-  // Mint a fresh conversation so we don't share state with prior runs.
-  // After the click the route navigates to the new session id; waiting
-  // on the URL change is more robust than racing the POST response.
   await newChatButton.click();
   await page.waitForURL(
     (u) => /\/corpus\/[\w-]+$/.test(u.pathname) && u.href !== urlBeforeClick,
@@ -50,34 +43,31 @@ test("user message persists across navigation away and back", async ({
   );
   const sessionUrl = page.url();
 
-  // Unique payload so reruns can't false-pass on stale rows. Includes
-  // the test run timestamp so failures are debuggable from DB.
   const message = `e2e persistence ${Date.now()} ${Math.random().toString(36).slice(2, 8)}`;
 
   const textarea = page.getByPlaceholder(/type a message/i);
   await textarea.fill(message);
 
-  // The chat surface POSTs to `/api/chat/conversations/<key>/messages`.
-  // Wait for the *response* (not just the request) so the backend has
-  // finished persisting the user row before we navigate away.
+  // POST /messages now returns the stream body; we wait for that
+  // request to complete (body finished = `d:` emitted = commit_turn
+  // ran), so the persisted pair is on disk by the time we navigate.
   const messagesResponse = page.waitForResponse(
     (r) =>
       /\/api\/chat\/conversations\/[^/]+\/messages$/.test(r.url()) &&
       r.request().method() === "POST",
+    { timeout: 30_000 },
   );
   await page.getByRole("button", { name: /^submit$/i }).click();
 
-  // The user message renders optimistically — quick sanity check that
-  // the submit actually fired, before we wait on the network.
+  // Optimistic render of the user message.
   await expect(page.getByText(message, { exact: true })).toBeVisible();
 
   const res = await messagesResponse;
-  // POST is fire-and-forget under the new contract: a 202 means the
-  // user row is persisted and the worker is dispatched. The assistant
-  // reply arrives separately on the GET /stream subscription, which
-  // this test deliberately doesn't gate on (LLM may be unavailable in
-  // CI without provider credentials).
-  expect(res.status()).toBe(202);
+  expect(res.status()).toBe(200);
+  // Drain the response body so the worker's `d:` frame has been seen
+  // by Playwright before we navigate (`commit_turn` runs server-side
+  // just before the `d:` frame).
+  await res.body();
 
   // Navigate away, then back via URL — this remounts the route and
   // forces the loader to fetch the conversation from the backend.
@@ -86,8 +76,6 @@ test("user message persists across navigation away and back", async ({
   await page.goto(sessionUrl);
   await expect(page).toHaveURL(sessionUrl);
 
-  // After the loader resolves, the persisted user message must be
-  // rendered into the chat surface.
   await expect(page.getByText(message, { exact: true })).toBeVisible({
     timeout: 10_000,
   });
