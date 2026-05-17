@@ -14,15 +14,26 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
+use crate::chat::SessionRegistry;
 use crate::embedder::Embedder;
 use crate::ingestion::FeedItemEvent;
 use crate::llm::LlmClient;
 use crate::object_store::ObjectStore;
+use crate::storage::RequestDbPool;
 use crate::text_extractor::TextExtractor;
 
 #[derive(Clone)]
 pub struct AppState {
     pub llm: Arc<dyn LlmClient>,
+    /// Per-conversation in-memory streaming state. Workers spawned by
+    /// `POST /api/chat/conversations/{id}/messages` register here so
+    /// SSE readers attached via `GET /stream` see the live byte log.
+    pub session_registry: Arc<SessionRegistry>,
+    /// Per-request DB pool, shared with the identity middleware. The
+    /// chat worker checks out its own `AuthedDb` for the commit step
+    /// because the request that spawned it has already released its
+    /// connection by the time the worker finishes.
+    pub request_db_pool: RequestDbPool,
     /// Where original artefacts (PDFs, …) are stashed. Adapters use it
     /// directly; HTTP handlers can dereference `Document.storage_uri`
     /// through it for "show original" features.

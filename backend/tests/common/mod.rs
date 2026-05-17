@@ -31,6 +31,7 @@ use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
     JwtClaimsExtractor, JwtValidator,
 };
+use delphi::chat::SessionRegistry;
 use delphi::embedder::Embedder;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
@@ -150,6 +151,8 @@ impl TestApp {
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
         let state = AppState {
             llm: Arc::new(FakeLlmClient::default()),
+            session_registry: Arc::new(SessionRegistry::new()),
+            request_db_pool: request_pool.clone(),
             object_store: object_store.clone(),
             events: events_tx.clone(),
             // RAG: integration tests that don't set up an embedder leave

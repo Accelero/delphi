@@ -27,7 +27,9 @@
 mod reader;
 mod registry;
 mod state;
+mod worker;
 
 pub use reader::SessionReader;
 pub use registry::SessionRegistry;
 pub use state::SessionState;
+pub use worker::{spawn as spawn_worker, turn_request, TurnRequest};

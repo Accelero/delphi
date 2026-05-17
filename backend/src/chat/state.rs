@@ -81,6 +81,7 @@ impl SessionState {
     /// right now. A reader created with this cursor sees only future
     /// appends. The new-tab handshake instead uses [`Self::tail_cursor`]
     /// via `subscribe()` so it picks up the in-flight turn bytes.
+    #[cfg(test)]
     pub(super) fn end_cursor(&self) -> u64 {
         // Length read under the same `read()` guard that bounds it.
         let base = self.base_offset.load(Ordering::Acquire);
