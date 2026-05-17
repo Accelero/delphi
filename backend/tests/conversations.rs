@@ -94,7 +94,7 @@ async fn list_starts_empty_then_reflects_create() {
 }
 
 #[tokio::test]
-async fn post_message_streams_and_persists_both_messages_and_title() {
+async fn post_message_returns_202_and_worker_persists_both_messages_and_title() {
     let app = TestApp::build().await;
     let id = create_one(&app).await;
     let key = key_of(&id);
@@ -110,36 +110,37 @@ async fn post_message_streams_and_persists_both_messages_and_title() {
             }),
         ))
         .await;
-    assert_eq!(res.status, StatusCode::OK, "stream OK");
-    let body = res.text();
-    // Vercel AI SDK Data Stream Protocol — `0:` text records and a `d:` finish marker.
-    assert!(
-        body.contains("0:\"ok\""),
-        "body should contain text delta: {body}"
-    );
-    assert!(
-        body.contains("d:{\"finishReason\":"),
-        "body should contain finish marker: {body}"
-    );
+    // POST is fire-and-forget under the new design — the streaming
+    // reply arrives on the separate GET /stream subscription.
+    assert_eq!(res.status, StatusCode::ACCEPTED, "submit accepted");
+    assert!(res.bytes.is_empty(), "body should be empty");
 
-    // Re-fetch the conversation: both messages should be persisted, and the
-    // title should have been auto-generated (FakeLlm default returns "ok").
-    let res = app
-        .send(auth_get(&format!("/api/chat/conversations/{key}")))
-        .await;
-    assert_eq!(res.status, StatusCode::OK);
-    let body: Value = res.json();
-    let msgs = body["messages"].as_array().unwrap();
-    assert_eq!(msgs.len(), 2);
-    assert_eq!(msgs[0]["role"], "user");
-    assert_eq!(msgs[0]["content"], "Hello");
-    assert_eq!(msgs[1]["role"], "assistant");
-    assert_eq!(msgs[1]["content"], "ok");
-    assert!(
-        body["conversation"]["title"].as_str().is_some(),
-        "title should be auto-populated; got {:?}",
-        body["conversation"]["title"]
-    );
+    // The worker runs detached; poll the conversation until both
+    // messages + the auto-title land. FakeLlm default emits "ok"
+    // synchronously so this usually resolves in the first iteration.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let res = app
+            .send(auth_get(&format!("/api/chat/conversations/{key}")))
+            .await;
+        assert_eq!(res.status, StatusCode::OK);
+        let body: Value = res.json();
+        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+        let title_ok = body["conversation"]["title"].as_str().is_some();
+        if msgs.len() == 2 && title_ok {
+            assert_eq!(msgs[0]["role"], "user");
+            assert_eq!(msgs[0]["content"], "Hello");
+            assert_eq!(msgs[1]["role"], "assistant");
+            assert_eq!(msgs[1]["content"], "ok");
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "worker did not persist within deadline; last body = {body:?}"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
@@ -182,7 +183,9 @@ async fn delete_cascades_and_is_idempotent() {
     let id = create_one(&app).await;
     let key = key_of(&id);
 
-    // Post a message so we have something to cascade.
+    // Post a message so we have something to cascade. POST returns
+    // 202 immediately; we don't wait for the worker because the user
+    // message is persisted synchronously before the 202 is sent.
     let _ = app
         .send(auth_post(
             &format!("/api/chat/conversations/{key}/messages"),
