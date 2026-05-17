@@ -109,6 +109,38 @@ impl SessionState {
     pub fn subscribe(self: &std::sync::Arc<Self>) -> SessionReader {
         SessionReader::new(self.clone(), self.tail_cursor())
     }
+
+    /// Append framed bytes (one or more whole `proto::*` records) and
+    /// wake any parked readers. The worker is the only caller.
+    pub(crate) async fn append(&self, bytes: &[u8]) {
+        let mut g = self.buf.write().await;
+        g.extend_from_slice(bytes);
+        drop(g);
+        self.notify.notify_waiters();
+    }
+
+    /// Truncate the buffer at the end of a committed turn. Bumps
+    /// `base_offset` by the cleared length so reader cursors stay
+    /// consistent across the boundary — a reader whose cursor is past
+    /// the new `base_offset` simply sees "caught up" on its next read
+    /// and parks.
+    ///
+    /// Caller must hold the [`finalize_lock`] across DB-commit + this
+    /// clear so the handshake sees a coherent view.
+    ///
+    /// [`finalize_lock`]: SessionState::finalize_lock
+    pub(crate) async fn clear_after_commit(&self) {
+        let mut g = self.buf.write().await;
+        let old_len = g.len() as u64;
+        g.clear();
+        // Order matters: bump the offset *after* truncating so an
+        // observer can't see `base_offset > buf-end`.
+        self.base_offset.fetch_add(old_len, Ordering::AcqRel);
+        // Wake everyone so cursors past the new base get to re-check
+        // (they'll see "caught up" and re-park, which is the intended
+        // behaviour — they're now waiting for the next turn).
+        self.notify.notify_waiters();
+    }
 }
 
 #[cfg(test)]
@@ -132,5 +164,67 @@ mod tests {
         let r = s.subscribe();
         // Reader should see the buffered bytes (it attached at base_offset).
         assert_eq!(r.cursor(), 0);
+    }
+
+    #[tokio::test]
+    async fn clear_advances_base_offset_by_old_len() {
+        let s = Arc::new(SessionState::new());
+        s.append(b"first turn payload").await;
+        assert_eq!(s.base_offset.load(Ordering::Acquire), 0);
+        assert_eq!(s.end_cursor(), b"first turn payload".len() as u64);
+
+        s.clear_after_commit().await;
+        assert_eq!(
+            s.base_offset.load(Ordering::Acquire),
+            b"first turn payload".len() as u64
+        );
+        assert_eq!(s.buf.read().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn reader_past_end_sees_empty_after_clear_then_next_turn() {
+        use tokio::io::AsyncReadExt;
+        use tokio::time::{timeout, Duration};
+
+        let s = Arc::new(SessionState::new());
+        s.append(b"turnA").await;
+
+        let mut r = s.subscribe();
+        let mut out = [0u8; 32];
+        let n = r.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"turnA");
+
+        // Worker commits: clear + bump base_offset.
+        s.clear_after_commit().await;
+
+        // Reader is now "past the new base". Next read parks until the
+        // worker appends turn B.
+        let parked = timeout(Duration::from_millis(50), r.read(&mut out)).await;
+        assert!(parked.is_err(), "reader should park after clear");
+
+        // Append turn B, reader wakes and resumes from its absolute cursor.
+        s.append(b"turnB-bytes").await;
+        let n = timeout(Duration::from_millis(500), r.read(&mut out))
+            .await
+            .expect("woke")
+            .expect("read ok");
+        assert_eq!(&out[..n], b"turnB-bytes");
+    }
+
+    #[tokio::test]
+    async fn fresh_reader_after_clear_sees_only_new_turn() {
+        use tokio::io::AsyncReadExt;
+
+        let s = Arc::new(SessionState::new());
+        s.append(b"turnA").await;
+        s.clear_after_commit().await;
+        s.append(b"turnB").await;
+
+        // A reader created AFTER the clear should see only turn B
+        // (its cursor starts at the new base_offset, which is past A).
+        let mut r = s.subscribe();
+        let mut out = [0u8; 32];
+        let n = r.read(&mut out).await.unwrap();
+        assert_eq!(&out[..n], b"turnB");
     }
 }
