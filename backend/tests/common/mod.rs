@@ -79,14 +79,22 @@ impl TestApp {
         chunk_embedder: Option<Arc<dyn Embedder>>,
         document_embedder: Option<Arc<dyn Embedder>>,
     ) -> Self {
-        Self::build_inner(text_extractor, chunk_embedder, document_embedder).await
+        Self::build_inner(None, text_extractor, chunk_embedder, document_embedder).await
     }
 
     pub async fn build() -> Self {
-        Self::build_inner(None, None, None).await
+        Self::build_inner(None, None, None, None).await
+    }
+
+    /// Build with a custom `LlmClient`. Used by tests that need the worker
+    /// to pause/error/etc — e.g. `chat_stop.rs` uses a parking LLM so the
+    /// stop endpoint has a live worker to cancel.
+    pub async fn build_with_llm(llm: Arc<dyn delphi::llm::LlmClient>) -> Self {
+        Self::build_inner(Some(llm), None, None, None).await
     }
 
     async fn build_inner(
+        llm: Option<Arc<dyn delphi::llm::LlmClient>>,
         text_extractor: Option<Arc<dyn TextExtractor>>,
         chunk_embedder: Option<Arc<dyn Embedder>>,
         document_embedder: Option<Arc<dyn Embedder>>,
@@ -156,7 +164,7 @@ impl TestApp {
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
         let session_registry = Arc::new(SessionRegistry::new());
         let state = AppState {
-            llm: Arc::new(FakeLlmClient::default()),
+            llm: llm.unwrap_or_else(|| Arc::new(FakeLlmClient::default())),
             session_registry: session_registry.clone(),
             request_db_pool: request_pool.clone(),
             object_store: object_store.clone(),

@@ -128,6 +128,36 @@ impl SessionState {
         self.finalize_lock.lock().await
     }
 
+    /// True if a worker has installed a per-turn cancellation token and
+    /// hasn't yet cleared it. Used by tests to wait deterministically
+    /// for the worker to reach its `select!` loop; not used in
+    /// production code paths.
+    pub async fn has_active_turn(&self) -> bool {
+        self.current_turn_cancel.lock().await.is_some()
+    }
+
+    /// Install a per-turn cancellation token. **Tests only** — the
+    /// production install happens inside [`crate::chat::worker::run`].
+    /// Lets `tests/chat_stop.rs` exercise the endpoint wiring without
+    /// spawning a real worker (which would hog the single-slot in-memory
+    /// pool).
+    #[doc(hidden)]
+    pub async fn set_current_turn_for_test(&self, token: CancellationToken) {
+        let mut g = self.current_turn_cancel.lock().await;
+        *g = Some(token);
+    }
+
+    /// Cancel the in-flight turn for this session, if any. No-op when no
+    /// worker is running (or the worker is past its `select!` loop and
+    /// already in the finalize path). Idempotent — cancelling an
+    /// already-cancelled token is a cheap no-op.
+    pub async fn cancel_current_turn(&self) {
+        let g = self.current_turn_cancel.lock().await;
+        if let Some(token) = g.as_ref() {
+            token.cancel();
+        }
+    }
+
     /// Truncate the buffer at the end of a committed turn. Bumps
     /// `base_offset` by the cleared length so reader cursors stay
     /// consistent across the boundary — a reader whose cursor is past
