@@ -6,9 +6,15 @@
 //!   `0:<json string>\n`  → text delta
 //!   `2:<json array>\n`   → data block (citations payload lives here)
 //!   `3:<json string>\n`  → error message
-//!   `d:<json object>\n`  → finish marker (with finish reason)
+//!   `8:<json object>\n`  → task announcement (delphi extension)
+//!   `d:<json object>\n`  → finish marker (with finish reason + assistant id)
 //!
 //! Reference: <https://sdk.vercel.ai/docs/ai-sdk-ui/stream-protocol>
+//!
+//! The `8:` task frame is a delphi-side extension: it carries the
+//! `task_id` the client needs in order to call `/stop/{task_id}`. The
+//! AI SDK parser ignores unknown tags, so emitting it is safe against
+//! any consumer that follows the official spec.
 
 use serde::Serialize;
 use serde_json::json;
@@ -23,9 +29,23 @@ pub fn error(msg: &str) -> String {
     format!("3:{}\n", serde_json::to_string(msg).unwrap_or_else(|_| "\"\"".into()))
 }
 
+/// Task announcement — emitted **first** on the stream so the client
+/// knows the `task_id` before any text arrives. Used by the stop button
+/// to address the worker.
+pub fn task(task_id: &str) -> String {
+    let body = json!({ "taskId": task_id });
+    format!("8:{}\n", body)
+}
+
 /// Final finish marker. `reason` is e.g. "stop", "length", "error".
-pub fn finish(reason: &str) -> String {
-    let body = json!({ "finishReason": reason });
+/// `assistant_message_id` is the record id of the persisted assistant
+/// reply (used by the client as `parent_id` for the next submit). Pass
+/// an empty string when no message was persisted (cancelled turn).
+pub fn finish(reason: &str, assistant_message_id: &str) -> String {
+    let body = json!({
+        "finishReason": reason,
+        "assistantMessageId": assistant_message_id,
+    });
     format!("d:{}\n", body)
 }
 
@@ -72,9 +92,23 @@ mod tests {
     }
 
     #[test]
+    fn task_snapshot() {
+        assert_eq!(
+            task("01JABCDXYZ"),
+            "8:{\"taskId\":\"01JABCDXYZ\"}\n"
+        );
+    }
+
+    #[test]
     fn finish_snapshot() {
-        assert_eq!(finish("stop"), "d:{\"finishReason\":\"stop\"}\n");
-        assert_eq!(finish("error"), "d:{\"finishReason\":\"error\"}\n");
+        assert_eq!(
+            finish("stop", "message:abc"),
+            "d:{\"finishReason\":\"stop\",\"assistantMessageId\":\"message:abc\"}\n"
+        );
+        assert_eq!(
+            finish("error", ""),
+            "d:{\"finishReason\":\"error\",\"assistantMessageId\":\"\"}\n"
+        );
     }
 
     #[test]

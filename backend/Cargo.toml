@@ -33,6 +33,9 @@ tower-http = { version = "0.6", features = ["trace", "fs"] }
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "process", "fs"] }
 tokio-util = { version = "0.7", features = ["io"] }
+# `ReceiverStream` adapts the per-turn mpsc::Receiver into a
+# `Stream<Item = Bytes>` that axum's `Body::from_stream` consumes.
+tokio-stream = { version = "0.1", features = ["sync"] }
 async-trait = "0.1"
 futures = "0.3"
 
@@ -82,6 +85,15 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 # `Bytes` is in our `ObjectStore` API to avoid copies when piping PDFs
 # from `reqwest` through to disk.
 bytes = "1"
+
+# Lock-free sharded map. The chat task registry maps TaskId →
+# CancellationToken; per-request inserts/removes hit different shards,
+# avoiding the global mutex we'd otherwise need around a HashMap.
+dashmap = "6"
+
+# ULIDs for chat task ids (client-generated, server-mirrored). Tiny
+# (no extra deps beyond getrandom which we already pull in transitively).
+ulid = "1"
 
 # (added later when wired up)
 # rmcp = "0.2"
