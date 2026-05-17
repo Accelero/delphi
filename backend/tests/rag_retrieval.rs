@@ -9,11 +9,9 @@
 //!   adjacent ordinals,
 //! - the stream ends with the expected `0:`/`d:` records.
 //!
-//! Note the contract since the POST/GET split (chat-streaming redesign):
-//! POST `/messages` returns 202 immediately and the bytes arrive on the
-//! separate GET `/stream` subscription. The test therefore opens the
-//! stream first, fires the POST, then drains the stream until the
-//! trailing `d:` finish frame and closes.
+//! Contract post-redesign: POST `/messages` returns 200 with the
+//! AI SDK stream as its body. We read the body directly until the
+//! trailing `d:` frame.
 
 mod common;
 
@@ -163,27 +161,11 @@ async fn chat_streams_citations_block_before_text() {
     let conv_id = created["id"].as_str().expect("conv id").to_string();
     let key = key_of(&conv_id);
 
-    // Open the stream FIRST, before the POST, so we don't miss any bytes.
-    let stream_resp = client
-        .get(format!("{base_url}/api/chat/conversations/{key}/stream"))
-        .bearer_auth(&bearer)
-        .send()
-        .await
-        .expect("open stream");
-    assert_eq!(stream_resp.status().as_u16(), 200);
-    assert_eq!(
-        stream_resp
-            .headers()
-            .get("x-vercel-ai-data-stream")
-            .and_then(|v| v.to_str().ok()),
-        Some("v1"),
-        "stream must announce the AI SDK data-stream protocol",
-    );
-    let mut bytes = stream_resp.bytes_stream();
-
-    // Submit the user message.
+    // Submit the user message — the response body IS the AI SDK stream.
     let body = json!({
-        "messages": [{ "role": "user", "content": "chunk content 2" }]
+        "id": "01HXY0000000000000000000ZZ",
+        "text": "chunk content 2",
+        "parent_id": null,
     });
     let post = client
         .post(format!("{base_url}/api/chat/conversations/{key}/messages"))
@@ -193,13 +175,15 @@ async fn chat_streams_citations_block_before_text() {
         .send()
         .await
         .expect("post message");
+    assert_eq!(post.status().as_u16(), 200);
     assert_eq!(
-        post.status().as_u16(),
-        202,
-        "POST should be fire-and-forget; got {}: {}",
-        post.status(),
-        post.text().await.unwrap_or_default()
+        post.headers()
+            .get("x-vercel-ai-data-stream")
+            .and_then(|v| v.to_str().ok()),
+        Some("v1"),
+        "POST must announce the AI SDK data-stream protocol",
     );
+    let mut bytes = post.bytes_stream();
 
     // Drain the stream until we see the trailing `d:` frame, then bail.
     let mut acc = Vec::<u8>::new();
@@ -229,16 +213,23 @@ async fn chat_streams_citations_block_before_text() {
 
     let text = String::from_utf8(acc).expect("utf-8");
 
-    // The protocol opens with a `2:` data block carrying the citations.
-    let first_line = text.lines().next().unwrap_or_default();
+    // Frame ordering: first the `8:` task frame, then the `2:`
+    // citations block before any `0:` text. Find the citations line.
+    let mut lines = text.lines();
+    let task_line = lines.next().unwrap_or_default();
     assert!(
-        first_line.starts_with("2:"),
-        "expected leading `2:` citations block; got first line {first_line:?}\nfull: {text}",
+        task_line.starts_with("8:"),
+        "expected leading `8:` task frame; got first line {task_line:?}\nfull: {text}",
     );
-    let body_json = &first_line[2..];
+    let citations_line = lines.next().unwrap_or_default();
+    assert!(
+        citations_line.starts_with("2:"),
+        "expected `2:` citations block right after the task frame; got {citations_line:?}\nfull: {text}",
+    );
+    let body_json = &citations_line[2..];
     let parsed: serde_json::Value = serde_json::from_str(body_json).expect("json");
     let chunks_arr = parsed[0]["chunks"].as_array().expect("chunks array");
-    assert!(!chunks_arr.is_empty(), "no citations: {first_line}");
+    assert!(!chunks_arr.is_empty(), "no citations: {citations_line}");
 
     // Text-delta + finish marker round out the stream.
     assert!(text.contains("0:\"ok\""), "expected text delta in: {text}");

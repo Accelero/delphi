@@ -1,35 +1,40 @@
 //! Per-turn background worker.
 //!
-//! Spawned by `POST /api/chat/conversations/{id}/messages` after the
-//! user message is persisted. The worker:
+//! Spawned by `POST /api/chat/conversations/{id}/messages`. The worker:
 //!
-//! 1. Acquires `turn_lock` (serialises against any in-flight or queued
-//!    turn for the same session).
-//! 2. Checks out its own [`AuthedDb`] from the pool using the caller's
+//! 1. Acquires its own [`AuthedDb`] from the pool using the caller's
 //!    snapshotted bearer (`AuthedDb` is `!Clone` and released-on-Drop,
-//!    so it can't be smuggled past the request that minted it — see
-//!    the storage module's pool comments).
+//!    so we don't smuggle the request's handle — we mint a fresh one
+//!    here. See the storage module's pool comments).
+//! 2. Emits the `8:` task frame (so the client can address /stop), and
+//!    a `2:` citations block if RAG retrieval yielded any.
 //! 3. Loads history + optionally runs RAG retrieval, builds the prompt.
-//! 4. Streams the LLM reply, appending framed `proto::*` bytes to the
-//!    session buffer after every delta.
-//! 5. Stop button: a per-turn [`CancellationToken`] races each delta;
-//!    on cancel we emit `proto::finish("stop")` and persist whatever
-//!    we have, identical to the clean-finish path.
-//! 6. Under `finalize_lock`: write the assistant message, run the
-//!    best-effort title generator if the conversation was unnamed,
-//!    then clear the buffer (advancing `base_offset`).
-//! 7. Drops its `Arc<SessionState>` and the `Semaphore` permit. Any
-//!    queued submission's worker wakes up and runs next.
+//! 4. Streams the LLM reply into the caller's mpsc as framed `proto::*`
+//!    bytes.
+//! 5. Stop button: a per-turn [`CancellationToken`] races each delta.
+//!    On cancel we **discard** — the client already aborted, nothing to
+//!    persist.
+//! 6. On natural EOF / mid-stream error we commit the user+assistant
+//!    pair atomically via [`Storage::commit_turn`] (last-writer-wins
+//!    against any racing turn against the same parent), then emit the
+//!    trailing `d:` frame carrying the assistant message id.
+//! 7. Title generation runs once after commit if the conversation was
+//!    unnamed. Best-effort; failure doesn't affect the `d:` emission.
 //!
-//! Errors at any stage emit `proto::error(...)` into the buffer and
-//! fall through to the same persist+commit path — the partial reply
-//! is still a reply.
+//! ### Backpressure on the response body
+//!
+//! `try_send` errors when the client has dropped the response body
+//! (chat switch / tab close) are **ignored**. The worker keeps pulling
+//! from the LLM and commits at the end — that's the "chat switch
+//! survives" property called out in the design doc.
 
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::StreamExt;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -39,13 +44,18 @@ use crate::embedder::Embedder;
 use crate::llm::{LlmClient, LlmDelta, LlmMessage, Role};
 use crate::state::AppState;
 use crate::storage::{
-    AuthedDb, ChatMessage, ChunkSearchResult, ConversationId, Filters, RequestDbPool, Storage,
+    AuthedDb, ChatMessage, ChunkSearchResult, ConversationId, Filters, MessageId, RequestDbPool,
+    Storage,
 };
 
-use super::state::SessionState;
+use super::registry::{TaskId, TaskRegistry};
 
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_NEIGHBOR_RADIUS: i64 = 1;
+/// Capacity for the per-turn mpsc. Sized generously for chat-rate
+/// streaming so the LLM loop never blocks on a slow socket — when the
+/// client drops, `try_send` returns `Disconnected` and we ignore it.
+const STREAM_CHANNEL_CAPACITY: usize = 64;
 
 /// Reason the turn ended. Reported as the `finishReason` in the
 /// trailing `d:` frame and used for tracing.
@@ -53,8 +63,8 @@ const DEFAULT_NEIGHBOR_RADIUS: i64 = 1;
 enum StopReason {
     /// LLM stream ran to completion.
     Eof,
-    /// User clicked the stop button (or any tab POSTed `/stop`).
-    User,
+    /// User clicked the stop button → `/stop/{task_id}` cancelled us.
+    Cancelled,
     /// Upstream returned an error mid-stream.
     Error,
 }
@@ -63,125 +73,131 @@ impl StopReason {
     fn wire(self) -> &'static str {
         match self {
             StopReason::Eof => "stop",
-            StopReason::User => "stop",
+            StopReason::Cancelled => "stop",
             StopReason::Error => "error",
         }
     }
 }
 
-/// Everything the worker needs to drive one turn. Constructed by the
-/// POST handler after it persists the user message and resolves the
-/// caller's identity. Plain-data, owned values only — the worker
-/// outlives the request that spawned it.
+/// Everything the worker needs to drive one turn. Owned values only —
+/// the worker outlives the request that spawned it.
 pub struct TurnRequest {
     pub conversation_id: ConversationId,
+    /// Client-generated ULID (no `message:` prefix). Becomes the record
+    /// id of the persisted user message.
+    pub user_message_id: String,
     pub user_text: String,
-    pub conversation_had_title: bool,
+    /// Last known assistant message id (or `None` for the first turn).
+    /// `commit_turn` uses this to "last-writer-wins" against any racing
+    /// turn submitted against the same parent.
+    pub parent_id: Option<MessageId>,
     /// JWT we'll feed to `pool.acquire(bearer)` to get a fresh
     /// `AuthedDb`. Same value the original request used.
     pub bearer: String,
-    /// Caller identity, snapshotted from the request. Kept for tracing
-    /// — the actual DB-side identity comes from the bearer.
+    /// Caller identity, snapshotted from the request. Kept for tracing;
+    /// the DB-side identity comes from the bearer.
     pub auth: AuthContext,
-    /// Shared LLM / embedder handles cloned from `AppState`.
     pub llm: Arc<dyn LlmClient>,
     pub chunk_embedder: Option<Arc<dyn Embedder>>,
     pub pool: RequestDbPool,
 }
 
-/// Spawn the worker. Caller passes in the session state (kept alive
-/// by the returned future + any attached readers); the future itself
-/// is detached via `tokio::spawn` so the POST handler can return 202
-/// immediately.
-pub fn spawn(state: Arc<SessionState>, req: TurnRequest) {
-    tokio::spawn(run(state, req));
-}
-
-async fn run(state: Arc<SessionState>, req: TurnRequest) {
-    // Acquire the turn semaphore. The permit drops with `_permit` at
-    // the end of this function — that's how queued submissions get
-    // the green light. We don't `forget()` the permit on any branch.
-    let _permit = match state.turn_lock.acquire().await {
-        Ok(p) => p,
-        Err(_) => {
-            // Semaphore closed — only happens at process shutdown.
-            warn!(conv = %req.conversation_id, "turn_lock closed; aborting worker");
-            return;
-        }
-    };
-
-    // Install the cancellation token for the stop endpoint to find.
+/// Spawn the worker. Allocates the [`TaskId`], registers a fresh cancel
+/// token, sets up the mpsc, and detaches the worker future. Returns the
+/// task id (so the POST handler can record-keep / log) and the receiver
+/// (which the handler wraps in a `Body::from_stream`).
+pub fn spawn_worker(
+    tasks: Arc<TaskRegistry>,
+    req: TurnRequest,
+) -> (TaskId, mpsc::Receiver<Bytes>) {
+    let task_id = TaskId::new();
     let cancel = CancellationToken::new();
-    {
-        let mut g = state.current_turn_cancel.lock().await;
-        *g = Some(cancel.clone());
-    }
+    tasks.insert(task_id, cancel.clone());
 
-    let outcome = drive_turn(&state, &req, &cancel).await;
-
-    // Drop the per-turn cancel handle on exit so a stale stop request
-    // can't fire against the next turn's worker.
-    {
-        let mut g = state.current_turn_cancel.lock().await;
-        *g = None;
-    }
-
-    // _permit drops here, releasing the semaphore for the next queued submission.
-    drop(_permit);
-
-    // Tracing-only — failures inside drive_turn already emitted their own bytes.
-    if let Err(e) = outcome {
-        error!(conv = %req.conversation_id, error = %e, "turn ended with internal error");
-    }
+    let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
+    tokio::spawn(run(tasks, task_id, cancel, tx, req));
+    (task_id, rx)
 }
 
-/// Returns Ok(()) when the turn ran end-to-end (clean or partial); an
-/// Err only signals an internal/coding failure that prevented us from
-/// even attempting the LLM call. Stream-side errors are folded into
-/// the buffer as `proto::error` + `proto::finish("error")`.
+async fn run(
+    tasks: Arc<TaskRegistry>,
+    task_id: TaskId,
+    cancel: CancellationToken,
+    tx: mpsc::Sender<Bytes>,
+    req: TurnRequest,
+) {
+    // Always remove ourselves from the registry on exit, regardless of
+    // how the turn ends.
+    let _guard = scopeguard(move || {
+        let _ = tasks.remove(&task_id);
+    });
+
+    // First wire frame: tell the client our task id.
+    let _ = tx.try_send(Bytes::from(proto::task(&task_id.to_string())));
+
+    let outcome = drive_turn(task_id, &cancel, &tx, &req).await;
+
+    if let Err(e) = outcome {
+        error!(conv = %req.conversation_id, task = %task_id, error = %e, "turn ended with internal error");
+    }
+    // _guard drops here → tasks.remove fires.
+}
+
+/// Drive one full turn. `try_send`-failures on `tx` are intentionally
+/// ignored — the client may have dropped the body; we keep going and
+/// commit at the end.
 async fn drive_turn(
-    state: &Arc<SessionState>,
-    req: &TurnRequest,
+    task_id: TaskId,
     cancel: &CancellationToken,
+    tx: &mpsc::Sender<Bytes>,
+    req: &TurnRequest,
 ) -> Result<(), String> {
-    // Pool checkout — happens fresh on every turn, on the worker side.
-    // `AuthedDb` is `!Clone`/pool-released; we keep it for the duration
-    // of this turn and drop it at the end so the connection goes back
-    // to the pool.
+    // Pool checkout — fresh `AuthedDb` for this worker, released back
+    // when this function returns.
     let db = match req.pool.acquire(&req.bearer).await {
         Ok(d) => d,
         Err(e) => {
             error!(conv = %req.conversation_id, error = %e, "worker pool acquire failed");
-            state
-                .append(proto::error("auth setup failed").as_bytes())
-                .await;
-            state
-                .append(proto::finish("error").as_bytes())
-                .await;
+            let _ = tx.try_send(Bytes::from(proto::error("auth setup failed")));
+            let _ = tx.try_send(Bytes::from(proto::finish("error", "")));
             return Err(format!("pool acquire: {e}"));
         }
     };
 
-    // Load history. The user message was already persisted by the POST
-    // handler, so it shows up here.
+    // Load committed history (the user message we're about to commit is
+    // NOT persisted yet — `commit_turn` writes it at the end).
     let history = match db.list_messages(&req.conversation_id).await {
         Ok(m) => m,
         Err(e) => {
             error!(conv = %req.conversation_id, error = %e, "list_messages failed");
-            state
-                .append(proto::error("history lookup failed").as_bytes())
-                .await;
-            state.append(proto::finish("error").as_bytes()).await;
+            let _ = tx.try_send(Bytes::from(proto::error("history lookup failed")));
+            let _ = tx.try_send(Bytes::from(proto::finish("error", "")));
             return Err(format!("list_messages: {e}"));
         }
     };
 
-    let mut prompt: Vec<LlmMessage> = history_to_llm(&history);
+    // Snapshot whether the conversation was unnamed BEFORE we run the
+    // commit.
+    let conversation_had_title = match db.get_conversation(&req.conversation_id).await {
+        Ok(Some(c)) => c.title.is_some(),
+        Ok(None) => false,
+        Err(e) => {
+            error!(conv = %req.conversation_id, error = %e, "get_conversation failed");
+            false
+        }
+    };
 
-    // RAG retrieval (best-effort). Same shape as the pre-redesign
-    // handler: embed the user's message, KNN, expand neighbours, prepend
-    // a `[N]`-tagged system message so the LLM can cite. Any failure
-    // falls through to the pre-RAG flow without erroring the chat.
+    let mut prompt: Vec<LlmMessage> = history_to_llm(&history);
+    // The user message isn't in `history` yet (we commit at the end);
+    // append it so the LLM sees the current turn.
+    prompt.push(LlmMessage {
+        role: Role::User,
+        content: req.user_text.clone(),
+    });
+
+    // RAG retrieval (best-effort). Same shape as before: embed the
+    // user's message, KNN, expand neighbours, prepend a `[N]`-tagged
+    // system message so the LLM can cite.
     let citations = if let Some(embedder) = req.chunk_embedder.clone() {
         match retrieve_for_query(&db, embedder.as_ref(), &req.user_text).await {
             Ok(r) => r,
@@ -203,49 +219,46 @@ async fn drive_turn(
                 content: system,
             },
         );
-        // Emit the `citations` data block first so the client has the
-        // table ready before any `[N]` markers in the text deltas.
         let entries = citation_entries(&citations);
-        state.append(proto::citations(&entries).as_bytes()).await;
+        let _ = tx.try_send(Bytes::from(proto::citations(&entries)));
     }
 
     info!(
         user_id = %req.auth.user_id,
         conv = %req.conversation_id,
+        task = %task_id,
         history_len = history.len(),
         "worker driving turn"
     );
 
-    // Open the LLM stream.
     let mut upstream = match req.llm.stream_chat(prompt).await {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "stream_chat init failed");
-            state.append(proto::error("llm error").as_bytes()).await;
-            state.append(proto::finish("error").as_bytes()).await;
+            let _ = tx.try_send(Bytes::from(proto::error("llm error")));
+            let _ = tx.try_send(Bytes::from(proto::finish("error", "")));
             return Err(format!("stream_chat: {e}"));
         }
     };
 
     // Per-delta loop. Cancellation races each `.next()`; on cancel we
-    // drop the upstream (which propagates a cancel to the provider via
-    // `rig`'s stream Drop) and break to the finalize path.
+    // DISCARD — nothing persisted, no `d:` frame (client already aborted).
     let mut assistant_buf = String::new();
     let stop_reason = loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                info!(conv = %req.conversation_id, "turn cancelled by user");
-                break StopReason::User;
+                info!(conv = %req.conversation_id, task = %task_id, "turn cancelled by /stop");
+                break StopReason::Cancelled;
             }
             item = upstream.next() => match item {
                 Some(Ok(LlmDelta::Text(t))) => {
                     assistant_buf.push_str(&t);
-                    state.append(proto::text(&t).as_bytes()).await;
+                    let _ = tx.try_send(Bytes::from(proto::text(&t)));
                 }
                 Some(Err(e)) => {
                     error!(error = %e, "llm stream error");
-                    state.append(proto::error("llm stream error").as_bytes()).await;
+                    let _ = tx.try_send(Bytes::from(proto::error("llm stream error")));
                     break StopReason::Error;
                 }
                 None => break StopReason::Eof,
@@ -253,28 +266,38 @@ async fn drive_turn(
         }
     };
 
-    // Drop the upstream stream explicitly so its Drop runs before we
-    // hold finalize_lock; for clean Eof this is a no-op, for User /
-    // Error it cancels the provider request.
-    drop(upstream);
+    drop(upstream); // run rig's stream Drop before commit
 
-    // Emit the trailing `d:` frame. Readers' "is streaming?" flag
-    // flips back to false on this frame.
-    state.append(proto::finish(stop_reason.wire()).as_bytes()).await;
-
-    // Finalize: persist + best-effort title + clear buffer. All under
-    // finalize_lock so the new-tab handshake can't observe a "neither
-    // in DB nor in buffer" gap.
-    let _g = state.lock_finalize().await;
-
-    if let Err(e) = db
-        .append_message(&req.conversation_id, "assistant", &assistant_buf)
-        .await
-    {
-        warn!(error = %e, "persisting assistant message failed");
+    if matches!(stop_reason, StopReason::Cancelled) {
+        // DISCARD: no DB write, no `d:` frame.
+        return Ok(());
     }
 
-    if req.conversation_had_title == false && !assistant_buf.is_empty() {
+    // Commit the user+assistant pair atomically.
+    let assistant_id = match db
+        .commit_turn(
+            &req.conversation_id,
+            &req.user_message_id,
+            &req.user_text,
+            req.parent_id.as_ref(),
+            &assistant_buf,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            error!(error = %e, "commit_turn failed");
+            let _ = tx.try_send(Bytes::from(proto::error("commit failed")));
+            let _ = tx.try_send(Bytes::from(proto::finish("error", "")));
+            return Err(format!("commit_turn: {e}"));
+        }
+    };
+
+    let assistant_id_str = assistant_id.to_string();
+
+    // Best-effort title generation after a successful commit. Failure
+    // doesn't affect the `d:` emission.
+    if !conversation_had_title && !assistant_buf.is_empty() {
         if let Some(title) =
             generate_title(req.llm.as_ref(), &req.user_text, &assistant_buf).await
         {
@@ -284,16 +307,16 @@ async fn drive_turn(
         }
     }
 
-    state.clear_after_commit().await;
-    drop(_g);
+    let _ = tx.try_send(Bytes::from(proto::finish(
+        stop_reason.wire(),
+        &assistant_id_str,
+    )));
 
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// helpers — these are intentionally close clones of the equivalents that
-// used to live in `api/chat.rs`. After step 6 the originals are deleted
-// and the worker becomes the single owner.
+// helpers — copied near-verbatim from the previous worker
 // ---------------------------------------------------------------------------
 
 fn history_to_llm(messages: &[ChatMessage]) -> Vec<LlmMessage> {
@@ -488,25 +511,47 @@ fn env_i64(key: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
-/// Build a `TurnRequest` from the conventional API-handler inputs. Lets
-/// `api::chat::post_message` stay small (it knows nothing about the
-/// worker internals beyond this constructor + `spawn`).
+/// Build a `TurnRequest` from conventional API-handler inputs. Keeps
+/// `api::chat::post_message` from having to know the worker's full
+/// field layout.
 pub fn turn_request(
     conversation_id: ConversationId,
+    user_message_id: String,
     user_text: String,
-    conversation_had_title: bool,
+    parent_id: Option<MessageId>,
     bearer: String,
     auth: AuthContext,
     app: &AppState,
 ) -> TurnRequest {
     TurnRequest {
         conversation_id,
+        user_message_id,
         user_text,
-        conversation_had_title,
+        parent_id,
         bearer,
         auth,
         llm: app.llm.clone(),
         chunk_embedder: app.chunk_embedder.clone(),
         pool: app.request_db_pool.clone(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// scopeguard — three-line replacement so we don't pull in a crate
+// ---------------------------------------------------------------------------
+
+struct ScopeGuard<F: FnOnce()> {
+    f: Option<F>,
+}
+
+impl<F: FnOnce()> Drop for ScopeGuard<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.f.take() {
+            f();
+        }
+    }
+}
+
+fn scopeguard<F: FnOnce()>(f: F) -> ScopeGuard<F> {
+    ScopeGuard { f: Some(f) }
 }

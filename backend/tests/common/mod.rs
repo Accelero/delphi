@@ -31,7 +31,7 @@ use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
     JwtClaimsExtractor, JwtValidator,
 };
-use delphi::chat::SessionRegistry;
+use delphi::chat::TaskRegistry;
 use delphi::embedder::Embedder;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
@@ -57,11 +57,10 @@ pub struct TestApp {
     /// can `subscribe()` to verify ingest fan-out without parsing the
     /// SSE stream.
     pub events: tokio::sync::broadcast::Sender<delphi::ingestion::FeedItemEvent>,
-    /// Same `SessionRegistry` the router holds in its `AppState`. Tests
-    /// that need to drive the chat-streaming handshake directly (e.g.,
-    /// `chat_handshake.rs`) reach in via this handle instead of going
-    /// through the HTTP path.
-    pub session_registry: Arc<SessionRegistry>,
+    /// Same `TaskRegistry` the router holds in its `AppState`. Tests
+    /// that need to inspect in-flight chat workers reach in via this
+    /// handle instead of going through the HTTP path.
+    pub tasks: Arc<TaskRegistry>,
     /// Same per-request pool the router uses; lets tests drive
     /// `commit_turn` and other request-path Storage methods directly
     /// against a JWT-authed handle (mint the bearer via
@@ -167,10 +166,10 @@ impl TestApp {
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
-        let session_registry = Arc::new(SessionRegistry::new());
+        let tasks = Arc::new(TaskRegistry::new());
         let state = AppState {
             llm: llm.unwrap_or_else(|| Arc::new(FakeLlmClient::default())),
-            session_registry: session_registry.clone(),
+            tasks: tasks.clone(),
             request_db_pool: request_pool.clone(),
             object_store: object_store.clone(),
             events: events_tx.clone(),
@@ -192,7 +191,7 @@ impl TestApp {
             default_tenant_id,
             default_tenant_slug,
             events: events_tx,
-            session_registry,
+            tasks,
             request_db_pool: request_pool,
         }
     }

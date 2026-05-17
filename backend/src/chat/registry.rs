@@ -1,118 +1,157 @@
-//! Process-global directory of live [`SessionState`]s.
+//! Process-global directory of in-flight chat workers.
 //!
-//! Keyed by `ConversationId`. Entries are [`Weak`] so a session
-//! collapses naturally when no `Arc` remains (worker finished + every
-//! reader disconnected). Lookups are lazy: a dead `Weak` is replaced
-//! on the next `get_or_create` call.
+//! Maps `TaskId → CancellationToken`. The POST handler inserts on
+//! worker spawn; the worker removes when it exits; the `/stop` endpoint
+//! cancels by id.
 //!
-//! The registry is cheap to clone (`Arc` internals) and lives in
-//! [`crate::state::AppState`] for the lifetime of the process.
+//! Lock-free via `DashMap` — every operation is one shard lookup, no
+//! global mutex. The registry is cheap to clone (`Arc` internals) and
+//! lives in [`crate::state::AppState`] for the lifetime of the process.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
 
-use crate::storage::ConversationId;
+/// Opaque task identifier. Wraps a ULID — short, sortable, URL-safe,
+/// and never collides at our cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TaskId(Ulid);
 
-use super::state::SessionState;
-
-/// Multi-conversation lookup table. One instance per backend process,
-/// kept inside `AppState`.
-pub struct SessionRegistry {
-    inner: RwLock<HashMap<ConversationId, Weak<SessionState>>>,
-}
-
-impl SessionRegistry {
+impl TaskId {
+    /// Mint a fresh, monotonically-increasing id. Used by the POST
+    /// handler when spawning a worker.
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
+        Self(Ulid::new())
     }
 
-    /// Return the existing `Arc<SessionState>` for `id`, or construct
-    /// (and register) a fresh one. Reaps a stale `Weak` if upgrade
-    /// fails. Take the write-lock once; we don't bother with the
-    /// read-then-upgrade dance because contention here is low (one
-    /// look-up per submit / per subscribe).
-    pub async fn get_or_create(&self, id: &ConversationId) -> Arc<SessionState> {
-        let mut g = self.inner.write().await;
-        if let Some(weak) = g.get(id) {
-            if let Some(strong) = weak.upgrade() {
-                return strong;
-            }
-        }
-        let fresh = Arc::new(SessionState::new());
-        g.insert(id.clone(), Arc::downgrade(&fresh));
-        fresh
-    }
-
-    /// Read-only lookup. Returns `None` if no live session is registered
-    /// (either never created, or the `Weak` has gone dead). Used by the
-    /// stop endpoint, which has nothing to cancel when no worker is
-    /// running.
-    pub async fn lookup(&self, id: &ConversationId) -> Option<Arc<SessionState>> {
-        let g = self.inner.read().await;
-        g.get(id).and_then(Weak::upgrade)
+    /// Parse the canonical 26-character Crockford-base32 representation
+    /// the client / `/stop` URL carries.
+    pub fn parse(s: &str) -> Result<Self, ulid::DecodeError> {
+        Ulid::from_string(s).map(Self)
     }
 }
 
-impl Default for SessionRegistry {
+impl Default for TaskId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl fmt::Display for TaskId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for TaskId {
+    type Err = ulid::DecodeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+/// Live chat-worker handles, keyed by `TaskId`. Cloneable cheaply —
+/// internals are `Arc`-counted.
+#[derive(Clone, Default)]
+pub struct TaskRegistry {
+    inner: Arc<DashMap<TaskId, CancellationToken>>,
+}
+
+impl TaskRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Register a new task. Overwrites any prior entry for the same id
+    /// (id collisions don't happen in practice — ULIDs are unique by
+    /// construction).
+    pub fn insert(&self, id: TaskId, token: CancellationToken) {
+        self.inner.insert(id, token);
+    }
+
+    /// Drop the task's entry. Returns its `CancellationToken` so the
+    /// caller (the worker on exit, typically) can drop it explicitly if
+    /// they want.
+    pub fn remove(&self, id: &TaskId) -> Option<CancellationToken> {
+        self.inner.remove(id).map(|(_, t)| t)
+    }
+
+    /// Cancel the named task. Returns `true` if the task was present
+    /// (the `/stop` endpoint uses this just to log; the response is
+    /// 204 either way per the design doc).
+    pub fn cancel(&self, id: &TaskId) -> bool {
+        match self.inner.remove(id) {
+            Some((_, token)) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Number of live tasks. Convenience for tracing / metrics; not
+    /// load-bearing.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use surrealdb::RecordId;
 
-    fn cid(k: &str) -> ConversationId {
-        RecordId::from(("conversation", k))
+    #[test]
+    fn task_id_round_trips_through_string() {
+        let id = TaskId::new();
+        let s = id.to_string();
+        assert_eq!(s.len(), 26, "ULID canonical form is 26 chars");
+        let parsed = TaskId::parse(&s).expect("parse back");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn task_id_rejects_garbage() {
+        assert!(TaskId::parse("not a ulid").is_err());
+        assert!(TaskId::parse("").is_err());
     }
 
     #[tokio::test]
-    async fn get_or_create_returns_same_arc_for_same_id() {
-        let r = SessionRegistry::new();
-        let a = r.get_or_create(&cid("alpha")).await;
-        let b = r.get_or_create(&cid("alpha")).await;
-        assert!(Arc::ptr_eq(&a, &b));
+    async fn insert_then_cancel_flips_the_token() {
+        let r = TaskRegistry::new();
+        let id = TaskId::new();
+        let token = CancellationToken::new();
+        r.insert(id, token.clone());
+        assert!(!token.is_cancelled());
+        assert!(r.cancel(&id));
+        assert!(token.is_cancelled());
+        // Cancelling again is a no-op (entry already removed).
+        assert!(!r.cancel(&id));
     }
 
     #[tokio::test]
-    async fn distinct_ids_get_distinct_state() {
-        let r = SessionRegistry::new();
-        let a = r.get_or_create(&cid("alpha")).await;
-        let b = r.get_or_create(&cid("beta")).await;
-        assert!(!Arc::ptr_eq(&a, &b));
+    async fn remove_returns_the_token_without_cancelling() {
+        let r = TaskRegistry::new();
+        let id = TaskId::new();
+        let token = CancellationToken::new();
+        r.insert(id, token.clone());
+        let returned = r.remove(&id).expect("present");
+        assert!(!returned.is_cancelled(), "remove must not cancel");
+        assert!(r.is_empty());
     }
 
     #[tokio::test]
-    async fn lookup_is_none_for_unknown_id() {
-        let r = SessionRegistry::new();
-        assert!(r.lookup(&cid("nope")).await.is_none());
-    }
-
-    #[tokio::test]
-    async fn dead_weak_is_reaped_and_replaced() {
-        let r = SessionRegistry::new();
-        let a = r.get_or_create(&cid("alpha")).await;
-        let a_ptr = Arc::as_ptr(&a) as usize;
-        drop(a);
-        // After all strong refs dropped, the next get_or_create returns a
-        // brand-new state, not the dead weak's address.
-        let b = r.get_or_create(&cid("alpha")).await;
-        assert_ne!(Arc::as_ptr(&b) as usize, a_ptr);
-    }
-
-    #[tokio::test]
-    async fn lookup_returns_live_state_only() {
-        let r = SessionRegistry::new();
-        let a = r.get_or_create(&cid("alpha")).await;
-        assert!(r.lookup(&cid("alpha")).await.is_some());
-        drop(a);
-        // Weak still in the map but upgrade fails ⇒ lookup is None.
-        assert!(r.lookup(&cid("alpha")).await.is_none());
+    async fn cancel_unknown_is_false() {
+        let r = TaskRegistry::new();
+        assert!(!r.cancel(&TaskId::new()));
     }
 }

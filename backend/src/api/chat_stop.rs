@@ -1,14 +1,14 @@
-//! Stop the in-flight turn for a conversation.
+//! Stop a named chat-worker.
 //!
-//! Route: `POST /api/chat/conversations/{id}/stop`.
+//! Route: `POST /api/chat/conversations/{key}/tasks/{task_id}/stop`.
 //!
-//! Idempotent: returns `204 No Content` whether or not a worker was
-//! actually running. Any tab attached to the conversation can call this;
-//! all of them see the worker's `proto::finish("stop")` frame on the
-//! same open stream the moment the worker reacts.
+//! Idempotent: returns `204 No Content` whether or not the task was
+//! found. Any caller authenticated for the conversation can hit it.
 //!
-//! See [`docs/architecture/chat-streaming.md`](../../../docs/architecture/chat-streaming.md)
-//! § Stop button for the design.
+//! The PERMISSIONS pre-check (via `get_conversation`) is what keeps
+//! anonymous callers from probing for valid task ids across
+//! conversations they don't own — without it, a /stop would 204 for
+//! any string and leak the task id space.
 
 use std::sync::Arc;
 
@@ -18,6 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use surrealdb::RecordId;
 
+use crate::chat::TaskId;
 use crate::state::AppState;
 use crate::storage::{AuthedDb, ConversationId, Storage};
 
@@ -29,23 +30,18 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     Ok(RecordId::from(("conversation", k)))
 }
 
-/// POST handler. Cancels the per-turn token if one is installed; returns
-/// 204 either way. The worker reacts asynchronously: its `tokio::select!`
-/// breaks on `cancel.cancelled()`, the trailing `proto::finish("stop")`
-/// frame goes into the buffer, the partial assistant reply is persisted,
-/// and the semaphore permit drops so any queued submission proceeds.
-pub async fn stop_message(
+pub async fn stop(
     State(app): State<AppState>,
     Extension(db): Extension<Arc<AuthedDb>>,
-    Path(key): Path<String>,
+    Path((conv_key, task_key)): Path<(String, String)>,
 ) -> Response {
-    let conv_id = match parse_conversation_id(&key) {
+    let conv_id = match parse_conversation_id(&conv_key) {
         Ok(id) => id,
         Err(r) => return r,
     };
 
-    // PERMISSIONS gate: identical to the GET handlers — a caller without
-    // visibility on this conversation gets the same 404 they'd see
+    // PERMISSIONS gate: same shape as the chat endpoints — a caller
+    // who can't see the conversation gets the same 404 they'd see
     // anywhere else, rather than a 204 leak.
     match db.get_conversation(&conv_id).await {
         Ok(Some(_)) => {}
@@ -56,8 +52,14 @@ pub async fn stop_message(
         }
     }
 
-    if let Some(session) = app.session_registry.lookup(&conv_id).await {
-        session.cancel_current_turn().await;
-    }
+    let task_id = match TaskId::parse(&task_key) {
+        Ok(t) => t,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid task id").into_response(),
+    };
+
+    // Best-effort: no-op if the task is absent (already completed or
+    // never existed). The design doc spells this out — the response is
+    // 204 either way.
+    let _ = app.tasks.cancel(&task_id);
     StatusCode::NO_CONTENT.into_response()
 }

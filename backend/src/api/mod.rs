@@ -2,7 +2,6 @@
 
 mod chat;
 mod chat_stop;
-mod chat_stream;
 mod chunks;
 mod conversations;
 mod discovery;
@@ -24,7 +23,7 @@ use crate::auth::{
     self, service_identity_from_env, validator_from_jwt_access, AuthConfig, AuthMode,
     ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
-use crate::chat::SessionRegistry;
+use crate::chat::TaskRegistry;
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
@@ -122,7 +121,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     let state = AppState {
         llm,
-        session_registry: Arc::new(SessionRegistry::new()),
+        tasks: Arc::new(TaskRegistry::new()),
         request_db_pool: request_pool.clone(),
         object_store: object_store.clone(),
         events: events_tx,
@@ -238,12 +237,8 @@ pub fn build_router(
             post(chat::post_message),
         )
         .route(
-            "/api/chat/conversations/{key}/stream",
-            get(chat_stream::stream),
-        )
-        .route(
-            "/api/chat/conversations/{key}/stop",
-            post(chat_stop::stop_message),
+            "/api/chat/conversations/{key}/tasks/{task_id}/stop",
+            post(chat_stop::stop),
         )
         .route("/api/auth/me", get(auth::me))
         .route(

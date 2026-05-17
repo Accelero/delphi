@@ -2,81 +2,59 @@
 //!
 //! Route: `POST /api/chat/conversations/{id}/messages`.
 //!
-//! Lifecycle (post-redesign — see
+//! Post-redesign (see
 //! [`docs/architecture/chat-streaming.md`](../../../docs/architecture/chat-streaming.md)):
+//! the POST **is** the stream. The response body is the AI SDK
+//! data-stream emitted by the worker spawned for this turn. There is no
+//! separate `/stream` subscription.
 //!
-//!  1. Verify the conversation exists for this caller (PERMISSIONS gate).
-//!  2. Persist the user message synchronously — a crash here still
-//!     leaves the user's words in the log.
-//!  3. Look up (or create) the live [`SessionState`] for this
-//!     conversation in the [`SessionRegistry`].
-//!  4. Spawn the per-turn worker. The worker checks out its own
-//!     `AuthedDb` from the pool, runs RAG + LLM, and commits the
-//!     assistant message — all detached from this request.
-//!  5. Return **202 Accepted** with an empty body.
+//! Lifecycle:
 //!
-//! The response is *not* the LLM stream. Clients subscribe to
-//! `GET /api/chat/conversations/{id}/stream` to receive bytes, and
-//! that subscription survives both the POST request and the tab that
-//! sent it.
+//!  1. Parse + basic validation on `{ id, text, parent_id }`.
+//!  2. PERMISSIONS gate: `get_conversation` on the caller's
+//!     [`AuthedDb`].
+//!  3. Optimistic concurrency check: `parent_id` must match the
+//!     conversation's tail. Mismatch → `409 Conflict`.
+//!  4. Spawn the worker; wrap its mpsc receiver in a streaming
+//!     response body.
+//!  5. Return 200 with the AI SDK headers and the stream as body.
+//!
+//! The first frame on the stream is the `8:` task frame, so the client
+//! knows the `task_id` before any text arrives.
 
+use std::convert::Infallible;
+use std::sync::Arc;
+
+use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
+use bytes::Bytes;
 use serde::Deserialize;
-use std::sync::Arc;
 use surrealdb::RecordId;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt as _;
 use tracing::{error, info};
 
 use crate::auth::AuthContext;
 use crate::chat::{spawn_worker, turn_request};
 use crate::state::AppState;
-use crate::storage::{AuthedDb, ConversationId, Storage};
+use crate::storage::{AuthedDb, ConversationId, MessageId, Storage};
 
-/// Body sent by the SPA's submit hook. Extra fields are ignored.
+/// Body sent by the SPA's submit hook.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
+    /// Client-generated ULID for the user message. The server takes
+    /// this verbatim as the record key (`message:<id>`) so the
+    /// optimistic insert and the persisted row agree from byte zero.
+    pub id: String,
+    /// User text. Must be non-empty after trim.
+    pub text: String,
+    /// Last assistant message id the client knows about, e.g.
+    /// `"message:k9d8…"`. `None` (or absent) declares "first turn".
     #[serde(default)]
-    pub messages: Vec<ChatRequestMessage>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatRequestMessage {
-    pub role: String,
-    #[serde(default)]
-    pub content: String,
-    /// Some clients send the AI-SDK v3+ `parts` array; we flatten any
-    /// text parts into `content` when `content` is empty.
-    #[serde(default)]
-    pub parts: Vec<MessagePart>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum MessagePart {
-    Text {
-        #[serde(default)]
-        text: String,
-    },
-    #[serde(other)]
-    Other,
-}
-
-impl ChatRequestMessage {
-    fn collapse_text(&self) -> String {
-        if !self.content.is_empty() {
-            return self.content.clone();
-        }
-        self.parts
-            .iter()
-            .filter_map(|p| match p {
-                MessagePart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
+    pub parent_id: Option<String>,
 }
 
 fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
@@ -87,10 +65,40 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     Ok(RecordId::from(("conversation", k)))
 }
 
-/// Extract `Authorization: Bearer <jwt>` from the request headers. The
-/// identity middleware has already validated it; we just need the
-/// string so the spawned worker can re-authenticate its own pool
-/// checkout.
+/// Cheap syntactic check on the user-supplied ULID: 26 chars, valid
+/// Crockford-base32 charset. Anything else → 400.
+fn looks_like_ulid(s: &str) -> bool {
+    if s.len() != 26 {
+        return false;
+    }
+    // Crockford excludes I, L, O, U from the alphabet; we accept upper
+    // and lower case (ULIDs are usually upper, but the spec is case-
+    // insensitive on decode).
+    s.bytes().all(|b| {
+        matches!(b,
+            b'0'..=b'9' |
+            b'A'..=b'H' | b'J' | b'K' | b'M' | b'N' | b'P'..=b'T' | b'V'..=b'Z' |
+            b'a'..=b'h' | b'j' | b'k' | b'm' | b'n' | b'p'..=b't' | b'v'..=b'z')
+    })
+}
+
+/// Parse a `parent_id` from the request body. Accepts `"message:<key>"`
+/// only; anything else is a 400 (the client never builds an id that
+/// isn't a record id stringified).
+fn parse_parent_id(s: &str) -> Result<MessageId, Response> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty parent_id").into_response());
+    }
+    let (table, key) = trimmed
+        .split_once(':')
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "parent_id missing 'message:' prefix").into_response())?;
+    if table != "message" || key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "parent_id must be 'message:<key>'").into_response());
+    }
+    Ok(RecordId::from(("message", key)))
+}
+
 fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     let v = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
     let s = v
@@ -99,10 +107,6 @@ fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
     Some(s.to_string())
 }
 
-/// POST handler. Persists the user message, spawns the worker, returns
-/// `202 Accepted`. The streaming reply is delivered out-of-band via
-/// `GET /api/chat/conversations/{id}/stream` (a separate subscription
-/// the SPA opens on session-page mount).
 pub async fn post_message(
     State(state): State<AppState>,
     Extension(db): Extension<Arc<AuthedDb>>,
@@ -116,9 +120,24 @@ pub async fn post_message(
         Err(r) => return r,
     };
 
-    // 1. Verify the conversation exists for this caller.
-    let conversation = match db.get_conversation(&conv_id).await {
-        Ok(Some(c)) => c,
+    // Validate the client-provided message id BEFORE we touch the DB.
+    if !looks_like_ulid(&req.id) {
+        return (StatusCode::BAD_REQUEST, "invalid message id").into_response();
+    }
+    if req.text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty text").into_response();
+    }
+    let parent_id: Option<MessageId> = match req.parent_id.as_deref() {
+        Some(s) => match parse_parent_id(s) {
+            Ok(p) => Some(p),
+            Err(r) => return r,
+        },
+        None => None,
+    };
+
+    // PERMISSIONS gate + existence check.
+    match db.get_conversation(&conv_id).await {
+        Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, "conversation not found").into_response(),
         Err(e) => {
             error!(error = %e, "get_conversation failed");
@@ -126,56 +145,85 @@ pub async fn post_message(
         }
     };
 
-    // 2. Pull the trailing user message out of the request body.
-    let last_user_text = req
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.collapse_text())
-        .unwrap_or_default();
-    if last_user_text.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "no user message").into_response();
-    }
-
-    // 3. Persist the user message synchronously. A crash before the
-    //    worker commits the assistant reply still leaves the user's
-    //    message in the log; the user can resubmit.
-    if let Err(e) = db.append_message(&conv_id, "user", &last_user_text).await {
-        error!(error = %e, "append user message failed");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "append failed").into_response();
-    }
-
-    // 4. Capture the bearer so the worker can check out its own
-    //    `AuthedDb`. The middleware already validated it.
-    let bearer = match bearer_from_headers(&headers) {
-        Some(b) => b,
-        None => {
-            // The identity middleware would have already 401'd if the
-            // bearer were missing, but be paranoid.
-            return (StatusCode::UNAUTHORIZED, "missing bearer").into_response();
+    // Optimistic concurrency: parent_id must match the conversation's
+    // current tail (or both must be None/empty).
+    let history = match db.list_messages(&conv_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!(error = %e, "list_messages failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, "lookup failed").into_response();
         }
     };
+    let tail_id = history.last().and_then(|m| m.id.as_ref());
+    if tail_id != parent_id.as_ref() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"reason": "stale_parent"})),
+        )
+            .into_response();
+    }
 
-    // 5. Get-or-create the per-conversation SessionState and spawn the
-    //    worker. The worker holds its own `Arc<SessionState>` plus a
-    //    `turn_lock` permit; this request can return immediately.
-    let session = state.session_registry.get_or_create(&conv_id).await;
+    let bearer = match bearer_from_headers(&headers) {
+        Some(b) => b,
+        None => return (StatusCode::UNAUTHORIZED, "missing bearer").into_response(),
+    };
+
     let turn = turn_request(
         conv_id.clone(),
-        last_user_text,
-        conversation.title.is_some(),
+        req.id,
+        req.text,
+        parent_id,
         bearer,
         auth.clone(),
         &state,
     );
-    spawn_worker(session, turn);
+    let (task_id, rx) = spawn_worker(state.tasks.clone(), turn);
 
     info!(
         user_id = %auth.user_id,
         conversation = %conv_id,
+        task = %task_id,
         "turn submitted"
     );
 
-    StatusCode::ACCEPTED.into_response()
+    let stream = ReceiverStream::new(rx).map(Ok::<Bytes, Infallible>);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header("x-vercel-ai-data-stream", "v1")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .expect("static headers, valid body")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ulid_validator_accepts_canonical_form() {
+        assert!(looks_like_ulid("01HXY0000000000000000000ZZ"));
+    }
+
+    #[test]
+    fn ulid_validator_rejects_short_or_garbage() {
+        assert!(!looks_like_ulid(""));
+        assert!(!looks_like_ulid("too short"));
+        assert!(!looks_like_ulid("01HXY0000000000000000000Z!"));
+        // 'I', 'L', 'O', 'U' are not in Crockford base32
+        assert!(!looks_like_ulid("01HXY0000000000000000000II"));
+    }
+
+    #[test]
+    fn parse_parent_id_round_trips() {
+        let id = parse_parent_id("message:abc123").expect("ok");
+        assert_eq!(id.to_string(), "message:abc123");
+    }
+
+    #[test]
+    fn parse_parent_id_rejects_wrong_table() {
+        assert!(parse_parent_id("conversation:abc").is_err());
+        assert!(parse_parent_id("not-a-record-id").is_err());
+        assert!(parse_parent_id("message:").is_err());
+    }
 }

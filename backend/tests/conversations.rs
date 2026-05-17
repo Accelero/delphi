@@ -94,7 +94,7 @@ async fn list_starts_empty_then_reflects_create() {
 }
 
 #[tokio::test]
-async fn post_message_returns_202_and_worker_persists_both_messages_and_title() {
+async fn post_message_streams_and_persists_pair_with_title() {
     let app = TestApp::build().await;
     let id = create_one(&app).await;
     let key = key_of(&id);
@@ -104,43 +104,119 @@ async fn post_message_returns_202_and_worker_persists_both_messages_and_title() 
         .send(auth_post(
             &uri,
             json!({
-                "messages": [
-                    {"role": "user", "content": "Hello"}
-                ]
+                "id": "01HXY0000000000000000000ZZ",
+                "text": "Hello",
+                "parent_id": null,
             }),
         ))
         .await;
-    // POST is fire-and-forget under the new design — the streaming
-    // reply arrives on the separate GET /stream subscription.
-    assert_eq!(res.status, StatusCode::ACCEPTED, "submit accepted");
-    assert!(res.bytes.is_empty(), "body should be empty");
+    // POST returns 200 with the AI SDK stream as its body. The
+    // FakeLlm default emits "ok" synchronously, then the worker
+    // commits and emits the trailing `d:` frame; the response body
+    // ends at that point so `app.send` returns the full bytes.
+    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    let body = res.text();
+    assert!(body.starts_with("8:"), "first frame should be task: {body}");
+    assert!(body.contains("0:\"ok\""), "expected text delta in: {body}");
+    assert!(
+        body.contains("\"finishReason\":\"stop\""),
+        "expected finish frame in: {body}"
+    );
 
-    // The worker runs detached; poll the conversation until both
-    // messages + the auto-title land. FakeLlm default emits "ok"
-    // synchronously so this usually resolves in the first iteration.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        let res = app
-            .send(auth_get(&format!("/api/chat/conversations/{key}")))
-            .await;
-        assert_eq!(res.status, StatusCode::OK);
-        let body: Value = res.json();
-        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-        let title_ok = body["conversation"]["title"].as_str().is_some();
-        if msgs.len() == 2 && title_ok {
-            assert_eq!(msgs[0]["role"], "user");
-            assert_eq!(msgs[0]["content"], "Hello");
-            assert_eq!(msgs[1]["role"], "assistant");
-            assert_eq!(msgs[1]["content"], "ok");
-            return;
-        }
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "worker did not persist within deadline; last body = {body:?}"
-            );
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    // The worker commits before emitting `d:`, so by the time the
+    // response body has ended both messages + auto-title are persisted.
+    let res = app
+        .send(auth_get(&format!("/api/chat/conversations/{key}")))
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+    let body: Value = res.json();
+    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+    assert_eq!(msgs.len(), 2, "expected exactly two messages: {body:?}");
+    assert_eq!(msgs[0]["role"], "user");
+    assert_eq!(msgs[0]["content"], "Hello");
+    assert_eq!(msgs[0]["id"], "message:01HXY0000000000000000000ZZ");
+    assert_eq!(msgs[1]["role"], "assistant");
+    assert_eq!(msgs[1]["content"], "ok");
+    assert_eq!(msgs[1]["parent_id"], "message:01HXY0000000000000000000ZZ");
+    assert!(
+        body["conversation"]["title"].as_str().is_some(),
+        "auto-title should be set",
+    );
+}
+
+#[tokio::test]
+async fn post_with_stale_parent_returns_409() {
+    let app = TestApp::build().await;
+    let id = create_one(&app).await;
+    let key = key_of(&id);
+    // No messages yet — sending a non-null parent_id must 409.
+    let res = app
+        .send(auth_post(
+            &format!("/api/chat/conversations/{key}/messages"),
+            json!({
+                "id": "01HXY0000000000000000000AA",
+                "text": "hi",
+                "parent_id": "message:nonexistent",
+            }),
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::CONFLICT);
+    let body: Value = res.json();
+    assert_eq!(body["reason"], "stale_parent");
+
+    // And the conversation must remain empty — no partial write.
+    let res = app
+        .send(auth_get(&format!("/api/chat/conversations/{key}")))
+        .await;
+    let body: Value = res.json();
+    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+    assert!(msgs.is_empty(), "stale-parent POST must persist nothing");
+}
+
+#[tokio::test]
+async fn post_with_garbage_message_id_returns_400() {
+    let app = TestApp::build().await;
+    let id = create_one(&app).await;
+    let key = key_of(&id);
+    let res = app
+        .send(auth_post(
+            &format!("/api/chat/conversations/{key}/messages"),
+            json!({"id": "too-short", "text": "hi", "parent_id": null}),
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_messages_round_trips_parent_id_field() {
+    // After a turn commits, the assistant message's `parent_id` field
+    // should land on the wire as `"message:<key>"`.
+    let app = TestApp::build().await;
+    let id = create_one(&app).await;
+    let key = key_of(&id);
+    let res = app
+        .send(auth_post(
+            &format!("/api/chat/conversations/{key}/messages"),
+            json!({
+                "id": "01HXY0000000000000000000BB",
+                "text": "hi",
+                "parent_id": null,
+            }),
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK);
+
+    let res = app
+        .send(auth_get(&format!("/api/chat/conversations/{key}")))
+        .await;
+    let body: Value = res.json();
+    let msgs = body["messages"].as_array().expect("messages");
+    assert_eq!(msgs.len(), 2);
+    assert!(msgs[0]["parent_id"].is_null(), "user msg parent is null");
+    let asst_parent = msgs[1]["parent_id"]
+        .as_str()
+        .expect("assistant parent_id is a string");
+    assert_eq!(asst_parent, "message:01HXY0000000000000000000BB");
 }
 
 #[tokio::test]
@@ -183,13 +259,17 @@ async fn delete_cascades_and_is_idempotent() {
     let id = create_one(&app).await;
     let key = key_of(&id);
 
-    // Post a message so we have something to cascade. POST returns
-    // 202 immediately; we don't wait for the worker because the user
-    // message is persisted synchronously before the 202 is sent.
+    // Post a message so we have something to cascade. The POST body
+    // is the worker's stream — `app.send` collects it to completion,
+    // by which point `commit_turn` has already persisted both rows.
     let _ = app
         .send(auth_post(
             &format!("/api/chat/conversations/{key}/messages"),
-            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({
+                "id": "01HXY0000000000000000000CC",
+                "text": "hi",
+                "parent_id": null,
+            }),
         ))
         .await;
 
@@ -252,7 +332,11 @@ async fn post_message_404_unknown_id() {
     let res = app
         .send(auth_post(
             "/api/chat/conversations/does-not-exist/messages",
-            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            json!({
+                "id": "01HXY0000000000000000000DD",
+                "text": "hi",
+                "parent_id": null,
+            }),
         ))
         .await;
     assert_eq!(res.status, StatusCode::NOT_FOUND);
