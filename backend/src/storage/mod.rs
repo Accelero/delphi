@@ -134,11 +134,37 @@ pub trait Storage: Send + Sync {
     async fn list_messages(&self, conv: &ConversationId) -> Result<Vec<ChatMessage>>;
 
     /// Append a message and bump the parent conversation's `updated_at`.
+    ///
+    /// Kept for tests and ad-hoc inserts. Production chat writes go
+    /// through [`Storage::commit_turn`], which writes the
+    /// user+assistant pair atomically with "last writer wins"
+    /// semantics against a `parent_id`.
     async fn append_message(
         &self,
         conv: &ConversationId,
         role: &str,
         content: &str,
+    ) -> Result<MessageId>;
+
+    /// Atomically commit one chat turn: delete any messages created
+    /// after `parent_id` (the "last writer wins" step), insert the
+    /// user message with `user_message_id` as its record key, insert
+    /// the assistant reply linked to it, and bump the conversation's
+    /// `updated_at`. Returns the assistant message id.
+    ///
+    /// `user_message_id` is a client-provided ULID (no `message:`
+    /// prefix); the storage layer fabricates the record id internally.
+    /// `parent_id == None` declares "this is the first turn" and
+    /// causes the DELETE step to scrub everything in the conversation
+    /// — that is correct: a first-turn submit is asserting the chat
+    /// was empty.
+    async fn commit_turn(
+        &self,
+        conv: &ConversationId,
+        user_message_id: &str,
+        user_text: &str,
+        parent_id: Option<&MessageId>,
+        assistant_text: &str,
     ) -> Result<MessageId>;
 
     /// Update the title. Engine PERMISSIONS refuse cross-user / cross-

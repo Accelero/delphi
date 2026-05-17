@@ -62,6 +62,11 @@ pub struct TestApp {
     /// `chat_handshake.rs`) reach in via this handle instead of going
     /// through the HTTP path.
     pub session_registry: Arc<SessionRegistry>,
+    /// Same per-request pool the router uses; lets tests drive
+    /// `commit_turn` and other request-path Storage methods directly
+    /// against a JWT-authed handle (mint the bearer via
+    /// [`AuthRequestBuilder::mint_jwt`]).
+    pub request_db_pool: RequestDbPool,
 }
 
 impl TestApp {
@@ -188,6 +193,7 @@ impl TestApp {
             default_tenant_slug,
             events: events_tx,
             session_registry,
+            request_db_pool: request_pool,
         }
     }
 
@@ -306,6 +312,39 @@ impl AuthRequestBuilder {
     pub fn email(mut self, s: impl Into<String>) -> Self {
         self.email = s.into();
         self
+    }
+
+    /// Mint a JWT carrying the configured claims as a bare string. Same
+    /// signing path as [`Self::apply`] (HS512 + [`TEST_JWT_SECRET`]) so
+    /// the resulting bearer authenticates against the engine's
+    /// `app_session` access method. Useful for tests that drive the
+    /// `RequestDbPool` directly rather than the HTTP layer.
+    pub fn mint_jwt(&self) -> String {
+        let mut payload = json!({
+            "sub": self.sub,
+            "iss": self.iss,
+            "email": self.email,
+            "ac": "app_session",
+            "ns": "delphi_test",
+            "db": "main",
+            "iat": chrono::Utc::now().timestamp(),
+            "exp": chrono::Utc::now().timestamp() + 60,
+        });
+        if let Some(n) = &self.name {
+            payload["preferred_username"] = json!(n);
+        }
+        if let Some(t) = &self.tenant_slug {
+            payload["tenant_id"] = json!(t);
+        }
+        if !self.roles.is_empty() {
+            payload["roles"] = json!(self.roles);
+        }
+        encode(
+            &Header::new(jsonwebtoken::Algorithm::HS512),
+            &payload,
+            &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+        )
+        .expect("sign test JWT")
     }
 
     /// Mint a JWT carrying the configured claims and attach it to the

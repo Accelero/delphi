@@ -238,6 +238,17 @@ pub struct ChatMessage {
     pub id: Option<RecordId>,
     pub role: String,
     pub content: String,
+    /// Parent message in the linear chat history. `None` for the first
+    /// message of a conversation; otherwise the id of the prior
+    /// assistant message (or, for an assistant row, the user message it
+    /// answers). Used by `commit_turn` for "last writer wins" semantics
+    /// and by the frontend to thread the next submit.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "opt_record_id_str"
+    )]
+    pub parent_id: Option<RecordId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
 }

@@ -366,6 +366,18 @@ impl Storage for AuthedDb {
     ) -> Result<MessageId> {
         self.storage().append_message(conv, role, content).await
     }
+    async fn commit_turn(
+        &self,
+        conv: &ConversationId,
+        user_message_id: &str,
+        user_text: &str,
+        parent_id: Option<&MessageId>,
+        assistant_text: &str,
+    ) -> Result<MessageId> {
+        self.storage()
+            .commit_turn(conv, user_message_id, user_text, parent_id, assistant_text)
+            .await
+    }
     async fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()> {
         self.storage().rename_conversation(id, title).await
     }

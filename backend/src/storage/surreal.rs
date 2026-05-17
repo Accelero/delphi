@@ -172,6 +172,8 @@ struct ChatMessageWire {
     role: String,
     content: String,
     #[serde(default)]
+    parent_id: Option<RecordId>,
+    #[serde(default)]
     created_at: Option<Datetime>,
 }
 
@@ -181,6 +183,7 @@ impl From<ChatMessageWire> for ChatMessage {
             id: w.id,
             role: w.role,
             content: w.content,
+            parent_id: w.parent_id,
             created_at: w.created_at.map(datetime_to_chrono),
         }
     }
@@ -574,7 +577,7 @@ impl Storage for SurrealStorage {
         let mut response = self
             .db
             .query(
-                "SELECT id, role, content, created_at \
+                "SELECT id, role, content, parent_id, created_at \
                  FROM message WHERE conversation = $conv \
                  ORDER BY created_at ASC",
             )
@@ -593,6 +596,11 @@ impl Storage for SurrealStorage {
         // Two statements in one round-trip: create the message, bump the
         // parent's updated_at. Engine PERMISSIONS on both tables refuse
         // the write if the caller doesn't own the conversation.
+        //
+        // Production chat writes go through `commit_turn` so the
+        // user+assistant pair is atomic with "last writer wins"
+        // semantics. `append_message` is kept for tests and ad-hoc
+        // single-message inserts.
         let mut response = self
             .db
             .query(
@@ -608,6 +616,90 @@ impl Storage for SurrealStorage {
             .bind(("content", content.to_string()))
             .await?;
         let row: Option<IdRow> = response.take(0)?;
+        row.map(|r| r.id).ok_or(Error::EmptyResult)
+    }
+
+    async fn commit_turn(
+        &self,
+        conv: &ConversationId,
+        user_message_id: &str,
+        user_text: &str,
+        parent_id: Option<&MessageId>,
+        assistant_text: &str,
+    ) -> Result<MessageId> {
+        // Atomic transaction:
+        //   1. DELETE any messages created after our parent (the
+        //      "last writer wins" step — drops a competing turn that
+        //      committed first against the same parent).
+        //   2. CREATE the user message with the client-provided ULID.
+        //   3. CREATE the assistant message linked to the user message.
+        //   4. Bump the conversation's updated_at.
+        //
+        // The first statement is parametrised on the parent's
+        // `created_at`. When there is no parent (first turn) we use
+        // `time::EPOCH` so the WHERE clause is `created_at > epoch`,
+        // which matches every prior row in the conversation — that's
+        // correct: a "first turn" submit declares the conversation was
+        // empty, so any rows lying around belonged to a competing first
+        // turn and should be wiped.
+        //
+        // The user record id is `message:<ulid>`. We hand the key into
+        // a `type::thing('message', $key)` builder so SurrealDB's
+        // parser receives a record literal, not a string.
+        let user_rid = RecordId::from(("message", user_message_id));
+        // The transaction does (in order):
+        //   1. LET $parent_ts — bind the parent's created_at (or EPOCH).
+        //   2. DELETE any messages newer than that — "last writer wins".
+        //   3. CREATE the user message with the client-provided record id.
+        //   4. CREATE the assistant message linked to the user message,
+        //      with `RETURN id` so we can read the new id back.
+        //   5. UPDATE conversation.updated_at.
+        //
+        // Response slot layout: `BEGIN/COMMIT` and `LET` are framing;
+        // the four data statements (DELETE, CREATE user, CREATE
+        // assistant, UPDATE) occupy slots 0..=3 in order. We pull the
+        // assistant id from slot 2.
+        let sql = "
+            BEGIN;
+            LET $parent_ts = IF $parent_id != NONE
+                THEN (SELECT VALUE created_at FROM ONLY $parent_id)
+                ELSE time::EPOCH
+                END;
+            DELETE message
+                WHERE conversation = $conv
+                  AND created_at > $parent_ts;
+            CREATE $user_rid CONTENT {
+                conversation: $conv,
+                role: 'user',
+                content: $user_text,
+                parent_id: $parent_id
+            };
+            CREATE ONLY message CONTENT {
+                conversation: $conv,
+                role: 'assistant',
+                content: $asst_text,
+                parent_id: $user_rid
+            } RETURN id;
+            UPDATE $conv SET updated_at = time::now();
+            COMMIT;
+        ";
+        let mut response = self
+            .db
+            .query(sql)
+            .bind(("conv", conv.clone()))
+            .bind(("user_rid", user_rid))
+            .bind(("user_text", user_text.to_string()))
+            .bind(("asst_text", assistant_text.to_string()))
+            .bind(("parent_id", parent_id.cloned()))
+            .await?
+            .check()?;
+        // Statement-slot map (BEGIN/COMMIT framing, LET counts):
+        //   0: LET $parent_ts
+        //   1: DELETE
+        //   2: CREATE user
+        //   3: CREATE ONLY assistant RETURN id  ← what we want
+        //   4: UPDATE
+        let row: Option<IdRow> = response.take(3)?;
         row.map(|r| r.id).ok_or(Error::EmptyResult)
     }
 

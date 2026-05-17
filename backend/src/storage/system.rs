@@ -891,6 +891,18 @@ impl Storage for SystemStorage {
             "SystemStorage does not append messages".into(),
         ))
     }
+    async fn commit_turn(
+        &self,
+        _conv: &ConversationId,
+        _user_message_id: &str,
+        _user_text: &str,
+        _parent_id: Option<&MessageId>,
+        _assistant_text: &str,
+    ) -> Result<MessageId> {
+        Err(Error::NotImplemented(
+            "SystemStorage does not commit turns".into(),
+        ))
+    }
     async fn rename_conversation(&self, _id: &ConversationId, _title: &str) -> Result<()> {
         Err(Error::NotImplemented(
             "SystemStorage does not rename conversations".into(),

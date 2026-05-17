@@ -304,9 +304,17 @@ DEFINE FIELD IF NOT EXISTS role           ON message TYPE string
     ASSERT $value INSIDE ['system','user','assistant','tool'];
 DEFINE FIELD IF NOT EXISTS content        ON message TYPE string;
 DEFINE FIELD IF NOT EXISTS parts          ON message FLEXIBLE TYPE array DEFAULT [];
+-- Parent message in the linear chat history. NONE for the first
+-- message in a conversation. Powers the "last writer wins" commit_turn
+-- transaction: a new turn DELETEs anything created after its parent
+-- before persisting its own pair.
+DEFINE FIELD IF NOT EXISTS parent_id      ON message TYPE option<record<message>>;
 DEFINE FIELD IF NOT EXISTS model          ON message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS finish_reason  ON message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at     ON message TYPE datetime DEFAULT time::now();
 DEFINE INDEX IF NOT EXISTS message_conversation   ON message FIELDS conversation;
 REMOVE INDEX IF EXISTS message_tenant_created ON message;
 DEFINE INDEX IF NOT EXISTS message_tenant_created ON message FIELDS tenant_id, created_at;
+-- Supports the `WHERE conversation = $conv AND created_at > $t` query
+-- in commit_turn (delete-anything-after-parent step).
+DEFINE INDEX IF NOT EXISTS message_conversation_created ON message FIELDS conversation, created_at;
