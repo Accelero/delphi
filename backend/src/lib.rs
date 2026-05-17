@@ -9,6 +9,7 @@
 pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod chat;
 pub mod chunker;
 pub mod config;
 pub mod embedder;
