@@ -2,6 +2,7 @@
 
 mod chat;
 mod chat_stop;
+mod chat_stream;
 mod chunks;
 mod conversations;
 mod discovery;
@@ -237,7 +238,11 @@ pub fn build_router(
             post(chat::post_message),
         )
         .route(
-            "/api/chat/conversations/{key}/tasks/{task_id}/stop",
+            "/api/chat/conversations/{key}/stream",
+            get(chat_stream::stream),
+        )
+        .route(
+            "/api/chat/conversations/{key}/stop",
             post(chat_stop::stop),
         )
         .route("/api/auth/me", get(auth::me))
