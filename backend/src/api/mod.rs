@@ -23,7 +23,7 @@ use crate::auth::{
     self, service_identity_from_env, validator_from_jwt_access, AuthConfig, AuthMode,
     ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
-use crate::chat::TaskRegistry;
+use crate::chat::SessionRegistry;
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
@@ -121,7 +121,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     let state = AppState {
         llm,
-        tasks: Arc::new(TaskRegistry::new()),
+        sessions: Arc::new(SessionRegistry::new()),
         request_db_pool: request_pool.clone(),
         object_store: object_store.clone(),
         events: events_tx,

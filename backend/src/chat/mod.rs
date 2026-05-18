@@ -1,26 +1,29 @@
-//! Chat-streaming primitives.
+//! Chat-streaming primitives (v3).
 //!
-//! Post-redesign (see
+//! Multi-tab, SSE-based fan-out (see
 //! [`docs/architecture/chat-streaming.md`](../../../docs/architecture/chat-streaming.md)):
-//! one POST returns the stream body itself; the spawned worker is the
-//! whole model. There is no buffer, no multi-reader fanout, no
-//! re-attach mechanism.
+//! POST `/messages` is fire-and-forget, GET `/stream` is the single
+//! source of truth, and per-conversation [`SessionState`] coordinates
+//! the worker, the buffered frames, and the live subscriber list.
 //!
 //! ### Layout
 //!
 //! ```text
 //! chat/
 //! ├── mod.rs       public interface (this file)
-//! ├── registry.rs  TaskRegistry — TaskId → CancellationToken
+//! ├── registry.rs  SessionRegistry — ConversationId → Arc<SessionState>
+//! ├── session.rs   SessionState — buffer + subscribers + phase
 //! └── worker.rs    spawn_worker — detached per-turn future
 //! ```
 //!
 //! `api/*` consumes this module via `crate::chat::*`; `chat::` itself
-//! imports `crate::api::stream::*` (sibling, allowed) for the framed
-//! protocol writers.
+//! imports `crate::api::sse::*` (sibling, allowed) for the SSE frame
+//! writers.
 
 mod registry;
+mod session;
 mod worker;
 
-pub use registry::{TaskId, TaskRegistry};
+pub use registry::{SessionRegistry, TaskId};
+pub use session::{AlreadyRunning, SessionState, TurnPhase};
 pub use worker::{spawn_worker, turn_request, TurnRequest};

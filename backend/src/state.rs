@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::chat::TaskRegistry;
+use crate::chat::SessionRegistry;
 use crate::embedder::Embedder;
 use crate::ingestion::FeedItemEvent;
 use crate::llm::LlmClient;
@@ -25,10 +25,12 @@ use crate::text_extractor::TextExtractor;
 #[derive(Clone)]
 pub struct AppState {
     pub llm: Arc<dyn LlmClient>,
-    /// In-flight chat workers, keyed by `TaskId`. Each entry is a
-    /// `CancellationToken` the `/stop/{task_id}` endpoint flips. The
-    /// POST handler inserts on spawn; the worker removes on exit.
-    pub tasks: Arc<TaskRegistry>,
+    /// Per-conversation chat sessions. Each entry buffers the in-flight
+    /// turn's SSE frames and tracks live subscribers, so every tab on
+    /// the same conversation sees the same byte stream. The `/stop`
+    /// endpoint cancels by conversation id (no task id in the public
+    /// API in v3).
+    pub sessions: Arc<SessionRegistry>,
     /// Per-request DB pool, shared with the identity middleware. The
     /// chat worker checks out its own `AuthedDb` for the commit step
     /// because the request that spawned it has already released its
