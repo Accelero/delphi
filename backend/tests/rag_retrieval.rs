@@ -4,14 +4,14 @@
 //! FakeEmbedder, queries with a synthetic vector matching chunk #2, and
 //! asserts:
 //!
-//! - the SSE stream opens with a `2:` data block listing the citations,
+//! - the SSE stream emits a `citations` frame before any `text` frame,
 //! - neighbor expansion (radius=1) widens the citation set to include
 //!   adjacent ordinals,
-//! - the stream ends with the expected `0:`/`d:` records.
+//! - the stream ends with a `finish` frame.
 //!
-//! Contract post-redesign: POST `/messages` returns 200 with the
-//! AI SDK stream as its body. We read the body directly until the
-//! trailing `d:` frame.
+//! Contract (v3): POST `/messages` is fire-and-forget (202); the SSE
+//! stream is `GET /conversations/{key}/stream`. We subscribe first
+//! and read until `finish`.
 
 mod common;
 
@@ -161,7 +161,45 @@ async fn chat_streams_citations_block_before_text() {
     let conv_id = created["id"].as_str().expect("conv id").to_string();
     let key = key_of(&conv_id);
 
-    // Submit the user message — the response body IS the AI SDK stream.
+    // Open the SSE subscription FIRST so the worker's emit fans out to
+    // a registered subscriber.
+    let stream_client = client.clone();
+    let stream_url = format!("{base_url}/api/chat/conversations/{key}/stream");
+    let stream_bearer = bearer.clone();
+    let stream_task = tokio::spawn(async move {
+        let res = stream_client
+            .get(&stream_url)
+            .bearer_auth(&stream_bearer)
+            .send()
+            .await
+            .expect("subscribe");
+        assert_eq!(res.status().as_u16(), 200);
+        let mut bytes = res.bytes_stream();
+        let mut acc = Vec::<u8>::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::time::Instant::now() > deadline {
+                panic!("no finish frame within deadline; got: {}", String::from_utf8_lossy(&acc));
+            }
+            let next = tokio::time::timeout(Duration::from_millis(500), bytes.next()).await;
+            match next {
+                Ok(Some(Ok(chunk))) => acc.extend_from_slice(&chunk),
+                Ok(Some(Err(e))) => panic!("stream error: {e}"),
+                Ok(None) => break,
+                Err(_) => {}
+            }
+            if let Ok(s) = std::str::from_utf8(&acc) {
+                if s.contains("event: finish") {
+                    break;
+                }
+            }
+        }
+        acc
+    });
+
+    // Give the GET a moment to land its subscribe before POST starts the turn.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     let body = json!({
         "id": "01HXY0000000000000000000ZZ",
         "text": "chunk content 2",
@@ -175,63 +213,44 @@ async fn chat_streams_citations_block_before_text() {
         .send()
         .await
         .expect("post message");
-    assert_eq!(post.status().as_u16(), 200);
-    assert_eq!(
-        post.headers()
-            .get("x-vercel-ai-data-stream")
-            .and_then(|v| v.to_str().ok()),
-        Some("v1"),
-        "POST must announce the AI SDK data-stream protocol",
-    );
-    let mut bytes = post.bytes_stream();
+    assert_eq!(post.status().as_u16(), 202);
 
-    // Drain the stream until we see the trailing `d:` frame, then bail.
-    let mut acc = Vec::<u8>::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if std::time::Instant::now() > deadline {
-            panic!(
-                "did not receive finish frame within deadline; got so far: {}",
-                String::from_utf8_lossy(&acc)
-            );
-        }
-        let chunk_fut = tokio::time::timeout(Duration::from_millis(500), bytes.next());
-        match chunk_fut.await {
-            Ok(Some(Ok(chunk))) => acc.extend_from_slice(&chunk),
-            Ok(Some(Err(e))) => panic!("stream error: {e}"),
-            Ok(None) => break, // server closed (shouldn't happen but harmless)
-            Err(_) => {}       // tick — re-check accumulator for terminal frame
-        }
-        if let Ok(s) = std::str::from_utf8(&acc) {
-            if s.contains("\"finishReason\":") {
-                break;
-            }
-        }
-    }
-    drop(bytes);
+    let acc = stream_task.await.expect("stream task");
     server.abort();
-
     let text = String::from_utf8(acc).expect("utf-8");
 
-    // Frame ordering: first the `8:` task frame, then the `2:`
-    // citations block before any `0:` text. Find the citations line.
-    let mut lines = text.lines();
-    let task_line = lines.next().unwrap_or_default();
-    assert!(
-        task_line.starts_with("8:"),
-        "expected leading `8:` task frame; got first line {task_line:?}\nfull: {text}",
-    );
-    let citations_line = lines.next().unwrap_or_default();
-    assert!(
-        citations_line.starts_with("2:"),
-        "expected `2:` citations block right after the task frame; got {citations_line:?}\nfull: {text}",
-    );
-    let body_json = &citations_line[2..];
-    let parsed: serde_json::Value = serde_json::from_str(body_json).expect("json");
-    let chunks_arr = parsed[0]["chunks"].as_array().expect("chunks array");
-    assert!(!chunks_arr.is_empty(), "no citations: {citations_line}");
+    // Frame ordering: user_message → citations → text* → finish. Find
+    // each by event name and assert the citations block precedes any
+    // text frame.
+    let user_idx = text
+        .find("event: user_message\n")
+        .unwrap_or_else(|| panic!("no user_message: {text}"));
+    let citations_idx = text
+        .find("event: citations\n")
+        .unwrap_or_else(|| panic!("no citations frame: {text}"));
+    let text_idx = text
+        .find("event: text\n")
+        .unwrap_or_else(|| panic!("no text frame: {text}"));
+    let finish_idx = text
+        .find("event: finish\n")
+        .unwrap_or_else(|| panic!("no finish frame: {text}"));
+    assert!(user_idx < citations_idx, "user_message before citations");
+    assert!(citations_idx < text_idx, "citations before text");
+    assert!(text_idx < finish_idx, "text before finish");
 
-    // Text-delta + finish marker round out the stream.
-    assert!(text.contains("0:\"ok\""), "expected text delta in: {text}");
-    assert!(text.contains("\"finishReason\":\"stop\""));
+    // citations data is a JSON array — parse the line after `data: ` on
+    // the citations frame.
+    let after = &text[citations_idx..];
+    let data_start = after.find("\ndata: ").expect("data line") + "\ndata: ".len();
+    let data_end = after[data_start..].find('\n').expect("data eol");
+    let json_body = &after[data_start..data_start + data_end];
+    let parsed: serde_json::Value = serde_json::from_str(json_body).expect("citations json");
+    let arr = parsed.as_array().expect("citations is array");
+    assert!(!arr.is_empty(), "expected at least one citation: {json_body}");
+
+    // finish reason
+    assert!(
+        text.contains("\"finishReason\":\"stop\""),
+        "expected stop finish: {text}"
+    );
 }

@@ -1,18 +1,21 @@
-//! End-to-end POST /messages: the response body IS the AI SDK stream.
+//! End-to-end POST /messages + GET /stream: the SSE stream is the
+//! single source of truth.
 //!
-//! Drives one turn through the in-process router via
-//! `tower::ServiceExt::oneshot`, asserts the frame order on the wire,
-//! and asserts the DB has the persisted user+assistant pair.
-//!
-//! The detailed RAG-citations ordering lives in `rag_retrieval.rs`;
-//! this test exercises the bare path with a vanilla FakeLlm so the
-//! frame-protocol assertions are stable.
+//! Subscribes to the per-conversation SSE stream first, then POSTs the
+//! turn, then asserts the frame order on the wire. After `finish` the
+//! DB has the committed user+assistant pair.
 
 mod common;
 
+use std::time::Duration;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use bytes::Bytes;
+use futures::StreamExt;
+use http_body_util::BodyStream;
 use serde_json::{json, Value};
+use tower::ServiceExt;
 
 use common::{AuthRequestBuilder, TestApp};
 
@@ -48,11 +51,100 @@ async fn create_conversation(app: &TestApp) -> String {
     key_of(body["id"].as_str().expect("id"))
 }
 
+/// One SSE event parsed out of the wire bytes.
+#[derive(Debug)]
+pub struct SseFrame {
+    pub event: String,
+    pub data: String,
+}
+
+/// Read `text/event-stream` bytes from a router subscription, returning
+/// parsed frames until either `until_event` arrives or `timeout` elapses.
+pub async fn read_until(
+    router: axum::Router,
+    uri: &str,
+    until_event: &str,
+    timeout: Duration,
+) -> Vec<SseFrame> {
+    let req = AuthRequestBuilder::default().apply(
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let res = router.oneshot(req).await.expect("router oneshot");
+    assert_eq!(res.status(), StatusCode::OK, "stream open");
+
+    let mut stream = BodyStream::new(res.into_body());
+    let mut buf = Vec::<u8>::new();
+    let mut frames = Vec::new();
+
+    let read = async {
+        while let Some(chunk) = stream.next().await {
+            let frame = chunk.expect("chunk");
+            let data = frame.data_ref().cloned().unwrap_or_else(Bytes::new);
+            if data.is_empty() {
+                continue;
+            }
+            buf.extend_from_slice(&data);
+            while let Some(end) = find_event_end(&buf) {
+                let block = std::str::from_utf8(&buf[..end])
+                    .expect("sse utf-8")
+                    .to_string();
+                buf.drain(..end + 2); // consume "\n\n"
+                if let Some(parsed) = parse_sse_block(&block) {
+                    let stop = parsed.event == until_event;
+                    frames.push(parsed);
+                    if stop {
+                        return;
+                    }
+                }
+            }
+        }
+    };
+
+    let _ = tokio::time::timeout(timeout, read).await;
+    frames
+}
+
+/// Find the byte index of `\n\n` in `buf` (returns index of the first `\n`).
+fn find_event_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(2).position(|w| w == b"\n\n")
+}
+
+fn parse_sse_block(s: &str) -> Option<SseFrame> {
+    let mut event: Option<String> = None;
+    let mut data = String::new();
+    for line in s.split('\n') {
+        if let Some(rest) = line.strip_prefix("event: ") {
+            event = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("data: ") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest);
+        }
+    }
+    event.map(|e| SseFrame { event: e, data })
+}
+
 #[tokio::test]
-async fn post_emits_task_then_text_then_finish_and_persists_pair() {
+async fn sse_emits_user_message_text_finish_and_persists_pair() {
     let app = TestApp::build().await;
     let key = create_conversation(&app).await;
     let user_id = "01HXY0000000000000000000FF";
+
+    // Open the SSE subscription FIRST so the worker's emit fans out to
+    // a registered subscriber rather than just into the buffer.
+    let stream_router = app.router.clone();
+    let stream_uri = format!("/api/chat/conversations/{key}/stream");
+    let stream_task = tokio::spawn(async move {
+        read_until(stream_router, &stream_uri, "finish", Duration::from_secs(5)).await
+    });
+
+    // Give the GET a head start so its subscribe lands before start_turn.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let res = app
         .send(auth_post(
@@ -60,40 +152,31 @@ async fn post_emits_task_then_text_then_finish_and_persists_pair() {
             json!({"id": user_id, "text": "hi", "parent_id": null}),
         ))
         .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.text());
 
-    let body = res.text();
-    let mut lines = body.lines();
+    let frames = stream_task.await.expect("stream task");
 
-    // 1) first frame must be `8:` with a 26-char task id.
-    let task_line = lines.next().expect("task frame");
-    assert!(task_line.starts_with("8:"), "first frame must be task: {task_line}");
-    let task_json: Value = serde_json::from_str(&task_line[2..]).expect("task is json");
-    let task_id = task_json["taskId"].as_str().expect("taskId field");
-    assert_eq!(task_id.len(), 26, "taskId should be a 26-char ULID");
+    // Frame ordering: user_message → text* → finish.
+    assert!(!frames.is_empty(), "expected SSE frames");
+    let names: Vec<&str> = frames.iter().map(|f| f.event.as_str()).collect();
+    assert_eq!(names.first(), Some(&"user_message"), "first frame: {names:?}");
+    assert_eq!(names.last(), Some(&"finish"), "last frame: {names:?}");
+    assert!(names.iter().any(|n| *n == "text"), "no text frames: {names:?}");
 
-    // 2..n) one or more `0:` text deltas before a single `d:` finish.
-    let mut saw_text = false;
-    let mut finish_line: Option<&str> = None;
-    for line in lines {
-        if line.starts_with("0:") {
-            saw_text = true;
-        } else if line.starts_with("d:") {
-            finish_line = Some(line);
-            break;
-        }
-    }
-    assert!(saw_text, "expected at least one `0:` text delta: {body}");
-    let finish = finish_line.expect("finish frame: {body}");
-    let finish_json: Value = serde_json::from_str(&finish[2..]).expect("finish is json");
-    assert_eq!(finish_json["finishReason"], "stop");
-    let asst_id = finish_json["assistantMessageId"]
+    // user_message body: { id: "message:<ulid>", content: "hi" }
+    let first: Value = serde_json::from_str(&frames[0].data).expect("user_message json");
+    assert_eq!(first["id"], format!("message:{user_id}"));
+    assert_eq!(first["content"], "hi");
+
+    // finish body: { finishReason: "stop", assistantMessageId: "message:..." }
+    let last: Value = serde_json::from_str(&frames.last().unwrap().data).expect("finish json");
+    assert_eq!(last["finishReason"], "stop");
+    let asst_id = last["assistantMessageId"]
         .as_str()
-        .expect("assistantMessageId field");
-    assert!(asst_id.starts_with("message:"), "asst id is record id: {asst_id}");
+        .expect("assistantMessageId");
+    assert!(asst_id.starts_with("message:"));
 
-    // After the body ends the pair is persisted (commit_turn ran before
-    // the `d:` frame).
+    // Persisted pair.
     let res = app
         .send(auth_get(&format!("/api/chat/conversations/{key}")))
         .await;

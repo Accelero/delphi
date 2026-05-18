@@ -1,11 +1,16 @@
-//! Persisted chat conversations: CRUD + the streaming message endpoint.
+//! Persisted chat conversations: CRUD + the fire-and-forget POST endpoint.
 //!
 //! Drives the in-process router via `tower::ServiceExt::oneshot` exactly
-//! like `discovery_feed.rs`. The fake LLM emits `"ok"` for any prompt,
-//! which is sufficient to exercise both the streaming protocol and the
-//! best-effort auto-title path.
+//! like `discovery_feed.rs`. The fake LLM emits `"ok"` for any prompt.
+//!
+//! Since v3 the POST is fire-and-forget (202 Accepted) — these tests
+//! poll the conversation's message list to wait for the worker's
+//! `commit_turn` to land before asserting persisted state. The
+//! detailed SSE protocol test lives in `chat_streaming.rs`.
 
 mod common;
+
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -73,6 +78,30 @@ async fn create_one(app: &TestApp) -> String {
     body["id"].as_str().expect("id present").to_string()
 }
 
+/// Poll `GET /conversations/{key}` until the worker has committed
+/// `expected` messages, or panic after a short timeout. Cheap because
+/// the in-memory engine + FakeLlm finish a turn well under 100ms.
+async fn wait_for_messages(app: &TestApp, key: &str, expected: usize) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let res = app
+            .send(auth_get(&format!("/api/chat/conversations/{key}")))
+            .await;
+        assert_eq!(res.status, StatusCode::OK);
+        let body: Value = res.json();
+        let len = body["messages"].as_array().map(|a| a.len()).unwrap_or(0);
+        if len >= expected {
+            return body;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {expected} messages on {key}; have {len}: {body}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn list_starts_empty_then_reflects_create() {
     let app = TestApp::build().await;
@@ -94,7 +123,7 @@ async fn list_starts_empty_then_reflects_create() {
 }
 
 #[tokio::test]
-async fn post_message_streams_and_persists_pair_with_title() {
+async fn post_message_accepts_then_persists_pair_with_title() {
     let app = TestApp::build().await;
     let id = create_one(&app).await;
     let key = key_of(&id);
@@ -110,27 +139,13 @@ async fn post_message_streams_and_persists_pair_with_title() {
             }),
         ))
         .await;
-    // POST returns 200 with the AI SDK stream as its body. The
-    // FakeLlm default emits "ok" synchronously, then the worker
-    // commits and emits the trailing `d:` frame; the response body
-    // ends at that point so `app.send` returns the full bytes.
-    assert_eq!(res.status, StatusCode::OK, "{}", res.text());
-    let body = res.text();
-    assert!(body.starts_with("8:"), "first frame should be task: {body}");
-    assert!(body.contains("0:\"ok\""), "expected text delta in: {body}");
-    assert!(
-        body.contains("\"finishReason\":\"stop\""),
-        "expected finish frame in: {body}"
-    );
+    // POST is fire-and-forget — 202 Accepted, empty body. The worker
+    // commits asynchronously; we poll the GET endpoint below.
+    assert_eq!(res.status, StatusCode::ACCEPTED, "{}", res.text());
+    assert!(res.bytes.is_empty(), "202 body should be empty");
 
-    // The worker commits before emitting `d:`, so by the time the
-    // response body has ended both messages + auto-title are persisted.
-    let res = app
-        .send(auth_get(&format!("/api/chat/conversations/{key}")))
-        .await;
-    assert_eq!(res.status, StatusCode::OK);
-    let body: Value = res.json();
-    let msgs = body["messages"].as_array().cloned().unwrap_or_default();
+    let body = wait_for_messages(&app, &key, 2).await;
+    let msgs = body["messages"].as_array().expect("messages");
     assert_eq!(msgs.len(), 2, "expected exactly two messages: {body:?}");
     assert_eq!(msgs[0]["role"], "user");
     assert_eq!(msgs[0]["content"], "Hello");
@@ -138,10 +153,23 @@ async fn post_message_streams_and_persists_pair_with_title() {
     assert_eq!(msgs[1]["role"], "assistant");
     assert_eq!(msgs[1]["content"], "ok");
     assert_eq!(msgs[1]["parent_id"], "message:01HXY0000000000000000000ZZ");
-    assert!(
-        body["conversation"]["title"].as_str().is_some(),
-        "auto-title should be set",
-    );
+
+    // Auto-title generation is best-effort and runs in a detached task
+    // after the commit; poll briefly so the test isn't flaky.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let res = app
+            .send(auth_get(&format!("/api/chat/conversations/{key}")))
+            .await;
+        let body: Value = res.json();
+        if body["conversation"]["title"].as_str().is_some() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out waiting for auto-title; body: {body}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -204,12 +232,9 @@ async fn list_messages_round_trips_parent_id_field() {
             }),
         ))
         .await;
-    assert_eq!(res.status, StatusCode::OK);
+    assert_eq!(res.status, StatusCode::ACCEPTED);
 
-    let res = app
-        .send(auth_get(&format!("/api/chat/conversations/{key}")))
-        .await;
-    let body: Value = res.json();
+    let body = wait_for_messages(&app, &key, 2).await;
     let msgs = body["messages"].as_array().expect("messages");
     assert_eq!(msgs.len(), 2);
     assert!(msgs[0]["parent_id"].is_null(), "user msg parent is null");
@@ -259,9 +284,9 @@ async fn delete_cascades_and_is_idempotent() {
     let id = create_one(&app).await;
     let key = key_of(&id);
 
-    // Post a message so we have something to cascade. The POST body
-    // is the worker's stream — `app.send` collects it to completion,
-    // by which point `commit_turn` has already persisted both rows.
+    // Post a message so we have something to cascade. POST is now
+    // fire-and-forget (202), so wait for the commit to land before
+    // deleting.
     let _ = app
         .send(auth_post(
             &format!("/api/chat/conversations/{key}/messages"),
@@ -272,6 +297,7 @@ async fn delete_cascades_and_is_idempotent() {
             }),
         ))
         .await;
+    let _ = wait_for_messages(&app, &key, 2).await;
 
     let res = app
         .send(auth_delete(&format!("/api/chat/conversations/{key}")))
