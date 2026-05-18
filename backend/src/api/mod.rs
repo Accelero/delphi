@@ -7,7 +7,7 @@ mod conversations;
 mod discovery;
 mod documents;
 mod health;
-pub(crate) mod stream;
+pub(crate) mod sse;
 
 use std::path::PathBuf;
 use std::sync::Arc;
