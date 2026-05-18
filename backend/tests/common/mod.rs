@@ -31,7 +31,7 @@ use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
     JwtClaimsExtractor, JwtValidator,
 };
-use delphi::chat::TaskRegistry;
+use delphi::chat::SessionRegistry;
 use delphi::embedder::Embedder;
 use delphi::object_store::{MemObjectStore, ObjectStore};
 use delphi::state::AppState;
@@ -57,10 +57,10 @@ pub struct TestApp {
     /// can `subscribe()` to verify ingest fan-out without parsing the
     /// SSE stream.
     pub events: tokio::sync::broadcast::Sender<delphi::ingestion::FeedItemEvent>,
-    /// Same `TaskRegistry` the router holds in its `AppState`. Tests
-    /// that need to inspect in-flight chat workers reach in via this
-    /// handle instead of going through the HTTP path.
-    pub tasks: Arc<TaskRegistry>,
+    /// Same `SessionRegistry` the router holds in its `AppState`.
+    /// Tests that need to inspect per-conversation chat sessions reach
+    /// in via this handle instead of going through the HTTP path.
+    pub sessions: Arc<SessionRegistry>,
     /// Same per-request pool the router uses; lets tests drive
     /// `commit_turn` and other request-path Storage methods directly
     /// against a JWT-authed handle (mint the bearer via
@@ -166,10 +166,10 @@ impl TestApp {
 
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
-        let tasks = Arc::new(TaskRegistry::new());
+        let sessions = Arc::new(SessionRegistry::new());
         let state = AppState {
             llm: llm.unwrap_or_else(|| Arc::new(FakeLlmClient::default())),
-            tasks: tasks.clone(),
+            sessions: sessions.clone(),
             request_db_pool: request_pool.clone(),
             object_store: object_store.clone(),
             events: events_tx.clone(),
@@ -191,7 +191,7 @@ impl TestApp {
             default_tenant_id,
             default_tenant_slug,
             events: events_tx,
-            tasks,
+            sessions,
             request_db_pool: request_pool,
         }
     }

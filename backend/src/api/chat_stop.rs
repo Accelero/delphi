@@ -1,14 +1,15 @@
-//! Stop a named chat-worker.
+//! Stop the in-flight turn for a conversation.
 //!
-//! Route: `POST /api/chat/conversations/{key}/tasks/{task_id}/stop`.
+//! Route: `POST /api/chat/conversations/{key}/stop`.
 //!
-//! Idempotent: returns `204 No Content` whether or not the task was
-//! found. Any caller authenticated for the conversation can hit it.
+//! Idempotent: returns `204 No Content` whether or not there was an
+//! in-flight turn. Any caller authenticated for the conversation can
+//! hit it. **Conversation-scoped — no task id in the public API.**
+//! Since v3 allows only one in-flight turn per conversation, there is
+//! no ambiguity about which turn gets cancelled.
 //!
-//! The PERMISSIONS pre-check (via `get_conversation`) is what keeps
-//! anonymous callers from probing for valid task ids across
-//! conversations they don't own — without it, a /stop would 204 for
-//! any string and leak the task id space.
+//! The PERMISSIONS pre-check (via `get_conversation`) keeps anonymous
+//! callers from probing for valid conversation keys.
 
 use std::sync::Arc;
 
@@ -18,7 +19,6 @@ use axum::response::{IntoResponse, Response};
 use axum::Extension;
 use surrealdb::RecordId;
 
-use crate::chat::TaskId;
 use crate::state::AppState;
 use crate::storage::{AuthedDb, ConversationId, Storage};
 
@@ -33,16 +33,15 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
 pub async fn stop(
     State(app): State<AppState>,
     Extension(db): Extension<Arc<AuthedDb>>,
-    Path((conv_key, task_key)): Path<(String, String)>,
+    Path(conv_key): Path<String>,
 ) -> Response {
     let conv_id = match parse_conversation_id(&conv_key) {
         Ok(id) => id,
         Err(r) => return r,
     };
 
-    // PERMISSIONS gate: same shape as the chat endpoints — a caller
-    // who can't see the conversation gets the same 404 they'd see
-    // anywhere else, rather than a 204 leak.
+    // PERMISSIONS gate: a caller who can't see the conversation gets
+    // the same 404 they'd see anywhere else, rather than a 204 leak.
     match db.get_conversation(&conv_id).await {
         Ok(Some(_)) => {}
         Ok(None) => return (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -52,14 +51,10 @@ pub async fn stop(
         }
     }
 
-    let task_id = match TaskId::parse(&task_key) {
-        Ok(t) => t,
-        Err(_) => return (StatusCode::BAD_REQUEST, "invalid task id").into_response(),
-    };
-
-    // Best-effort: no-op if the task is absent (already completed or
-    // never existed). The design doc spells this out — the response is
-    // 204 either way.
-    let _ = app.tasks.cancel(&task_id);
+    // Look up the session WITHOUT creating one — if no turn has ever
+    // touched this conversation, there is nothing to stop.
+    if let Some(session) = app.sessions.lookup(&conv_id) {
+        session.abort();
+    }
     StatusCode::NO_CONTENT.into_response()
 }

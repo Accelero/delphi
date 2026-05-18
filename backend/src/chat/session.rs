@@ -14,7 +14,7 @@
 //! unlocks. The mutex is contended only at frame cadence (chat-rate
 //! tokens + subscribe events), which is cheap.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -36,6 +36,8 @@ pub struct AlreadyRunning;
 
 /// Live state of the current turn. `None` when the conversation is idle.
 pub struct InFlightTurn {
+    /// Internal-only worker handle; useful for log/trace correlation.
+    #[allow(dead_code)]
     pub task_id: TaskId,
     pub cancel: CancellationToken,
     /// SSE-formatted frames emitted so far, replayable verbatim to any
@@ -263,10 +265,6 @@ mod tests {
 
     use crate::api::sse;
     use std::sync::Arc;
-
-    fn frame(s: &str) -> Bytes {
-        Bytes::from(s.to_string())
-    }
 
     #[tokio::test]
     async fn subscribe_then_emit_orders_frames() {
