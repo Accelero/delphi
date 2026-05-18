@@ -35,9 +35,9 @@ import {
   conversationsKey,
 } from "@/hooks/useConversations";
 import {
-  useSessionStream,
+  useChatStream,
   type LocalMessage,
-} from "@/hooks/useSessionStream";
+} from "@/hooks/useChatStream";
 
 import {
   Message,
@@ -182,7 +182,7 @@ export function Chat({
     error,
     submit,
     stop,
-  } = useSessionStream(sessionKey, {
+  } = useChatStream(sessionKey, {
     initialMessages: seed,
     onTurnEnd,
   });

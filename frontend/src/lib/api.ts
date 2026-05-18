@@ -183,34 +183,42 @@ export const api = {
       request<void>(`/api/chat/conversations/${encodeURIComponent(key)}`, {
         method: "DELETE",
       }),
-    /** POST one turn. The response body **is** the AI SDK
-     *  data-stream — caller `.body.getReader()`s and parses frames
-     *  incrementally. Returns the raw `Response` (so the caller can
-     *  inspect status + body together; a 409 reads as `stale_parent`).
+    /** Submit one turn. Fire-and-forget — the live SSE stream
+     *  delivers user_message + text + finish frames.
      *
-     *  Body shape: `{ id, text, parent_id }`. The `id` is a
-     *  client-generated ULID; the server takes it verbatim as the
-     *  message record key. `parent_id` is the last known assistant
-     *  message id (`"message:..."`) or `null` for the first turn. */
-    submitMessage: (
+     *  Body shape: `{ id, text, parent_id }`. `id` is a client-
+     *  generated ULID, used verbatim as the message record key.
+     *  `parent_id` is the last known assistant message id or `null`
+     *  for the first turn.
+     *
+     *  Returns `{ok: true}` on 202 Accepted; `{ok: false, status}`
+     *  on 409 (parent stale OR turn in flight) or any other failure.
+     *  Caller inspects `status` to decide between a refetch toast
+     *  and a generic error. */
+    submitMessage: async (
       key: string,
       body: { id: string; text: string; parent_id: string | null },
-      signal?: AbortSignal,
-    ) =>
-      fetch(`/api/chat/conversations/${encodeURIComponent(key)}/messages`, {
-        method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal,
-      }),
-    /** Cancel an in-flight task by id. Idempotent — server returns
-     *  204 whether or not the task is still around. Fire-and-forget. */
-    stopTask: (key: string, taskId: string) =>
+    ): Promise<{ ok: true } | { ok: false; status: number }> => {
+      const res = await fetch(
+        `/api/chat/conversations/${encodeURIComponent(key)}/messages`,
+        {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (res.status === 202) return { ok: true };
+      return { ok: false, status: res.status };
+    },
+    /** Cancel the in-flight turn (if any) for a conversation.
+     *  Idempotent — server returns 204 whether or not a turn was
+     *  running. Fire-and-forget; the SSE `clear` event drives the
+     *  UI rollback. **No task id** — v3's `/stop` is scoped to the
+     *  conversation. */
+    stopChat: (key: string) =>
       request<void>(
-        `/api/chat/conversations/${encodeURIComponent(
-          key,
-        )}/tasks/${encodeURIComponent(taskId)}/stop`,
+        `/api/chat/conversations/${encodeURIComponent(key)}/stop`,
         { method: "POST" },
       ),
   },
