@@ -1,44 +1,37 @@
 //! Submit one user message to a persisted conversation.
 //!
-//! Route: `POST /api/chat/conversations/{id}/messages`.
+//! Route: `POST /api/chat/conversations/{key}/messages`.
 //!
-//! Post-redesign (see
+//! v3 contract (see
 //! [`docs/architecture/chat-streaming.md`](../../../docs/architecture/chat-streaming.md)):
-//! the POST **is** the stream. The response body is the AI SDK
-//! data-stream emitted by the worker spawned for this turn. There is no
-//! separate `/stream` subscription.
+//! the POST is **fire-and-forget**. The handler:
 //!
-//! Lifecycle:
+//!  1. Parses + validates `{ id, text, parent_id }`.
+//!  2. PERMISSIONS gate + parent-id check on the caller's `AuthedDb`.
+//!  3. Buffers the `user_message` SSE frame and registers the worker's
+//!     cancel token via [`SessionState::start_turn`]. If a turn is
+//!     already in flight for this conversation, returns **409**.
+//!  4. Spawns the worker.
+//!  5. Returns **202 Accepted** with an empty body.
 //!
-//!  1. Parse + basic validation on `{ id, text, parent_id }`.
-//!  2. PERMISSIONS gate: `get_conversation` on the caller's
-//!     [`AuthedDb`].
-//!  3. Optimistic concurrency check: `parent_id` must match the
-//!     conversation's tail. Mismatch → `409 Conflict`.
-//!  4. Spawn the worker; wrap its mpsc receiver in a streaming
-//!     response body.
-//!  5. Return 200 with the AI SDK headers and the stream as body.
-//!
-//! The first frame on the stream is the `8:` task frame, so the client
-//! knows the `task_id` before any text arrives.
+//! The client doesn't read this response for streaming bytes — every
+//! tab subscribes to the per-conversation SSE stream and receives the
+//! same buffered + live frames as everyone else.
 
-use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use bytes::Bytes;
 use serde::Deserialize;
 use surrealdb::RecordId;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_stream::StreamExt as _;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
+use crate::api::sse;
 use crate::auth::AuthContext;
-use crate::chat::{spawn_worker, turn_request};
+use crate::chat::{spawn_worker, turn_request, TaskId};
 use crate::state::AppState;
 use crate::storage::{AuthedDb, ConversationId, MessageId, Storage};
 
@@ -46,13 +39,12 @@ use crate::storage::{AuthedDb, ConversationId, MessageId, Storage};
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     /// Client-generated ULID for the user message. The server takes
-    /// this verbatim as the record key (`message:<id>`) so the
-    /// optimistic insert and the persisted row agree from byte zero.
+    /// this verbatim as the record key (`message:<id>`).
     pub id: String,
     /// User text. Must be non-empty after trim.
     pub text: String,
-    /// Last assistant message id the client knows about, e.g.
-    /// `"message:k9d8…"`. `None` (or absent) declares "first turn".
+    /// Last assistant message id the client knows about
+    /// (`"message:k9d8…"`). `None` declares "first turn".
     #[serde(default)]
     pub parent_id: Option<String>,
 }
@@ -65,23 +57,21 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     Ok(RecordId::from(("conversation", k)))
 }
 
-/// Cheap syntactic check on the user-supplied ULID. Delegates to the
-/// `ulid` crate so we agree with the client's `ulid()` exactly.
+/// Cheap syntactic check on the user-supplied ULID.
 fn looks_like_ulid(s: &str) -> bool {
     ulid::Ulid::from_string(s).is_ok()
 }
 
 /// Parse a `parent_id` from the request body. Accepts `"message:<key>"`
-/// only; anything else is a 400 (the client never builds an id that
-/// isn't a record id stringified).
+/// only.
 fn parse_parent_id(s: &str) -> Result<MessageId, Response> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty parent_id").into_response());
     }
-    let (table, key) = trimmed
-        .split_once(':')
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "parent_id missing 'message:' prefix").into_response())?;
+    let (table, key) = trimmed.split_once(':').ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, "parent_id missing 'message:' prefix").into_response()
+    })?;
     if table != "message" || key.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "parent_id must be 'message:<key>'").into_response());
     }
@@ -109,7 +99,6 @@ pub async fn post_message(
         Err(r) => return r,
     };
 
-    // Validate the client-provided message id BEFORE we touch the DB.
     if !looks_like_ulid(&req.id) {
         return (StatusCode::BAD_REQUEST, "invalid message id").into_response();
     }
@@ -157,6 +146,22 @@ pub async fn post_message(
         None => return (StatusCode::UNAUTHORIZED, "missing bearer").into_response(),
     };
 
+    // Buffer the user_message frame and claim the in-flight slot. On
+    // AlreadyRunning we 409 — the client should wait for the existing
+    // turn to finish (it sees the same live SSE stream).
+    let session = state.sessions.for_conversation(&conv_id);
+    let user_record_id = format!("message:{}", req.id);
+    let user_frame = sse::user_message(&user_record_id, &req.text);
+    let task_id = TaskId::new();
+    let cancel = CancellationToken::new();
+    if let Err(_already) = session.start_turn(task_id, cancel.clone(), user_frame) {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"reason": "in_flight"})),
+        )
+            .into_response();
+    }
+
     let turn = turn_request(
         conv_id.clone(),
         req.id,
@@ -166,7 +171,7 @@ pub async fn post_message(
         auth.clone(),
         &state,
     );
-    let (task_id, rx) = spawn_worker(state.tasks.clone(), turn);
+    spawn_worker(session, task_id, cancel, turn);
 
     info!(
         user_id = %auth.user_id,
@@ -175,14 +180,7 @@ pub async fn post_message(
         "turn submitted"
     );
 
-    let stream = ReceiverStream::new(rx).map(Ok::<Bytes, Infallible>);
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .header("x-vercel-ai-data-stream", "v1")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(stream))
-        .expect("static headers, valid body")
+    StatusCode::ACCEPTED.into_response()
 }
 
 #[cfg(test)]
@@ -199,7 +197,6 @@ mod tests {
         assert!(!looks_like_ulid(""));
         assert!(!looks_like_ulid("too short"));
         assert!(!looks_like_ulid("01HXY0000000000000000000Z!"));
-        // 'I', 'L', 'O', 'U' are not in Crockford base32
         assert!(!looks_like_ulid("01HXY0000000000000000000II"));
     }
 
