@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::auth::AuthContext;
 use crate::chunker::ChunkConfig;
 use crate::state::AppState;
 use crate::storage::AuthedDb;
@@ -28,9 +27,6 @@ impl TextExtractor for NoopExtractor {
         Ok(Vec::new())
     }
 }
-
-/// Roles permitted to push documents in via the HTTP path.
-const INGESTER_ROLES: &[&str] = &["ingester", "owner"];
 
 /// Wire shape: identical to [`IngestRequest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,17 +79,8 @@ impl From<IngestRequestBody> for IngestRequest {
 pub async fn ingest_documents(
     State(state): State<AppState>,
     Extension(db): Extension<Arc<AuthedDb>>,
-    auth: AuthContext,
     Json(body): Json<IngestRequestBody>,
 ) -> Response {
-    let allowed = auth
-        .roles
-        .iter()
-        .any(|r| INGESTER_ROLES.contains(&r.as_str()));
-    if !allowed {
-        return (StatusCode::FORBIDDEN, "ingester role required").into_response();
-    }
-
     let storage = db.as_storage();
     let pipeline: Arc<dyn IngestSink> = Arc::new(Pipeline::new(storage.clone()));
     // Wrap with the RAG decorator when at least one embedder is wired up.

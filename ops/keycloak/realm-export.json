@@ -16,8 +16,13 @@
   "roles": {
     "realm": [
       { "name": "member", "description": "Standard tenant member" },
-      { "name": "owner",  "description": "Tenant owner — can ingest, admin within tenant" },
-      { "name": "ingester", "description": "Service account allowed to POST /api/ingestion/documents" }
+      {
+        "name": "owner",
+        "description": "Tenant owner — admin within tenant; composite of ingester so owners can ingest without a separate assignment",
+        "composite": true,
+        "composites": { "realm": ["ingester"] }
+      },
+      { "name": "ingester", "description": "Permitted to call ingestion endpoints" }
     ]
   },
 

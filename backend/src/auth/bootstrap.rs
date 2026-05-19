@@ -227,7 +227,6 @@ async fn upsert_membership(
     system: &SystemDb,
     user: &RecordId,
     tenant: &RecordId,
-    role: &str,
 ) -> Result<()> {
     ensure_root_session(system).await;
     let db = system.raw();
@@ -242,10 +241,9 @@ async fn upsert_membership(
         return Ok(());
     }
     let result = db
-        .query("CREATE membership CONTENT { user: $u, tenant_id: $t, role: $role }")
+        .query("CREATE membership CONTENT { user: $u, tenant_id: $t }")
         .bind(("u", user.clone()))
         .bind(("t", tenant.clone()))
-        .bind(("role", role.to_string()))
         .await
         .context("create membership")
         .and_then(|r| r.check().context("membership create check"));
@@ -298,7 +296,7 @@ pub async fn ensure_user(
         &tenant_id,
     )
     .await?;
-    upsert_membership(system, &user.id, &tenant_id, "member").await?;
+    upsert_membership(system, &user.id, &tenant_id).await?;
 
     Ok(AuthContext {
         user_id: user.id,
@@ -312,9 +310,9 @@ pub async fn ensure_user(
     })
 }
 
-/// Idempotent dev seed: ensures the dev tenant exists with role=owner so the
-/// per-request [`ensure_user`] (which assigns role=member to fresh users) is
-/// a no-op SELECT for the dev user. Returns the resolved tenant id.
+/// Idempotent dev seed: ensures the dev tenant and the dev user's
+/// membership row exist so the per-request [`ensure_user`] is a no-op
+/// SELECT for the dev user. Returns the resolved tenant id.
 #[cfg(feature = "dev-auth")]
 pub async fn seed_dev_world(system: &SystemDb, cfg: &DevConfig) -> Result<RecordId> {
     let tenant_id = upsert_tenant(system, &cfg.tenant_slug, "Dev Tenant").await?;
@@ -327,6 +325,6 @@ pub async fn seed_dev_world(system: &SystemDb, cfg: &DevConfig) -> Result<Record
         &tenant_id,
     )
     .await?;
-    upsert_membership(system, &user.id, &tenant_id, "owner").await?;
+    upsert_membership(system, &user.id, &tenant_id).await?;
     Ok(tenant_id)
 }

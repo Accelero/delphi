@@ -44,7 +44,11 @@ struct DevClaims<'a> {
     email: &'a str,
     preferred_username: &'a str,
     tenant_id: &'a str,
-    roles: [&'a str; 1],
+    /// Leaf capabilities the dev user holds. The backend never checks
+    /// for hierarchical roles like `owner`; composition (if any) is
+    /// configured in Keycloak and flattened into the token there. The
+    /// dev injector emits the same leaf-only shape directly.
+    roles: &'a [&'a str],
     // SurrealDB session routing.
     ac: &'static str,
     ns: &'a str,
@@ -77,7 +81,7 @@ fn mint_dev_jwt(cfg: &DevConfig) -> String {
         email: &cfg.user_email,
         preferred_username: &cfg.user_name,
         tenant_id: &cfg.tenant_slug,
-        roles: ["owner"],
+        roles: &["ingester"],
         ac: "app_session",
         ns: &cfg.surreal_ns,
         db: &cfg.surreal_db,
@@ -149,7 +153,7 @@ mod tests {
         assert_eq!(claims.email, cfg.user_email);
         assert_eq!(claims.display_name.as_deref(), Some(cfg.user_name.as_str()));
         assert_eq!(claims.tenant_slug.as_deref(), Some(cfg.tenant_slug.as_str()));
-        assert_eq!(claims.roles, vec!["owner".to_string()]);
+        assert_eq!(claims.roles, vec!["ingester".to_string()]);
     }
 
     #[tokio::test]

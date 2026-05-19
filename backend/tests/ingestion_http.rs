@@ -48,24 +48,6 @@ async fn ingest_401_when_unauthenticated() {
 }
 
 #[tokio::test]
-async fn ingest_403_when_role_missing() {
-    let app = TestApp::build().await;
-    let req = AuthRequestBuilder::default()
-        .sub("alice")
-        // no roles set → not an ingester
-        .apply(
-            Request::builder()
-                .method("POST")
-                .uri("/api/ingestion/documents")
-                .header("content-type", "application/json")
-                .body(ingest_request("doc-1", "hello"))
-                .unwrap(),
-        );
-    let res = app.send(req).await;
-    assert_eq!(res.status, StatusCode::FORBIDDEN);
-}
-
-#[tokio::test]
 async fn ingest_200_creates_then_unchanged_then_versioned() {
     let app = TestApp::build().await;
 

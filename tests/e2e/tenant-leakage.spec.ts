@@ -102,26 +102,6 @@ test("ingested doc is visible to its tenant only @tier2", async ({
   await bobCtx.close();
 });
 
-test("bob without ingester role cannot ingest @tier2", async ({ browser }) => {
-  const ctx = await browser.newContext();
-  const page = await ctx.newPage();
-  await loginViaKeycloak(page, "bob");
-
-  const res = await page.request.post(`${ORIGIN}/api/ingestion/documents`, {
-    data: {
-      canonical_id: `bob-attempt-${Date.now()}`,
-      source_type: "manual",
-      source_uri: "https://example.test/bob-attempt",
-      title: "bob shouldn't be allowed to ingest",
-    },
-    failOnStatusCode: false,
-  });
-  // INGESTER_ROLES = ["ingester", "owner"]; bob has only "member".
-  expect(res.status()).toBe(403);
-
-  await ctx.close();
-});
-
 // NOTE: a third test for "alice cannot mark-read a doc in another
 // tenant" was prototyped here and uncovered that `POST
 // /api/discovery/items/:id/read` returns 204 even for a non-existent

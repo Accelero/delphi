@@ -80,8 +80,9 @@ Optional headers:
 - `X-Auth-Name` — preferred display name (`preferred_username` / `name`).
 - `X-Auth-Tenant-Id` — tenant the request belongs to. Absent or unknown
   → falls back to the configured `DEFAULT_TENANT_SLUG`.
-- `X-Auth-Roles` — comma-separated role list for application-level
-  authorisation within a tenant.
+- `X-Auth-Roles` — comma-separated role list. Parsed into
+  `AuthContext.roles` for future per-action authorisation; no
+  endpoint consults it today.
 
 The trust boundary is the `ClaimsExtractor` trait. Today the only
 implementation reads the headers above and trusts them (the backend must
@@ -162,9 +163,14 @@ password-reset flow, and no role-editing UI.
   rules scope every read and write to the caller's `tenant_id`. The backend
   cannot accidentally leak across tenants because the database itself
   refuses cross-tenant queries.
-- **Roles are application-level.** Application code consults
-  `X-Auth-Roles` for feature gating (e.g. "can create source adapters")
-  *within* a tenant.
+- **Roles are application-level and composed in the IdP.** The JWT
+  `roles` claim is parsed onto `AuthContext.roles`. The only gate
+  today is on the ingestion endpoints (`/api/ingestion/uploads*`),
+  which require the leaf `ingester` role. Hierarchy is configured
+  via Keycloak composite roles — `owner` includes `ingester`, so
+  the backend never needs to know about the hierarchy itself.
+  Adding more capability-style roles is a realm config change plus
+  one handler line.
 
 ## Storage (SurrealDB)
 

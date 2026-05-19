@@ -103,8 +103,12 @@ DEFINE FIELD IF NOT EXISTS user      ON membership TYPE record<app_user>;
 -- legacy `tenant` field (pre-tenancy schema) — drop on apply if present.
 REMOVE FIELD IF EXISTS tenant ON membership;
 DEFINE FIELD IF NOT EXISTS tenant_id ON membership TYPE record<tenant>;
-DEFINE FIELD IF NOT EXISTS role      ON membership TYPE string
-    ASSERT $value INSIDE ['owner','admin','member','viewer'];
+-- Roles are not stored in the backend. Identity-level capabilities
+-- live in the IdP (Keycloak realm roles); the backend reads them off
+-- the JWT's `roles` claim per request. Resource-level authorisation
+-- (e.g. "alice created this document") will live in dedicated columns
+-- like `created_by` if/when introduced, not under the word "role".
+REMOVE FIELD IF EXISTS role ON membership;
 DEFINE FIELD IF NOT EXISTS joined_at ON membership TYPE datetime DEFAULT time::now();
 -- legacy index names (pre-tenancy schema) — drop on apply if present.
 REMOVE INDEX IF EXISTS membership_user_tenant ON membership;
