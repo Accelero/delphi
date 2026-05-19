@@ -32,7 +32,6 @@
 //!
 //! [`IngestRequestBody`]: crate::ingestion::IngestRequestBody
 
-mod arxiv;
 mod ingest_client;
 mod registry;
 mod scheduler;
@@ -45,7 +44,6 @@ use serde_json::Value;
 use crate::error::Result;
 use crate::ingestion::IngestRequestBody;
 
-pub use arxiv::ArxivAdapter;
 pub use ingest_client::IngestApiClient;
 pub use registry::{default_registry, AdapterRegistry};
 pub use scheduler::{run_scheduler, SchedulerHandle};

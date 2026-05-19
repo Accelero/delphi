@@ -79,7 +79,7 @@ base64 = "0.22"
 # JWTs to flow straight through to the DB without re-signing.
 jsonwebtoken = { version = "9", default-features = false }
 
-# arXiv adapter speaks Atom XML, not JSON.
+# pdftotext bbox-layout extractor reads poppler's XHTML output.
 quick-xml = { version = "0.36", features = ["serialize"] }
 
 # `Bytes` is in our `ObjectStore` API to avoid copies when piping PDFs

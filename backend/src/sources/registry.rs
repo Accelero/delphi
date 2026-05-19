@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use crate::object_store::ObjectStore;
 
-use super::arxiv::ArxivAdapter;
 use super::SourceAdapter;
 
 /// In-memory list of installed adapters. Built once at startup.
@@ -46,11 +45,8 @@ impl AdapterRegistry {
 /// Adapters that need to stash original artefacts (PDFs, etc.) take
 /// the shared `ObjectStore` as a constructor dependency — that's why
 /// it's an argument here.
-pub fn default_registry(object_store: Arc<dyn ObjectStore>) -> AdapterRegistry {
-    let mut reg = AdapterRegistry::new();
-    reg.try_register(
-        ArxivAdapter::try_from_env(object_store.clone()).map(|a| Arc::new(a) as _),
-    );
+pub fn default_registry(_object_store: Arc<dyn ObjectStore>) -> AdapterRegistry {
+    let reg = AdapterRegistry::new();
     // future:
     // reg.try_register(SemanticScholarAdapter::try_from_env().map(|a| Arc::new(a) as _));
     // reg.try_register(PubmedAdapter::try_from_env().map(|a| Arc::new(a) as _));

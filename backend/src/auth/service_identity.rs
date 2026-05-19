@@ -1,5 +1,5 @@
 //! Service identities — JWTs minted *for* the backend's own outbound
-//! callers (today: the in-process arxiv adapter calling its own
+//! callers (e.g. an in-process source adapter calling its own
 //! `/api/ingestion/documents` endpoint over loopback).
 //!
 //! There is one trust boundary in this codebase — the
@@ -227,7 +227,7 @@ impl ServiceIdentity for OAuthClientCredsIdentity {
 /// with distinct `sub` values (and, in tier-2, distinct OAuth clients
 /// — set via `${NAME}_OAUTH_*` env vars on the prefix-uppercased name).
 ///
-/// Today the only caller is `arxiv`, which reads `ARXIV_OAUTH_*`.
+/// Example: a caller named `sources` reads `SOURCES_OAUTH_*`.
 pub fn service_identity_from_env(name: &str) -> Result<Arc<dyn ServiceIdentity>> {
     let mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "header".into());
     match mode.as_str() {
@@ -277,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn hs512_token_round_trips_through_validator() {
         let id = Hs512ServiceIdentity::new(
-            "arxiv",
+            "sources",
             TEST_SECRET,
             "tenant-a",
             "delphi",
@@ -286,7 +286,7 @@ mod tests {
         let jwt = id.fresh_token().await.unwrap();
         let validator = Hs512Validator::new(TEST_SECRET, None, None);
         let claims = validator.validate(&jwt).await.expect("validate");
-        assert_eq!(claims["sub"].as_str(), Some("service:arxiv"));
+        assert_eq!(claims["sub"].as_str(), Some("service:sources"));
         assert_eq!(claims["iss"].as_str(), Some("dev://local"));
         assert_eq!(claims["tenant_id"].as_str(), Some("tenant-a"));
         assert_eq!(claims["ac"].as_str(), Some("app_session"));
@@ -297,13 +297,13 @@ mod tests {
         assert_eq!(roles[0].as_str(), Some("ingester"));
         assert_eq!(
             claims["email"].as_str(),
-            Some("arxiv-adapter@delphi.local")
+            Some("sources-adapter@delphi.local")
         );
     }
 
     #[tokio::test]
     async fn hs512_caches_token_within_window() {
-        let id = Hs512ServiceIdentity::new("arxiv", TEST_SECRET, "t", "delphi", "main");
+        let id = Hs512ServiceIdentity::new("sources", TEST_SECRET, "t", "delphi", "main");
         let a = id.fresh_token().await.unwrap();
         let b = id.fresh_token().await.unwrap();
         assert_eq!(a, b, "cached token should be reused within refresh window");

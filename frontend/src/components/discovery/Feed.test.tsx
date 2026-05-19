@@ -46,8 +46,8 @@ function fakeDoc(i: number, overrides: Partial<FeedDocument> = {}): FeedDocument
   return {
     id: `document:doc-${i}`,
     canonical_id: `test:doc-${i}`,
-    source_type: "arxiv",
-    source_uri: `https://arxiv.org/abs/${i}`,
+    source_type: "manual",
+    source_uri: `https://example.test/docs/${i}`,
     authors: [`Author ${i}`],
     title: `Document ${i}`,
     summary: `Summary for document ${i}.`,

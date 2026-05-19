@@ -160,8 +160,9 @@ pub async fn validate_uploaded_object(
     match declared_content_type {
         "application/pdf" => {
             // For PDFs we'd ideally shell out to a sandboxed parser to
-            // detect page-count overruns / parse failures (see the
-            // arXiv adapter's `pdftotext` discipline). The current
+            // detect page-count overruns / parse failures (with the
+            // same timeout + size-cap discipline `pdftotext_bbox` uses).
+            // The current
             // milestone treats the sniff + size cap as sufficient: page
             // counting requires fully downloading the bytes through the
             // backend, which the design explicitly avoids. The

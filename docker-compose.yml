@@ -84,16 +84,8 @@ services:
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
       # Source adapters (Discovery pillar). All optional; SOURCES_ENABLED
-      # gates the scheduler entirely. ARXIV_QUERY gates the arXiv
-      # adapter individually — unset = adapter not registered.
+      # gates the scheduler entirely. No in-tree adapters today.
       SOURCES_ENABLED: ${SOURCES_ENABLED:-false}
-      ARXIV_QUERY: ${ARXIV_QUERY:-}
-      ARXIV_POLL_INTERVAL_SECS: ${ARXIV_POLL_INTERVAL_SECS:-21600}
-      ARXIV_PAGE_SIZE: ${ARXIV_PAGE_SIZE:-50}
-      # arXiv asks for a contact email in the User-Agent so they can
-      # reach out before rate-limiting an offending client. Optional
-      # but reduces 429 risk.
-      ARXIV_CONTACT_EMAIL: ${ARXIV_CONTACT_EMAIL:-}
       # Object storage for original artefacts (PDFs etc.). Path is the
       # *container* path; the volume mount below maps it to the host.
       OBJECT_STORE_URL: ${OBJECT_STORE_URL:-file:///var/lib/delphi/originals}

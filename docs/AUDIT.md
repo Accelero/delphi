@@ -101,24 +101,6 @@ Mark items as `[x]` once a fix has been merged and verified.
   per-route) so oversized requests never reach the backend. Single-user
   / private deployments skip._
 
-- [x] **H4.** arXiv `pdftotext` shell-out (`sources/arxiv.rs::extract_pdf_text`)
-  has no `tokio::time::timeout`, no output size cap, and the PDF download
-  reads the whole body into memory and clones it for the writer task. A
-  malformed PDF can hang or OOM the backend. Bound timeout, cap with
-  `ARXIV_MAX_PDF_BYTES`, stream instead of double-buffering.
-
-  _Resolved: download is now streamed via `bytes_stream()` with a
-  pre-check against `Content-Length` and an abort-on-exceed during
-  read (`ARXIV_MAX_PDF_BYTES`, default 50 MB). `pdftotext` runs under
-  a wall-clock timeout (`ARXIV_PDFTOTEXT_TIMEOUT_SECS`, default 30s)
-  and its stdout is read in chunks with a hard cap
-  (`ARXIV_MAX_EXTRACTED_TEXT_BYTES`, default 10 MB) — child is killed
-  on either limit. `kill_on_drop(true)` stops orphans on scheduler
-  shutdown. `to_vec()` clone for the writer task is gone — `Bytes`
-  is refcount-shared. Two new unit tests cover the output-cap and
-  timeout-kill paths via `cat`/`sleep` stand-ins; full backend test
-  suite green in both feature configs._
-
 - [x] **H5.** `Cargo.toml` enables `tower-http`'s `cors` feature but no
   `CorsLayer` is wired. Either drop the feature or add an explicit
   permissive-in-dev / restricted-in-prod layer.
@@ -229,10 +211,6 @@ Mark items as `[x]` once a fix has been merged and verified.
   The original network-flap silent-failure mode is unchanged — a
   `connectionState` UI surface is still a follow-up._
 
-- [ ] **M11.** `ARXIV_QUERY` is concatenated unsanitised into the search
-  URL. Operator-trusted, so not a vuln, but a typo silently produces a
-  different query. Add a small validator (e.g. balanced parens).
-
 - [x] **M13.** `POST /api/discovery/items/:id/read` returns 204 even
   when `:id` does not exist or belongs to another tenant. Surfaced by
   `tests/e2e/tenant-leakage.spec.ts` while writing the leakage suite.
@@ -306,10 +284,6 @@ Mark items as `[x]` once a fix has been merged and verified.
 - [ ] **L4.** `BIND_ADDR` defaults to `0.0.0.0:8081`. Right call inside
   docker, wrong call when running `cargo run` locally. Default to
   `127.0.0.1:8081`; require explicit override for `0.0.0.0`.
-
-- [ ] **L5.** `sources/arxiv.rs::categories_first` is a stub that always
-  returns `None`. `metadata.primary_category` is therefore always null.
-  Implement or remove.
 
 - [ ] **L6.** `enforce_production_guard` only fires on
   `RUST_ENV=production`. `RUST_ENV=staging` with `AUTH_MODE=dev` boots
@@ -500,9 +474,8 @@ Mark items as `[x]` once a fix has been merged and verified.
 5. ~~N1 — tier-1 dev (JWT-minting dev injector).~~ ✓
 6. ~~N5 — tier-2 `db.authenticate` against Keycloak JWKS.~~ ✓
 7. ~~N3 — backend signature validation (defence-in-depth).~~ ✓
-8. ~~H4 — bound the arxiv `pdftotext` shell-out (timeout + size cap).~~ ✓
-9. ~~H3, L2 — body size limit and per-user rate limit.~~ Deferred to
+8. ~~H3, L2 — body size limit and per-user rate limit.~~ Deferred to
    infra ([`INFRA-BACKLOG.md`](INFRA-BACKLOG.md)) — defended at the
    reverse proxy in tier-2; single-user deployments skip.
-10. ~~H2 — `mark_read` upsert race.~~ ✓
-11. ~~H6 — object-store tmp filename collision (concurrent PUT clobber).~~ ✓
+9. ~~H2 — `mark_read` upsert race.~~ ✓
+10. ~~H6 — object-store tmp filename collision (concurrent PUT clobber).~~ ✓

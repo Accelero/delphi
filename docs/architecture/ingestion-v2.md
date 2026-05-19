@@ -8,10 +8,9 @@ for URL-reference-only ingestion.
 
 ## Goals
 
-- A first-class **document upload API** the SPA, OAuth clients (e.g.
-  the future containerised arxiv adapter), and custom adapters all use
-  through the same endpoints. JWT-only auth, no special trust for any
-  client class.
+- A first-class **document upload API** the SPA, OAuth clients, and
+  custom adapters all use through the same endpoints. JWT-only auth,
+  no special trust for any client class.
 - Bytes go **direct from client to S3-compatible storage** via Uppy's
   `AwsS3Multipart`, with the backend minting every presigned URL.
 - Storage is **provider-agnostic** behind one `ObjectStore` interface.
@@ -28,9 +27,7 @@ for URL-reference-only ingestion.
 
 ## Non-goals (this milestone)
 
-- Adapter extraction into its own container — next milestone. The
-  arxiv adapter keeps calling the API and may need a small call-site
-  update.
+- Adapter extraction into its own container — next milestone.
 - The text-extraction / chunking / embedding pipeline. Bytes land, a
   `document` row is written; downstream processing is a separate
   piece of work.
@@ -285,9 +282,9 @@ at S3 only, not at the backend.
 Request:
 ```json
 {
-  "canonical_id": "arxiv:2401.12345" | "manual:6c4a..." | ...,
-  "source_type": "arxiv" | "manual" | "...",
-  "source_uri": "https://arxiv.org/abs/2401.12345",
+  "canonical_id": "doi:10.1234/abcd" | "manual:6c4a..." | ...,
+  "source_type": "doi" | "manual" | "...",
+  "source_uri": "https://doi.org/10.1234/abcd",
   "title": "...",
   "content_type": "application/pdf",
   "size": 8421376,
@@ -297,7 +294,7 @@ Request:
 
 For `source_type = "manual"`, the SPA generates a UUID and
 constructs `canonical_id = "manual:<uuid>"`. Other source types
-use their natural canonical id (`arxiv:<id>`, `doi:<id>`, etc.).
+use their natural canonical id (`doi:<id>`, etc.).
 The `MetadataPolicy.canonical_id_pattern` regex enforces shape.
 
 Handler:
@@ -786,4 +783,3 @@ Items the plan does **not** target despite earlier draft claims:
 
 - **M9** (frontend `source_uri` rendering) — orthogonal; lives in
   `DocumentCard.tsx`.
-- **M11** (`ARXIV_QUERY` validator) — adapter-internal.

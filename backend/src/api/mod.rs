@@ -157,8 +157,8 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
                     .await
                     .context("resolving scheduler tenant")?;
 
-            let identity = service_identity_from_env("arxiv")
-                .context("loading arxiv service identity")?;
+            let identity = service_identity_from_env("sources")
+                .context("loading sources service identity")?;
             let ingest_url = std::env::var("INGEST_API_URL")
                 .unwrap_or_else(|_| default_loopback_url(&bind));
             info!(

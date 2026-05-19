@@ -52,7 +52,7 @@ pub use url::from_url;
 
 /// Read-write key/value blob store.
 ///
-/// Keys are virtual paths (`arxiv/2106.09685v1.pdf`), no leading slash,
+/// Keys are virtual paths (`originals/2106.09685v1.pdf`), no leading slash,
 /// no `..` segments — implementations refuse those for path-traversal
 /// safety.
 #[async_trait]

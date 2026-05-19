@@ -12,13 +12,13 @@ async fn put_then_get_roundtrip() {
     let store = LocalFsObjectStore::new(tmp.path()).unwrap();
 
     let url = store
-        .put("arxiv/2106.09685v1.pdf", Bytes::from_static(b"PDF-bytes"))
+        .put("originals/doc-1.pdf", Bytes::from_static(b"PDF-bytes"))
         .await
         .unwrap();
     assert!(url.starts_with("file://"));
-    assert!(url.ends_with("arxiv/2106.09685v1.pdf"));
+    assert!(url.ends_with("originals/doc-1.pdf"));
 
-    let got = store.get("arxiv/2106.09685v1.pdf").await.unwrap();
+    let got = store.get("originals/doc-1.pdf").await.unwrap();
     assert_eq!(&got[..], b"PDF-bytes");
 }
 

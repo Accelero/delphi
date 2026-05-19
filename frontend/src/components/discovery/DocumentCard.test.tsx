@@ -9,8 +9,8 @@ function doc(overrides: Partial<FeedDocument> = {}): FeedDocument {
   return {
     id: "document:abc",
     canonical_id: "test:abc",
-    source_type: "arxiv",
-    source_uri: "https://arxiv.org/abs/0001.0001",
+    source_type: "manual",
+    source_uri: "https://example.test/docs/0001.0001",
     authors: ["Alice", "Bob"],
     title: "Hello world",
     summary: "A summary of hello world.",

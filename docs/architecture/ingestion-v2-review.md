@@ -104,8 +104,8 @@ explicit whether a retry after a transient error re-runs validation
 
 Both tables have `UNIQUE (tenant_id, canonical_id)`. So:
 
-- T0: Alice creates upload_session with `canonical_id = "arxiv:X"`.
-- T1: Bob (same tenant) ingests "arxiv:X" via the JSON endpoint — a
+- T0: Alice creates upload_session with `canonical_id = "doi:X"`.
+- T1: Bob (same tenant) ingests "doi:X" via the JSON endpoint — a
   `document` row exists.
 - T2: Alice's upload completes, validator passes, INSERT document
   fails on the UNIQUE constraint.

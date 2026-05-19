@@ -17,8 +17,7 @@ The document ingestion API (`/api/ingestion/*`) is first-class and
 treated as **untrusted on every call**. The same surface is hit by:
 
 - The SPA (any authenticated user).
-- The arxiv adapter (today in-process, soon a separate container; an
-  OAuth client like any other).
+- In-process source adapters running under a service identity.
 - Future custom adapters and external integrations.
 
 There is no privileged client path. Identity is the JWT, scope is the
