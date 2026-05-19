@@ -12,6 +12,10 @@ node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+.tanstack/
+
+# claude code agent worktrees
+.claude/worktrees/
 
 # tests
 tests/playwright-report/
