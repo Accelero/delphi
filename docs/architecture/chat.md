@@ -1,9 +1,6 @@
 # Chat Streaming — v3 (multi-tab via SSE)
 
-Status: shipped. Sister doc to [`ARCH.md`](../ARCH.md). Implementation
-plan and design rationale live in `chat-streaming-v3-plan.md` (the
-land-time spec used by the implementing agent — kept around as the
-detailed reference).
+Status: shipped. Sister doc to [`ARCH.md`](../ARCH.md).
 
 ## Implements
 

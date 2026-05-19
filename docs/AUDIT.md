@@ -137,11 +137,16 @@ Mark items as `[x]` once a fix has been merged and verified.
   the same key, asserts every one returns Ok, the final read returns
   one writer's payload, and no `.tmp` siblings linger._
 
-- [ ] **H7.** `conversation` and `message` tables are defined in the schema
+- [x] **H7.** `conversation` and `message` tables are defined in the schema
   but never written to by any code. Schema-as-aspiration drifts. Either
   delete the tables until chat persistence ships, or land a minimal
-  write-path now. *(Phase 1 added tenant_id columns to keep them ready
-  for the eventual write-path; status unchanged.)*
+  write-path now.
+
+  _Resolved: chat persistence landed with the v3 streaming surface.
+  `Storage` exposes `create_conversation` / `list_conversations` /
+  `get_conversation` / `commit_turn` / `rename_conversation` /
+  `delete_conversation`; the SurrealDB impl writes both tables
+  (`storage/surreal.rs`), and `api/chat.rs` drives them end-to-end._
 
 ---
 
@@ -228,13 +233,20 @@ Mark items as `[x]` once a fix has been merged and verified.
   URL. Operator-trusted, so not a vuln, but a typo silently produces a
   different query. Add a small validator (e.g. balanced parens).
 
-- [ ] **M13.** `POST /api/discovery/items/:id/read` returns 204 even
+- [x] **M13.** `POST /api/discovery/items/:id/read` returns 204 even
   when `:id` does not exist or belongs to another tenant. Surfaced by
   `tests/e2e/tenant-leakage.spec.ts` while writing the leakage suite.
   Per-user read-state row gets created against an unverified document
   id — bloats `feed_read` and would let a curious caller probe other
   tenants' id space (existence side-channel). Fix: validate the
   document exists in the caller's tenant before upserting `feed_read`.
+
+  _Resolved: no longer applicable. The mark-read endpoint and the
+  `feed_read` table no longer exist in the codebase — `api/mod.rs`
+  registers only `/api/discovery/feed` and `/api/discovery/feed/events`,
+  and `feed_read` is absent from `schema.surql`. If per-user read state
+  is reintroduced, the tenant-scoping requirement called out here must
+  be honoured up front._
 
 - [ ] **M14.** Tier-2 sign-out shows Keycloak's "Are you sure?"
   confirmation page before clearing SSO cookies, because we don't
