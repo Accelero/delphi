@@ -2,7 +2,7 @@
 //!
 //! v3 rejects a second submit while a turn is in flight (deliberate
 //! regression vs. v2's last-writer-wins, exchanged for a much simpler
-//! state machine — see `docs/architecture/chat-streaming.md` §
+//! state machine — see `docs/architecture/chat.md` §
 //! Trade-off vs. v2).
 //!
 //! We exercise the rejection at the `SessionState::start_turn` layer

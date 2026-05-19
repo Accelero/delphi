@@ -1,6 +1,6 @@
 //! `POST /api/chat/conversations/{key}/stop` semantics (v3).
 //!
-//! Covers the contract from `docs/architecture/chat-streaming.md` § Stop:
+//! Covers the contract from `docs/architecture/chat.md` § Stop:
 //!
 //! - 204 when no turn is in flight (idempotent).
 //! - 404 when the caller cannot see the conversation.

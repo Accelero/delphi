@@ -1,7 +1,7 @@
 //! Chat-streaming primitives (v3).
 //!
 //! Multi-tab, SSE-based fan-out (see
-//! [`docs/architecture/chat-streaming.md`](../../../docs/architecture/chat-streaming.md)):
+//! [`docs/architecture/chat.md`](../../../docs/architecture/chat.md)):
 //! POST `/messages` is fire-and-forget, GET `/stream` is the single
 //! source of truth, and per-conversation [`SessionState`] coordinates
 //! the worker, the buffered frames, and the live subscriber list.

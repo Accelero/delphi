@@ -3,7 +3,7 @@
 //! Route: `POST /api/chat/conversations/{key}/messages`.
 //!
 //! v3 contract (see
-//! [`docs/architecture/chat-streaming.md`](../../../docs/architecture/chat-streaming.md)):
+//! [`docs/architecture/chat.md`](../../../docs/architecture/chat.md)):
 //! the POST is **fire-and-forget**. The handler:
 //!
 //!  1. Parses + validates `{ id, text, parent_id }`.

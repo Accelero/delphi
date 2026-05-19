@@ -3,7 +3,7 @@
 ## Context
 
 The current chat surface (landed 2026-05-18, spec at
-`docs/architecture/chat-streaming.md`) collapses everything into one POST
+`docs/architecture/chat.md`) collapses everything into one POST
 whose response body **is** the AI SDK data-stream. That is elegant for a
 single-tab user but actively wrong for multi-tab:
 
@@ -444,7 +444,7 @@ Internals:
 | `backend/tests/chat_concurrent_post.rs` | **New** — second POST during in-flight turn → 409 |
 | `backend/tests/chat_late_subscribe.rs` | **New** — subscribe mid-turn, assert replay |
 | `backend/tests/chat_commit_abort_race.rs` | **New** — stop arriving during commit must not produce ghost messages |
-| `docs/architecture/chat-streaming.md` | Rewrite for v3 design (lands with step 10) |
+| `docs/architecture/chat.md` | Rewrite for v3 design (lands with step 10) |
 
 ## Implementation order
 
@@ -536,7 +536,7 @@ Claude trailer).
    - Verify: `make frontend-test` and a `bun run build`.
 
 10. **Update spec doc** — rewrite
-    `docs/architecture/chat-streaming.md` for v3. Land in the same
+    `docs/architecture/chat.md` for v3. Land in the same
     commit as step 11 so docs and behaviour match.
 
 11. **End-to-end smoke** — Tier 1 stack:

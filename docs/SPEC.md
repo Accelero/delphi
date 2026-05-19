@@ -43,7 +43,9 @@ Working with the existing corpus.
   the corpus.
 - **RAG chat with the corpus.** A chat interface backed by retrieval over the
   vector index, letting the user ask questions answered with citations into
-  the corpus.
+  the corpus. The chat surface itself (multi-tab equality, stop, late-join,
+  persistence semantics) is specified in
+  [`specs/chat.md`](./specs/chat.md).
 
 ### 3. Analysis
 
@@ -52,6 +54,8 @@ Working with individual documents.
 - **Document chat.** The user pulls a paper from the corpus into a chat
   surface and converses with an LLM "research buddy" about it: clarifying
   passages, extracting claims, comparing to other documents, drafting notes.
+  Reuses the chat surface specified in
+  [`specs/chat.md`](./specs/chat.md).
 - **Multi-document context.** Analysis sessions can span more than one
   document so the LLM can reason across a small working set.
 

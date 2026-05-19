@@ -213,6 +213,13 @@ authoritative schema lives in `backend/schema.surql`.
   Discovery surface ships first — cursor-paginated feed, per-user read
   state, and an SSE stream that pushes new accepted documents to clients.
   Details: [`architecture/discovery-feed.md`](architecture/discovery-feed.md).
+- **Chat.** POST `/messages` (fire-and-forget) + per-conversation SSE
+  stream every tab subscribes to + conversation-scoped `/stop`. The SSE
+  stream is the single source of truth: every tab sees the same events
+  in the same order, including late joiners (replay) and the originating
+  tab (no special path). Requirements:
+  [`specs/chat.md`](specs/chat.md). Architecture and the multi-tab
+  state machine: [`architecture/chat.md`](architecture/chat.md).
 
 Module boundaries follow the project rules in `.claude/CLAUDE.md`: each
 module exposes a public interface (`mod.rs`); cross-module access goes only
@@ -234,8 +241,10 @@ through that interface.
   HMR; Tier-2 runs the production Caddy image so e2e validates the
   actual bytes that ship.
 - **Chat surface.** Reusable component used for both corpus-RAG chat and
-  per-document analysis chat. Streaming responses with markdown and
-  reasoning rendering.
+  per-document analysis chat. Markdown + reasoning rendering, citations
+  inline. EventSource-driven; the same component renders identically on
+  every tab subscribed to a conversation. See
+  [`architecture/chat.md`](architecture/chat.md).
 - **Discovery feed.** Reverse-chronological infinite scroll over the
   user's corpus. Cursor pagination via TanStack Query's `useInfiniteQuery`,
   live-prepend via SSE, native `overflow-anchor` for scroll preservation,
