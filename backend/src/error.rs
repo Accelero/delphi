@@ -31,6 +31,12 @@ pub enum Error {
 
     #[error("not implemented: {0}")]
     NotImplemented(String),
+
+    /// `commit_upload` raced or duplicated a `canonical_id` already
+    /// present in `document`. The handler turns this into a 422 with
+    /// the existing doc id so the SPA can deep-link.
+    #[error("canonical_id conflict; existing doc: {existing_doc_id}")]
+    CanonicalIdConflict { existing_doc_id: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

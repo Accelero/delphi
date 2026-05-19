@@ -262,3 +262,78 @@ pub struct FeedCursor {
     pub ingested_at: DateTime<Utc>,
     pub id: DocId,
 }
+
+/// Parameters for `Storage::create_upload_session`. Mirrors what the
+/// `POST /api/ingestion/uploads` handler has after the metadata validator
+/// runs and `ObjectStore::create_multipart_upload` has minted an
+/// `upload_id`.
+#[derive(Debug, Clone)]
+pub struct CreateUploadSessionParams {
+    pub doc_id: String,
+    pub s3_key: String,
+    pub s3_upload_id: String,
+    pub canonical_id: String,
+    pub source_type: String,
+    pub source_uri: String,
+    pub title: Option<String>,
+    pub declared_size: u64,
+    pub declared_content_type: String,
+    pub declared_metadata: serde_json::Value,
+}
+
+/// One upload session row, as returned by `Storage::get_upload_session`
+/// and the cleaner's list helpers. `tenant_id` and `user_id` are
+/// engine-managed; we expose them so handlers can do the redundant
+/// belt-and-suspenders identity check from the plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadSession {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<RecordId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<RecordId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<RecordId>,
+
+    pub doc_id: String,
+    pub s3_key: String,
+    pub s3_upload_id: String,
+    pub state: String,
+    pub canonical_id: String,
+    pub source_type: String,
+    pub source_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub declared_size: i64,
+    pub declared_content_type: String,
+    #[serde(default)]
+    pub declared_metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+/// Side-channel rejection record. Written by the validator-reject path
+/// inside `POST /uploads/:id/complete`; reaped by the nightly cleaner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestionRejection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<RecordId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<RecordId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<RecordId>,
+
+    pub doc_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sniffed_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at: Option<DateTime<Utc>>,
+}
+
+/// `commit_upload` error path: a row with the same
+/// `(tenant_id, canonical_id)` already exists. The handler returns 422
+/// with `existing_doc_id` so the SPA can deep-link to the document.
+#[derive(Debug, Clone)]
+pub struct CanonicalIdConflict {
+    pub existing_doc_id: DocId,
+}

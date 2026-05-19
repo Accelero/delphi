@@ -1,6 +1,7 @@
 //! In-memory `ObjectStore` for tests. Not used by production code.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -8,6 +9,7 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 
+use super::multipart::ObjectMeta;
 use super::ObjectStore;
 
 #[derive(Default)]
@@ -64,5 +66,25 @@ impl ObjectStore for MemObjectStore {
             Error::InvalidConfig(format!("not a mem:// URL: {url}"))
         })?;
         self.get(key).await
+    }
+
+    async fn get_range(&self, key: &str, range: Range<u64>) -> Result<Bytes> {
+        let full = self.get(key).await?;
+        let start = range.start as usize;
+        let end = (range.end as usize).min(full.len());
+        if start >= full.len() {
+            return Ok(Bytes::new());
+        }
+        Ok(full.slice(start..end))
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta> {
+        let bytes = self.get(key).await?;
+        Ok(ObjectMeta {
+            size: bytes.len() as u64,
+            etag: format!("\"mem-{}\"", bytes.len()),
+            content_type: None,
+            last_modified: None,
+        })
     }
 }

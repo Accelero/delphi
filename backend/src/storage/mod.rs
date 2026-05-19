@@ -28,8 +28,9 @@ mod surreal;
 mod system;
 
 pub use models::{
-    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
-    DocId, Document, FeedCursor, Filters, MessageId,
+    Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content,
+    Conversation, ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
+    IngestionRejection, MessageId, UploadSession,
 };
 pub use request::{AuthRecord, AuthedDb, RequestDbPool};
 pub use surreal::SurrealStorage;
@@ -174,4 +175,55 @@ pub trait Storage: Send + Sync {
     /// Cascade-delete a conversation and all of its messages.
     /// Idempotent: deleting a missing id is a no-op.
     async fn delete_conversation(&self, id: &ConversationId) -> Result<()>;
+
+    // ---- ingestion v2: upload sessions -------------------------------------
+    //
+    // Each method below is the typed surface that the four upload
+    // endpoints depend on. Raw SurrealQL never escapes this module.
+    //
+    // Engine PERMISSIONS on `upload_session` scope by `(tenant_id,
+    // user_id)`, both populated from `$auth` via the schema's DEFAULT
+    // clauses; the handler additionally double-checks the loaded row's
+    // identity against `AuthContext` (belt-and-suspenders).
+
+    async fn create_upload_session(
+        &self,
+        params: &CreateUploadSessionParams,
+    ) -> Result<UploadSession>;
+
+    async fn get_upload_session(&self, doc_id: &str) -> Result<Option<UploadSession>>;
+
+    /// Compare-and-swap state transition. Returns `Ok(true)` if the row
+    /// was updated (caller proceeds), `Ok(false)` if it wasn't (another
+    /// caller has the session, it doesn't exist, or the state was
+    /// something other than `from`). Implementation:
+    /// `UPDATE upload_session WHERE doc_id = $d AND state = $from
+    ///  SET state = $to RETURN BEFORE`.
+    async fn cas_upload_session_state(
+        &self,
+        doc_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<bool>;
+
+    /// Atomic transaction: INSERT `document` + DELETE
+    /// `upload_session`. Returns the new document id.
+    ///
+    /// Errors with [`Error::CanonicalIdConflict`] when the schema's
+    /// UNIQUE `(tenant_id, canonical_id)` index would be violated;
+    /// the handler turns that into a 422.
+    async fn commit_upload(&self, doc_id: &str, doc: &Document) -> Result<DocId>;
+
+    /// Idempotent: deleting a missing session is a no-op.
+    async fn delete_upload_session(&self, doc_id: &str) -> Result<()>;
+
+    async fn record_ingestion_rejection(
+        &self,
+        rec: &IngestionRejection,
+    ) -> Result<()>;
+
+    async fn get_ingestion_rejection(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<IngestionRejection>>;
 }

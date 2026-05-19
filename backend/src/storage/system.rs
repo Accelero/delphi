@@ -29,7 +29,8 @@ use crate::error::{Error, Result};
 
 use super::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
-    DocId, Document, FeedCursor, Filters, MessageId, Storage,
+    CreateUploadSessionParams, DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId,
+    Storage, UploadSession,
 };
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
@@ -144,6 +145,19 @@ impl SystemDb {
     /// session to the privileged baseline before each upsert.
     pub fn shared_engine(&self) -> bool {
         self.shared_engine
+    }
+
+    /// Reset the shared in-memory engine's session to the privileged
+    /// baseline. Called by request-path code that must run a system
+    /// write inline (e.g. the validator-reject path writing to
+    /// `ingestion_rejection`, whose PERMISSIONS deny user-session
+    /// writes). No-op against a remote engine, where the SystemDb owns
+    /// its own connection and the session is permanently Root.
+    pub async fn reset_session_if_shared(&self) {
+        if !self.shared_engine {
+            return;
+        }
+        let _ = self.db.invalidate().await;
     }
 
     /// Borrow the underlying handle. Used by `auth/bootstrap.rs` (which
@@ -912,6 +926,106 @@ impl Storage for SystemStorage {
         Err(Error::NotImplemented(
             "SystemStorage does not delete conversations".into(),
         ))
+    }
+
+    // ---- ingestion v2: upload sessions -------------------------------------
+    //
+    // SystemStorage is the cleaner's surface — only `record_ingestion_rejection`
+    // is implemented here today (the only write that must bypass PERMISSIONS).
+    // Listing + reaping helpers live as inherent methods on `SystemDb`
+    // proper rather than the `Storage` trait, since they're system-only
+    // operations the request path has no use for.
+
+    async fn create_upload_session(
+        &self,
+        _params: &CreateUploadSessionParams,
+    ) -> Result<UploadSession> {
+        Err(Error::NotImplemented(
+            "SystemStorage::create_upload_session: use AuthedDb instead".into(),
+        ))
+    }
+    async fn get_upload_session(&self, doc_id: &str) -> Result<Option<UploadSession>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM upload_session WHERE tenant_id = $t AND doc_id = $d LIMIT 1")
+            .bind(("t", self.tenant.clone()))
+            .bind(("d", doc_id.to_string()))
+            .await?;
+        Ok(response.take(0)?)
+    }
+    async fn cas_upload_session_state(
+        &self,
+        _doc_id: &str,
+        _from: &str,
+        _to: &str,
+    ) -> Result<bool> {
+        Err(Error::NotImplemented(
+            "SystemStorage::cas_upload_session_state: use AuthedDb instead".into(),
+        ))
+    }
+    async fn commit_upload(&self, _doc_id: &str, _doc: &Document) -> Result<DocId> {
+        Err(Error::NotImplemented(
+            "SystemStorage::commit_upload: use AuthedDb instead".into(),
+        ))
+    }
+    async fn delete_upload_session(&self, doc_id: &str) -> Result<()> {
+        self.db
+            .query("DELETE upload_session WHERE tenant_id = $t AND doc_id = $d")
+            .bind(("t", self.tenant.clone()))
+            .bind(("d", doc_id.to_string()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+    async fn record_ingestion_rejection(&self, rec: &IngestionRejection) -> Result<()> {
+        // Root session: PERMISSIONS don't fire. We must set tenant_id /
+        // user_id explicitly. Caller is the validator-reject path, which
+        // has the values to hand.
+        //
+        // In the in-memory test rig the engine is shared with the
+        // RequestDbPool, so the active session may be RECORD (the
+        // caller's authenticated session). `record_ingestion_rejection`
+        // must run as root to bypass the `FOR create … WHERE FALSE`
+        // PERMISSIONS clause; drop the RECORD session first. No-op
+        // against a remote engine (production), where the SystemDb owns
+        // its own connection.
+        let _ = self.db.invalidate().await;
+
+        let tenant_id = rec.tenant_id.clone().unwrap_or_else(|| self.tenant.clone());
+        let user_id = rec.user_id.clone().ok_or_else(|| {
+            Error::InvalidConfig("record_ingestion_rejection requires user_id".into())
+        })?;
+        self.db
+            .query(
+                "CREATE ingestion_rejection CONTENT { \
+                    tenant_id: $t, \
+                    user_id: $u, \
+                    doc_id: $d, \
+                    reason: $r, \
+                    sniffed_type: $s \
+                 }",
+            )
+            .bind(("t", tenant_id))
+            .bind(("u", user_id))
+            .bind(("d", rec.doc_id.clone()))
+            .bind(("r", rec.reason.clone()))
+            .bind(("s", rec.sniffed_type.clone()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+    async fn get_ingestion_rejection(&self, doc_id: &str) -> Result<Option<IngestionRejection>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM ingestion_rejection \
+                 WHERE tenant_id = $t AND doc_id = $d \
+                 ORDER BY rejected_at DESC LIMIT 1",
+            )
+            .bind(("t", self.tenant.clone()))
+            .bind(("d", doc_id.to_string()))
+            .await?;
+        Ok(response.take(0)?)
     }
 }
 

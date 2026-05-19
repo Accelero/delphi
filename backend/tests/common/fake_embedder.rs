@@ -52,12 +52,18 @@ impl Embedder for FakeEmbedder {
         self.dim
     }
     async fn passages(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        Ok(texts.iter().map(|t| deterministic_vector(t, self.dim)).collect())
+        Ok(texts
+            .iter()
+            .map(|t| deterministic_vector(t, self.dim))
+            .collect())
     }
     async fn query(&self, text: &str) -> Result<Vec<f32>> {
         Ok(deterministic_vector(text, self.dim))
     }
     async fn document(&self, title: &str, abstract_: &str) -> Result<Vec<f32>> {
-        Ok(deterministic_vector(&format!("{title}[SEP]{abstract_}"), self.dim))
+        Ok(deterministic_vector(
+            &format!("{title}[SEP]{abstract_}"),
+            self.dim,
+        ))
     }
 }

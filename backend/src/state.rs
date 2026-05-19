@@ -19,7 +19,7 @@ use crate::embedder::Embedder;
 use crate::ingestion::FeedItemEvent;
 use crate::llm::LlmClient;
 use crate::object_store::ObjectStore;
-use crate::storage::RequestDbPool;
+use crate::storage::{RequestDbPool, SystemDb};
 use crate::text_extractor::TextExtractor;
 
 #[derive(Clone)]
@@ -56,4 +56,14 @@ pub struct AppState {
     /// Document-level embedder (SPECTER2 in v1). `None` ⇒
     /// `document.paper_embedding` is not populated.
     pub document_embedder: Option<Arc<dyn Embedder>>,
+    /// Privileged DB handle. Reserved for the **handler-side** paths
+    /// that legitimately need to bypass `PERMISSIONS` — currently only
+    /// the ingestion v2 `/complete` validator-reject write to
+    /// `ingestion_rejection` (PERMISSIONS deny user-session writes by
+    /// design). Other handlers must continue using `AuthedDb`.
+    pub system_db: Arc<SystemDb>,
+    /// Ingestion v2 runtime knobs (part size, TTLs, policies). Built
+    /// once at boot from env; handlers read this for per-request
+    /// decisions without re-parsing env on every call.
+    pub uploads_config: Arc<crate::ingestion::UploadsConfig>,
 }

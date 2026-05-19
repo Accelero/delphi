@@ -28,7 +28,7 @@ use crate::chat::SessionRegistry;
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
-use crate::ingestion::{self, DEFAULT_BROADCAST_CAPACITY};
+use crate::ingestion::{self, UploadsConfig, DEFAULT_BROADCAST_CAPACITY};
 use crate::llm::llm_from_env;
 use crate::object_store::{self, ObjectStore};
 use crate::sources::{self, IngestApiClient};
@@ -120,6 +120,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         None
     };
 
+    let uploads_config = Arc::new(UploadsConfig::from_env());
     let state = AppState {
         llm,
         sessions: Arc::new(SessionRegistry::new()),
@@ -129,6 +130,8 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         text_extractor,
         chunk_embedder: embedders.chunk,
         document_embedder: embedders.document,
+        system_db: system.clone(),
+        uploads_config,
     };
 
     // Source-adapter scheduler runs alongside the HTTP server. It POSTs
@@ -249,6 +252,19 @@ pub fn build_router(
         .route(
             "/api/ingestion/documents",
             post(ingestion::ingest_documents),
+        )
+        .route("/api/ingestion/uploads", post(ingestion::create_upload))
+        .route(
+            "/api/ingestion/uploads/{doc_id}/sign-part",
+            post(ingestion::sign_upload_part),
+        )
+        .route(
+            "/api/ingestion/uploads/{doc_id}/complete",
+            post(ingestion::complete_upload),
+        )
+        .route(
+            "/api/ingestion/uploads/{doc_id}",
+            get(ingestion::get_upload_status),
         )
         .route("/api/discovery/feed", get(discovery::feed))
         .route("/api/discovery/feed/events", get(discovery::events))

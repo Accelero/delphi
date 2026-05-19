@@ -269,6 +269,75 @@ DEFINE INDEX IF NOT EXISTS source_state_tenant_adapter ON source_state FIELDS te
 -- sessions; identity arrives on every request as the IdP-issued JWT.)
 -- ===========================================================================
 
+-- ---------------------------------------------------------------------------
+-- upload_session
+-- In-progress direct-to-S3 uploads. Created on POST /api/ingestion/uploads
+-- (state=uploading), CAS-transitioned to "validating" on /complete, then
+-- DELETEd in the same transaction that creates the document row (or
+-- DELETEd alongside the S3 object on validator reject). Engine PERMISSIONS
+-- gate by `(tenant_id, user_id)` so only the originating identity can
+-- sign-part / complete / GET-status — whether human or OAuth client.
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS upload_session SCHEMAFULL
+    PERMISSIONS
+        FOR select WHERE tenant_id = $auth.tenant_id AND user_id = $auth.id
+        FOR create WHERE tenant_id = $auth.tenant_id AND user_id = $auth.id
+        FOR update WHERE tenant_id = $auth.tenant_id AND user_id = $auth.id
+        FOR delete WHERE tenant_id = $auth.tenant_id AND user_id = $auth.id;
+
+DEFINE FIELD OVERWRITE tenant_id ON upload_session TYPE record<tenant>
+    DEFAULT $auth.tenant_id
+    ASSERT $value != NONE;
+DEFINE FIELD OVERWRITE user_id ON upload_session TYPE record<app_user>
+    DEFAULT $auth.id
+    ASSERT $value != NONE;
+
+DEFINE FIELD IF NOT EXISTS doc_id                ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS s3_key                ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS s3_upload_id          ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS state                 ON upload_session TYPE string
+    ASSERT $value IN ['uploading', 'validating'];
+DEFINE FIELD IF NOT EXISTS canonical_id          ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS source_type           ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS source_uri            ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS title                 ON upload_session TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS declared_size         ON upload_session TYPE int;
+DEFINE FIELD IF NOT EXISTS declared_content_type ON upload_session TYPE string;
+DEFINE FIELD IF NOT EXISTS declared_metadata     ON upload_session FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS started_at            ON upload_session TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS upload_session_doc_id     ON upload_session FIELDS doc_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS upload_session_canonical  ON upload_session FIELDS tenant_id, canonical_id UNIQUE;
+DEFINE INDEX IF NOT EXISTS upload_session_started_at ON upload_session FIELDS started_at;
+
+-- ---------------------------------------------------------------------------
+-- ingestion_rejection
+-- Side-channel for /complete failures. Short-TTL; reaped by the nightly
+-- cleaner. SPA reads via GET /uploads/:id status polling. System writes
+-- only — PERMISSIONS deny user create/update/delete; the backend writes
+-- through SystemDb / the validator-reject path inside the request handler
+-- (which runs under the user's session but the FOR create rule below
+-- evaluates the user's identity — kept as FALSE on purpose, then the
+-- handler routes the rejection write through SystemDb to bypass).
+-- ---------------------------------------------------------------------------
+DEFINE TABLE IF NOT EXISTS ingestion_rejection SCHEMAFULL
+    PERMISSIONS
+        FOR select WHERE tenant_id = $auth.tenant_id AND user_id = $auth.id
+        FOR create, update, delete WHERE FALSE;
+
+DEFINE FIELD OVERWRITE tenant_id ON ingestion_rejection TYPE record<tenant>
+    ASSERT $value != NONE;
+DEFINE FIELD OVERWRITE user_id   ON ingestion_rejection TYPE record<app_user>
+    ASSERT $value != NONE;
+DEFINE FIELD IF NOT EXISTS doc_id       ON ingestion_rejection TYPE string;
+DEFINE FIELD IF NOT EXISTS reason       ON ingestion_rejection TYPE string;
+DEFINE FIELD IF NOT EXISTS sniffed_type ON ingestion_rejection TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS rejected_at  ON ingestion_rejection TYPE datetime DEFAULT time::now();
+
+DEFINE INDEX IF NOT EXISTS ingestion_rejection_doc        ON ingestion_rejection FIELDS tenant_id, doc_id;
+DEFINE INDEX IF NOT EXISTS ingestion_rejection_doc_user   ON ingestion_rejection FIELDS tenant_id, user_id, doc_id;
+DEFINE INDEX IF NOT EXISTS ingestion_rejection_rejected_at ON ingestion_rejection FIELDS rejected_at;
+
 -- ===========================================================================
 -- CONVERSATIONS / MESSAGES
 --

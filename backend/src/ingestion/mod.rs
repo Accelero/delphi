@@ -19,8 +19,15 @@ mod http;
 mod notifier;
 mod pipeline;
 mod rag;
+mod uploads;
+mod validation;
 
 pub use http::{ingest_documents, IngestRequestBody};
 pub use notifier::{FeedItemEvent, NotifyingSink, DEFAULT_BROADCAST_CAPACITY};
 pub use pipeline::{IngestOutcome, IngestRequest, IngestSink, Pipeline};
 pub use rag::RagSink;
+pub use uploads::{complete_upload, create_upload, get_upload_status, sign_upload_part, UploadsConfig};
+pub use validation::{
+    validate_ingestion_metadata, validate_uploaded_object, CreateUploadRequest, MetadataPolicy,
+    MetadataReject, ObjectPolicy, ObjectReject, ValidatedAttrs,
+};

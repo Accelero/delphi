@@ -22,7 +22,8 @@ use surrealdb::{Datetime, RecordId, Surreal};
 use crate::error::{Error, Result};
 use crate::storage::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
-    DocId, Document, FeedCursor, Filters, MessageId, Storage,
+    CreateUploadSessionParams, DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId,
+    Storage, UploadSession,
 };
 
 /// Storage trait implementation against a SurrealDB connection.
@@ -481,10 +482,7 @@ impl Storage for SurrealStorage {
              LIMIT {k_lit}"
         );
 
-        let mut q = self
-            .db
-            .query(sql)
-            .bind(("q", query.to_vec()));
+        let mut q = self.db.query(sql).bind(("q", query.to_vec()));
         if let Some(v) = &filters.embedding_model {
             q = q.bind(("f_model", v.clone()));
         }
@@ -752,6 +750,154 @@ impl Storage for SurrealStorage {
         let mut response = q.await?;
         let wires: Vec<DocumentWire> = response.take(0)?;
         Ok(wires.into_iter().map(Document::from).collect())
+    }
+
+    // ---- ingestion v2: upload sessions -------------------------------------
+
+    async fn create_upload_session(
+        &self,
+        params: &CreateUploadSessionParams,
+    ) -> Result<UploadSession> {
+        // Engine fills tenant_id / user_id from $auth via DEFAULT.
+        // PERMISSIONS gate the row to the caller; a tenant-mismatched
+        // canonical_id triggers the UNIQUE index → SurrealDB error,
+        // propagated to the handler as a 409.
+        let mut response = self
+            .db
+            .query(
+                "CREATE upload_session CONTENT { \
+                    doc_id: $doc_id, \
+                    s3_key: $s3_key, \
+                    s3_upload_id: $s3_upload_id, \
+                    state: 'uploading', \
+                    canonical_id: $canonical_id, \
+                    source_type: $source_type, \
+                    source_uri: $source_uri, \
+                    title: $title, \
+                    declared_size: $declared_size, \
+                    declared_content_type: $declared_content_type, \
+                    declared_metadata: $declared_metadata \
+                 }",
+            )
+            .bind(("doc_id", params.doc_id.clone()))
+            .bind(("s3_key", params.s3_key.clone()))
+            .bind(("s3_upload_id", params.s3_upload_id.clone()))
+            .bind(("canonical_id", params.canonical_id.clone()))
+            .bind(("source_type", params.source_type.clone()))
+            .bind(("source_uri", params.source_uri.clone()))
+            .bind(("title", params.title.clone()))
+            .bind(("declared_size", params.declared_size as i64))
+            .bind((
+                "declared_content_type",
+                params.declared_content_type.clone(),
+            ))
+            .bind(("declared_metadata", params.declared_metadata.clone()))
+            .await?
+            .check()?;
+        let row: Option<UploadSession> = response.take(0)?;
+        row.ok_or(Error::EmptyResult)
+    }
+
+    async fn get_upload_session(&self, doc_id: &str) -> Result<Option<UploadSession>> {
+        let mut response = self
+            .db
+            .query("SELECT * FROM upload_session WHERE doc_id = $d LIMIT 1")
+            .bind(("d", doc_id.to_string()))
+            .await?;
+        Ok(response.take(0)?)
+    }
+
+    async fn cas_upload_session_state(&self, doc_id: &str, from: &str, to: &str) -> Result<bool> {
+        // Two-statement transaction to read the affected-row count
+        // without serializing the row itself (`UPDATE … RETURN AFTER`
+        // can return a SurrealDB record-id type that doesn't round-trip
+        // through `serde_json::Value`). `RETURN id` keeps the response
+        // shape narrow.
+        let mut response = self
+            .db
+            .query(
+                "UPDATE upload_session SET state = $to \
+                 WHERE doc_id = $d AND state = $from \
+                 RETURN id",
+            )
+            .bind(("d", doc_id.to_string()))
+            .bind(("from", from.to_string()))
+            .bind(("to", to.to_string()))
+            .await?
+            .check()?;
+        let rows: Vec<IdRow> = response.take(0)?;
+        Ok(!rows.is_empty())
+    }
+
+    async fn commit_upload(&self, doc_id: &str, doc: &Document) -> Result<DocId> {
+        // Pre-check for canonical_id conflict so we can return the
+        // existing doc id to the SPA (rather than a UNIQUE-constraint
+        // error from inside the transaction). Engine PERMISSIONS scope
+        // both queries to the caller's tenant.
+        let mut conflict = self
+            .db
+            .query("SELECT id FROM document WHERE canonical_id = $cid LIMIT 1")
+            .bind(("cid", doc.canonical_id.clone()))
+            .await?;
+        let existing: Option<IdRow> = conflict.take(0)?;
+        if let Some(IdRow { id }) = existing {
+            return Err(Error::CanonicalIdConflict {
+                existing_doc_id: id.to_string(),
+            });
+        }
+
+        let wire = DocumentWire::from(doc);
+        // One Surreal transaction: CREATE doc + DELETE session.
+        let sql = "
+            BEGIN;
+            CREATE ONLY document CONTENT $data RETURN id;
+            DELETE upload_session WHERE doc_id = $d;
+            COMMIT;
+        ";
+        let mut response = self
+            .db
+            .query(sql)
+            .bind(("data", wire))
+            .bind(("d", doc_id.to_string()))
+            .await?
+            .check()?;
+        // Slot 0 = CREATE … RETURN id.
+        let created: Option<IdRow> = response.take(0)?;
+        created.map(|r| r.id).ok_or(Error::EmptyResult)
+    }
+
+    async fn delete_upload_session(&self, doc_id: &str) -> Result<()> {
+        self.db
+            .query("DELETE upload_session WHERE doc_id = $d")
+            .bind(("d", doc_id.to_string()))
+            .await?
+            .check()?;
+        Ok(())
+    }
+
+    async fn record_ingestion_rejection(&self, rec: &IngestionRejection) -> Result<()> {
+        // PERMISSIONS on ingestion_rejection: `FOR create … WHERE FALSE`
+        // — user sessions can't write. The handler routes this through
+        // SystemDb (SystemStorage) instead. Surfacing it on AuthedDb
+        // returns a clear error so a caller that wires it wrong fails
+        // loud.
+        let _ = rec;
+        Err(Error::NotImplemented(
+            "ingestion_rejection writes must go through SystemDb (PERMISSIONS deny user-session writes)".into(),
+        ))
+    }
+
+    async fn get_ingestion_rejection(&self, doc_id: &str) -> Result<Option<IngestionRejection>> {
+        let mut response = self
+            .db
+            .query(
+                "SELECT * FROM ingestion_rejection \
+                 WHERE doc_id = $d \
+                 ORDER BY rejected_at DESC LIMIT 1",
+            )
+            .bind(("d", doc_id.to_string()))
+            .await?;
+        Ok(response.take(0)?)
     }
 }
 

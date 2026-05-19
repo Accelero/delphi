@@ -32,8 +32,9 @@ use crate::error::{Error, Result};
 use super::surreal::SurrealStorage;
 use super::system::engine_requires_auth;
 use super::{
-    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId, DocId,
-    Document, FeedCursor, Filters, MessageId, Storage,
+    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
+    CreateUploadSessionParams, DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId,
+    Storage, UploadSession,
 };
 
 /// Default pool size when `REQUEST_DB_POOL_SIZE` is unset. Sized to
@@ -225,6 +226,22 @@ impl AuthedDb {
         Arc::new(SurrealStorage::from_handle(db))
     }
 
+    /// Resolve the slug of the caller's tenant via `$auth`. Used by
+    /// the upload endpoint to construct the object-store key
+    /// `tenants/<slug>/<doc_id>` from inside a JWT-authenticated
+    /// session, without leaking the raw `tenant:<key>` record id.
+    pub async fn resolve_tenant_slug(&self) -> Result<String> {
+        let inner = self.inner.as_ref().expect("AuthedDb used after drop");
+        let mut r = inner
+            .db
+            .query("SELECT VALUE slug FROM ONLY $auth.tenant_id;")
+            .await?;
+        let slug: Option<String> = r.take(0)?;
+        slug.ok_or_else(|| {
+            Error::InvalidConfig("resolve_tenant_slug: $auth.tenant_id missing".into())
+        })
+    }
+
     /// One-shot resolution of the authenticated user's row fields via
     /// `$auth`. Used by the identity middleware to populate
     /// [`crate::auth::AuthContext`] without an upsert. The
@@ -325,7 +342,9 @@ impl Storage for AuthedDb {
         ord_lo: i64,
         ord_hi: i64,
     ) -> Result<Vec<Chunk>> {
-        self.storage().list_chunks_in_range(doc_id, ord_lo, ord_hi).await
+        self.storage()
+            .list_chunks_in_range(doc_id, ord_lo, ord_hi)
+            .await
     }
     async fn search_vector(
         &self,
@@ -383,6 +402,32 @@ impl Storage for AuthedDb {
     }
     async fn delete_conversation(&self, id: &ConversationId) -> Result<()> {
         self.storage().delete_conversation(id).await
+    }
+    async fn create_upload_session(
+        &self,
+        params: &CreateUploadSessionParams,
+    ) -> Result<UploadSession> {
+        self.storage().create_upload_session(params).await
+    }
+    async fn get_upload_session(&self, doc_id: &str) -> Result<Option<UploadSession>> {
+        self.storage().get_upload_session(doc_id).await
+    }
+    async fn cas_upload_session_state(&self, doc_id: &str, from: &str, to: &str) -> Result<bool> {
+        self.storage()
+            .cas_upload_session_state(doc_id, from, to)
+            .await
+    }
+    async fn commit_upload(&self, doc_id: &str, doc: &Document) -> Result<DocId> {
+        self.storage().commit_upload(doc_id, doc).await
+    }
+    async fn delete_upload_session(&self, doc_id: &str) -> Result<()> {
+        self.storage().delete_upload_session(doc_id).await
+    }
+    async fn record_ingestion_rejection(&self, rec: &IngestionRejection) -> Result<()> {
+        self.storage().record_ingestion_rejection(rec).await
+    }
+    async fn get_ingestion_rejection(&self, doc_id: &str) -> Result<Option<IngestionRejection>> {
+        self.storage().get_ingestion_rejection(doc_id).await
     }
 }
 

@@ -33,7 +33,7 @@ use delphi::auth::{
 };
 use delphi::chat::SessionRegistry;
 use delphi::embedder::Embedder;
-use delphi::object_store::{MemObjectStore, ObjectStore};
+use delphi::object_store::{LocalFsObjectStore, MemObjectStore, ObjectStore};
 use delphi::state::AppState;
 use delphi::storage::{JwtAccessConfig, JwtAccessKind, RequestDbPool, SystemDb};
 use delphi::text_extractor::TextExtractor;
@@ -88,6 +88,53 @@ impl TestApp {
 
     pub async fn build() -> Self {
         Self::build_inner(None, None, None, None).await
+    }
+
+    /// Build with a `LocalFsObjectStore` backing `object_store`. The
+    /// ingestion-v2 upload tests need the multipart shim, which only
+    /// `LocalFsObjectStore` implements.
+    pub async fn build_with_local_fs() -> Self {
+        let mut app = Self::build_inner(None, None, None, None).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFsObjectStore::new(dir.path()).expect("local-fs object store"));
+        // Tempdir is leaked: OS reclaims on process exit. Tests are
+        // short-lived and the per-test data lives below a unique
+        // subdirectory anyway.
+        std::mem::forget(dir);
+        // Rebuild only the parts that depend on object_store: the
+        // router's `AppState` carries `object_store: Arc<dyn ObjectStore>`,
+        // so we re-run `api::build_router` with a fresh state cloned
+        // from the existing pieces.
+        let validator: Arc<dyn JwtValidator> =
+            Arc::new(Hs512Validator::new(TEST_JWT_SECRET, None, None));
+        let extractor: Arc<dyn ClaimsExtractor> = Arc::new(JwtClaimsExtractor::new(validator));
+        let mode = AuthMode::Header(HeaderConfig {
+            default_tenant_slug: app.default_tenant_slug.clone(),
+        });
+        let identity_deps = IdentityDeps {
+            system: app.system.clone(),
+            pool: app.request_db_pool.clone(),
+            default_tenant_slug: app.default_tenant_slug.clone(),
+            default_tenant_id: app.default_tenant_id.clone(),
+        };
+        let uploads_config = Arc::new(delphi::ingestion::UploadsConfig::test_default());
+        let state = AppState {
+            llm: Arc::new(FakeLlmClient::default()),
+            sessions: app.sessions.clone(),
+            request_db_pool: app.request_db_pool.clone(),
+            object_store: store.clone(),
+            events: app.events.clone(),
+            text_extractor: None,
+            chunk_embedder: None,
+            document_embedder: None,
+            system_db: app.system.clone(),
+            uploads_config,
+        };
+        let router = api::build_router(state, None, &mode, identity_deps, extractor);
+        app.object_store = store;
+        app.router = router;
+        app
     }
 
     /// Build with a custom `LlmClient`. Used by tests that need the worker
@@ -167,6 +214,7 @@ impl TestApp {
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
         let sessions = Arc::new(SessionRegistry::new());
+        let uploads_config = Arc::new(delphi::ingestion::UploadsConfig::test_default());
         let state = AppState {
             llm: llm.unwrap_or_else(|| Arc::new(FakeLlmClient::default())),
             sessions: sessions.clone(),
@@ -180,6 +228,8 @@ impl TestApp {
             text_extractor,
             chunk_embedder,
             document_embedder,
+            system_db: system.clone(),
+            uploads_config,
         };
 
         let router = api::build_router(state, None, &mode, identity_deps, extractor);

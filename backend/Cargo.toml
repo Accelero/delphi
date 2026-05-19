@@ -86,6 +86,14 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 # from `reqwest` through to disk.
 bytes = "1"
 
+# Regex driver for ingestion-metadata canonical_id pattern validation
+# (the `canonical_id_pattern` knob in MetadataPolicy).
+regex = "1"
+
+# Magic-byte content-type sniffer for the ingestion v2 object validator.
+# Lightweight, zero deps, pure-Rust.
+infer = "0.16"
+
 # Lock-free sharded map. The chat task registry maps TaskId →
 # CancellationToken; per-request inserts/removes hit different shards,
 # avoiding the global mutex we'd otherwise need around a HashMap.
