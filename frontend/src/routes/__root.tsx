@@ -8,6 +8,8 @@ import type { QueryClient } from "@tanstack/react-query";
 
 import { ThemeToggle } from "@/components/theme-toggle";
 import { UserMenu } from "@/components/user-menu";
+import { UploadProvider } from "@/components/upload/UploadProvider";
+import { UploadTracker } from "@/components/upload/UploadTracker";
 import { ApiError, api, SIGN_IN_URL } from "@/lib/api";
 import { useSession } from "@/hooks/useSession";
 
@@ -44,35 +46,41 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 function RootLayout() {
   const { dev } = useSession();
   return (
-    <div className="flex h-full">
-      <aside className="w-56 border-r border-[var(--border)] p-4 text-sm flex flex-col">
-        <div className="font-semibold mb-4">delphi</div>
-        <nav className="flex flex-col space-y-1">
-          <Link to="/" className="hover:underline">
-            Home
-          </Link>
-          <Link to="/feed" className="hover:underline">
-            Feed
-          </Link>
-          <Link to="/corpus" className="hover:underline">
-            Chat with corpus
-          </Link>
-        </nav>
-        <div className="mt-auto pt-4 space-y-2">
-          <UserMenu />
-          <ThemeToggle />
-        </div>
-      </aside>
-      <main className="flex-1 flex flex-col overflow-hidden">
-        {dev && (
-          <div className="bg-yellow-500/15 border-b border-yellow-500/40 px-4 py-1.5 text-xs text-yellow-700 dark:text-yellow-400">
-            DEV AUTH MODE — auto-signed in. Real auth is bypassed.
+    <UploadProvider>
+      <div className="flex h-full">
+        <aside className="w-56 border-r border-[var(--border)] p-4 text-sm flex flex-col">
+          <div className="font-semibold mb-4">delphi</div>
+          <nav className="flex flex-col space-y-1">
+            <Link to="/" className="hover:underline">
+              Home
+            </Link>
+            <Link to="/feed" className="hover:underline">
+              Feed
+            </Link>
+            <Link to="/upload" className="hover:underline">
+              Upload
+            </Link>
+            <Link to="/corpus" className="hover:underline">
+              Chat with corpus
+            </Link>
+          </nav>
+          <div className="mt-auto pt-4 space-y-2">
+            <UserMenu />
+            <ThemeToggle />
           </div>
-        )}
-        <div id="app-scroll" className="flex-1 p-6 overflow-auto">
-          <Outlet />
-        </div>
-      </main>
-    </div>
+        </aside>
+        <main className="flex-1 flex flex-col overflow-hidden">
+          {dev && (
+            <div className="bg-yellow-500/15 border-b border-yellow-500/40 px-4 py-1.5 text-xs text-yellow-700 dark:text-yellow-400">
+              DEV AUTH MODE — auto-signed in. Real auth is bypassed.
+            </div>
+          )}
+          <div id="app-scroll" className="flex-1 p-6 overflow-auto">
+            <Outlet />
+          </div>
+        </main>
+      </div>
+      <UploadTracker />
+    </UploadProvider>
   );
 }

@@ -213,7 +213,12 @@ authoritative schema lives in `backend/schema.surql`.
   Each stage is independently testable. The canonical `Pipeline` is wrapped
   in middleware-style `IngestSink` decorators (e.g. `NotifyingSink` for
   Discovery-feed fan-out) so cross-cutting concerns compose without
-  changing callers.
+  changing callers. Document ingestion (upload + direct-to-S3 + metadata
+  extraction) is specified in [`specs/ingestion.md`](specs/ingestion.md);
+  its architecture is in
+  [`architecture/ingestion.md`](architecture/ingestion.md), with the
+  forward plan in
+  [`architecture/ingestion-roadmap.md`](architecture/ingestion-roadmap.md).
 - **API.** JSON HTTP for the SPA. Endpoints are organised by pillar:
   `discovery/*`, `corpus/*`, `chat/*`, eventually `knowledge/*`. The
   Discovery surface ships first — cursor-paginated feed, per-user read

@@ -6,7 +6,7 @@
 # `--mount=type=cache` directives below.
 
 # syntax=docker/dockerfile:1.7
-FROM rust:1.89-slim-bookworm AS build
+FROM rust:1.95-slim-bookworm AS build
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

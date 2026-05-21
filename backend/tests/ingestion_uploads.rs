@@ -7,11 +7,9 @@
 //!
 //! Drives the full middleware stack in-process via `oneshot`, against
 //! the in-memory SurrealDB + `MemObjectStore` rig the rest of the
-//! integration tests use. The `MemObjectStore` does not implement
-//! multipart natively — the happy-path test only covers the `create`
-//! handler's wiring up through `create_multipart_upload`, then asserts
-//! the session row landed; deeper round-trip tests use the
-//! `LocalFsObjectStore` multipart shim once those land.
+//! integration tests use. `MemObjectStore` now carries the in-process
+//! multipart shim (create → sign → upload_part_direct → complete), so
+//! the full upload saga runs without Docker.
 
 mod common;
 
@@ -33,6 +31,18 @@ fn create_body(canonical_id: &str, content_type: &str, size: u64) -> Body {
             "content_type": content_type,
             "size": size,
             "metadata": {}
+        })
+        .to_string(),
+    )
+}
+
+/// The shape the SPA actually sends for a manual upload: no canonical_id,
+/// no source_uri, no source_type (server defaults to "manual").
+fn manual_create_body(content_type: &str, size: u64) -> Body {
+    Body::from(
+        json!({
+            "content_type": content_type,
+            "size": size
         })
         .to_string(),
     )
@@ -95,7 +105,7 @@ async fn create_upload_403_when_role_missing() {
 
 #[tokio::test]
 async fn create_upload_400_on_disallowed_content_type() {
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     let req = auth_post(
         "/api/ingestion/uploads",
         create_body("manual:abc", "application/x-evil", 1024),
@@ -107,7 +117,7 @@ async fn create_upload_400_on_disallowed_content_type() {
 
 #[tokio::test]
 async fn create_upload_400_when_forbidden_field_present() {
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     // tenant_id from the client must be rejected.
     let body = Body::from(
         json!({
@@ -128,7 +138,7 @@ async fn create_upload_400_when_forbidden_field_present() {
 
 #[tokio::test]
 async fn create_upload_200_returns_doc_id_and_part_size() {
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     let req = auth_post(
         "/api/ingestion/uploads",
         create_body("manual:doc-aaa", "application/pdf", 4096),
@@ -160,7 +170,7 @@ async fn full_round_trip_create_sign_complete_status() {
     //   3. POST /complete with the resulting ETags.
     //   4. GET /uploads/:id → expect 404 (session is gone, document
     //      lookup keyed on session.doc_id isn't wired in this milestone).
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
 
     // 1. Create.
     let res = app
@@ -231,12 +241,12 @@ async fn full_round_trip_create_sign_complete_status() {
         .await
         .unwrap();
     assert_eq!(docs.len(), 1);
-    assert_eq!(docs[0].canonical_id, "manual:rt-1");
+    assert_eq!(docs[0].canonical_id.as_deref(), Some("manual:rt-1"));
 }
 
 #[tokio::test]
 async fn sign_part_returns_url() {
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     let res = app
         .send(auth_post(
             "/api/ingestion/uploads",
@@ -258,14 +268,18 @@ async fn sign_part_returns_url() {
     assert_eq!(res.status, StatusCode::OK, "sign-part: {:?}", res.text());
     let body: Value = res.json();
     let url = body["url"].as_str().expect("url");
-    assert!(url.starts_with("local-multipart://"));
+    // sign-part now routes through the `AccessMinter` seam; the test rig's
+    // `MemAccess` mints a `mem-access://…?op=upload-part&…` pseudo-URL.
+    assert!(url.starts_with("mem-access://"), "unexpected url: {url}");
+    assert!(url.contains("op=upload-part"), "unexpected url: {url}");
+    assert!(url.contains("partNumber=1"), "unexpected url: {url}");
 }
 
 #[tokio::test]
 async fn cross_user_session_invisible() {
     // Alice creates an upload; Bob (different sub, same tenant) cannot
     // see it via /sign-part, /complete, or GET.
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     let alice = AuthRequestBuilder::default().sub("alice").roles("ingester");
     let res = app
         .send(
@@ -305,7 +319,7 @@ async fn complete_with_validator_reject_records_rejection() {
     // Declare PDF, upload bytes that aren't a PDF. The validator at
     // /complete sniffs and rejects with 422. The session row is gone,
     // S3 object is deleted, and the rejection is logged.
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     let res = app
         .send(auth_post(
             "/api/ingestion/uploads",
@@ -365,7 +379,7 @@ async fn complete_with_validator_reject_records_rejection() {
 async fn concurrent_complete_one_wins() {
     // Two `/complete` POSTs in flight against the same session; one
     // wins the CAS, the other returns 409 with the current state.
-    let app = TestApp::build_with_local_fs().await;
+    let app = TestApp::build_with_mem().await;
     let res = app
         .send(auth_post(
             "/api/ingestion/uploads",
@@ -405,4 +419,97 @@ async fn concurrent_complete_one_wins() {
         .count();
     assert_eq!(ok_count, 1, "exactly one winner; got {statuses:?}");
     assert_eq!(loser_count, 1, "exactly one loser; got {statuses:?}");
+}
+
+/// Helper: drive a manual upload (no canonical_id) all the way to commit.
+/// Returns the session doc_id.
+async fn manual_upload_to_commit(app: &TestApp, body: &str) -> String {
+    let res = app
+        .send(auth_post(
+            "/api/ingestion/uploads",
+            manual_create_body("text/plain", body.len() as u64),
+            "ingester",
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "create: {:?}", res.text());
+    let created: Value = res.json();
+    let doc_id = created["doc_id"].as_str().unwrap().to_string();
+    let upload_id = created["upload_id"].as_str().unwrap().to_string();
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let etag = app
+        .object_store
+        .upload_part_direct(&key, &upload_id, 1, bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await
+        .unwrap();
+    let complete_body =
+        Body::from(json!({ "parts": [{ "part_number": 1, "etag": etag }] }).to_string());
+    let res = app
+        .send(auth_post(
+            &format!("/api/ingestion/uploads/{doc_id}/complete"),
+            complete_body,
+            "ingester",
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "complete: {:?}", res.text());
+    let resp: Value = res.json();
+    assert_eq!(resp["result"], "ready");
+    doc_id
+}
+
+#[tokio::test]
+async fn manual_upload_without_canonical_id_commits() {
+    // The B1/B2 landmine: a manual upload sends no canonical_id, so the
+    // document row is written with canonical_id = NONE.
+    let app = TestApp::build_with_mem().await;
+    let doc_id = manual_upload_to_commit(&app, "manual body one").await;
+
+    // Document row exists with NONE canonical_id and a text body.
+    let storage = app.system.storage_for(app.default_tenant_id.clone());
+    use delphi::storage::Storage as _;
+    let rid = surrealdb::RecordId::from(("document", doc_id.as_str()));
+    let doc = storage.get_document(&rid).await.unwrap();
+    let doc = doc.expect("document must exist at document:<doc_id>");
+    assert!(doc.canonical_id.is_none(), "manual upload has no canonical_id");
+    let content = storage.get_content(&rid).await.unwrap();
+    assert_eq!(content.unwrap().text, "manual body one");
+}
+
+#[tokio::test]
+async fn second_manual_upload_does_not_false_conflict() {
+    // THE landmine from the review: with canonical_id = NONE, the second
+    // manual upload must NOT match the first NONE row and 422. Both
+    // commit cleanly.
+    let app = TestApp::build_with_mem().await;
+    let _first = manual_upload_to_commit(&app, "manual body one").await;
+    let _second = manual_upload_to_commit(&app, "manual body two").await;
+
+    let storage = app.system.storage_for(app.default_tenant_id.clone());
+    use delphi::storage::Storage as _;
+    let docs = storage.list_feed(None, 10).await.unwrap();
+    assert_eq!(docs.len(), 2, "both manual uploads committed");
+    assert!(docs.iter().all(|d| d.canonical_id.is_none()));
+}
+
+#[tokio::test]
+async fn get_status_returns_ready_after_commit() {
+    // B5: after a successful commit the session row is gone, but the
+    // status endpoint resolves `ready` by record-id lookup
+    // (document:<doc_id>) so the SPA's recovery poll works.
+    let app = TestApp::build_with_mem().await;
+    let doc_id = manual_upload_to_commit(&app, "ready body").await;
+
+    let res = app
+        .send(auth_get(
+            &format!("/api/ingestion/uploads/{doc_id}"),
+            "ingester",
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "status: {:?}", res.text());
+    let body: Value = res.json();
+    assert_eq!(body["state"], "ready");
+    assert_eq!(
+        body["doc_id"].as_str().unwrap(),
+        format!("document:{doc_id}")
+    );
 }

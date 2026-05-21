@@ -74,7 +74,13 @@ pub struct Document {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<RecordId>,
 
-    pub canonical_id: String,
+    /// Natural-source dedup key (`doi:…`, etc.). Optional: manual uploads
+    /// leave it unset and are identified by their record id alone.
+    /// `None` serialises as absent so the engine stores `NONE`, not `""` —
+    /// load-bearing for the unique-when-set index and the conflict
+    /// pre-check (see `commit_upload`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
     pub source_type: String,
     pub source_uri: String,
 
@@ -119,6 +125,17 @@ pub struct Document {
 
 fn default_version() -> i64 {
     1
+}
+
+/// Compute the per-tenant dedup key for the `dedup_key` UNIQUE index.
+///
+/// Returns `None` when `canonical_id` is absent (manual uploads — these
+/// rows are excluded from the unique index, so any number of them
+/// coexist), else `"<tenant_id>|<canonical_id>"` so dedup is scoped per
+/// tenant (cross-tenant same canonical_id is allowed; same-tenant
+/// duplicate is rejected). Both `document` and `upload_session` use this.
+pub fn dedup_key(tenant_id: &RecordId, canonical_id: Option<&str>) -> Option<String> {
+    canonical_id.map(|cid| format!("{tenant_id}|{cid}"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,7 +289,12 @@ pub struct CreateUploadSessionParams {
     pub doc_id: String,
     pub s3_key: String,
     pub s3_upload_id: String,
-    pub canonical_id: String,
+    /// Optional dedup key; `None` for manual uploads (bound as `NONE`).
+    pub canonical_id: Option<String>,
+    /// Per-tenant dedup index value: `Some("<tenant_id>|<canonical_id>")`
+    /// when `canonical_id` is set, else `None`. Computed by the handler
+    /// via [`dedup_key`] (the engine can't derive it; see schema comment).
+    pub dedup_key: Option<String>,
     pub source_type: String,
     pub source_uri: String,
     pub title: Option<String>,
@@ -298,7 +320,8 @@ pub struct UploadSession {
     pub s3_key: String,
     pub s3_upload_id: String,
     pub state: String,
-    pub canonical_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_id: Option<String>,
     pub source_type: String,
     pub source_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

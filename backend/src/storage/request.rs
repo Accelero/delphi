@@ -417,8 +417,16 @@ impl Storage for AuthedDb {
             .cas_upload_session_state(doc_id, from, to)
             .await
     }
-    async fn commit_upload(&self, doc_id: &str, doc: &Document) -> Result<DocId> {
-        self.storage().commit_upload(doc_id, doc).await
+    async fn commit_upload(
+        &self,
+        doc_id: &str,
+        doc: &Document,
+        content: &Content,
+        dedup_key: Option<&str>,
+    ) -> Result<DocId> {
+        self.storage()
+            .commit_upload(doc_id, doc, content, dedup_key)
+            .await
     }
     async fn delete_upload_session(&self, doc_id: &str) -> Result<()> {
         self.storage().delete_upload_session(doc_id).await

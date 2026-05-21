@@ -94,6 +94,15 @@ regex = "1"
 # Lightweight, zero deps, pure-Rust.
 infer = "0.16"
 
+# Direct-to-S3 ingestion (ingestion v2). `aws-sdk-s3` drives MinIO /
+# Hetzner / R2 / B2 / AWS through one client; `aws-config` builds the
+# SDK config from explicit knobs (no ambient AWS env discovery needed).
+# rustls keeps the build OpenSSL-free, matching reqwest + surrealdb.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sigv4a"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-smithy-types = "1"
+
 # Lock-free sharded map. The chat task registry maps TaskId →
 # CancellationToken; per-request inserts/removes hit different shards,
 # avoiding the global mutex we'd otherwise need around a HashMap.

@@ -80,6 +80,30 @@ If a future deployment needs durable forensics on rejected content
 `ingestion_audit_log` table written only by the validator and read
 only by an admin surface. Do not reuse the `document` table.
 
+### Ingestion read-back exception (text extraction at `/complete`)
+
+The upload path keeps the "bytes never traverse the backend" invariant:
+the file goes **direct browser → S3** via presigned multipart PUTs. There
+are exactly **two** places the backend reads object bytes, both bounded
+and both at `/complete`:
+
+1. **`validate_uploaded_object`** — HEADs the object and ranged-GETs only
+   `sniff_window_bytes` for the magic-byte check. Never the full body.
+2. **`extract_text`** (the autofill / full-text stage) — reads the object
+   back **once**, capped at `pdf_max_input_bytes` via a single ranged GET.
+   PDFs go through the sandboxed `pdftotext` discipline (timeout +
+   `kill_on_drop` + capped stdout, the same H4 hardening); text/markdown
+   is a bounded UTF-8 read. Extraction failure is non-fatal (the bytes are
+   already committed; the row is written with empty text).
+
+This read-back is a **deliberate, capped server-side operation**, not a
+proxy of the upload stream. It exists so the LLM metadata extractor (and
+full-text search) has the document text to work with. The invariant still
+holds for the *upload* path; only the post-commit read at `/complete` is
+in-backend, and it is bounded by `pdf_max_input_bytes`, a sandboxed
+parser, and capped stdout. The "delete, do not quarantine" rejection
+policy still applies if either bounded read rejects.
+
 ### Antivirus / malware scanning — deferred to production
 
 ClamAV (or equivalent) is **not** part of the development and tier-2

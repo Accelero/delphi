@@ -28,7 +28,7 @@ mod surreal;
 mod system;
 
 pub use models::{
-    Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content,
+    dedup_key, Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content,
     Conversation, ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
     IngestionRejection, MessageId, UploadSession,
 };
@@ -206,13 +206,23 @@ pub trait Storage: Send + Sync {
         to: &str,
     ) -> Result<bool>;
 
-    /// Atomic transaction: INSERT `document` + DELETE
-    /// `upload_session`. Returns the new document id.
+    /// Atomic transaction: `CREATE document:<doc_id>` (deterministic
+    /// record id) + UPSERT `document_content` (extracted text) + DELETE
+    /// `upload_session`, all in one Surreal transaction. Returns the new
+    /// document id (`document:<doc_id>`).
     ///
-    /// Errors with [`Error::CanonicalIdConflict`] when the schema's
-    /// UNIQUE `(tenant_id, canonical_id)` index would be violated;
-    /// the handler turns that into a 422.
-    async fn commit_upload(&self, doc_id: &str, doc: &Document) -> Result<DocId>;
+    /// Errors with [`Error::CanonicalIdConflict`] when the document's
+    /// `canonical_id` is set and a row with the same
+    /// `(tenant_id, canonical_id)` already exists (the conflict pre-check
+    /// is skipped when `canonical_id` is `None`). The handler turns the
+    /// conflict into a 422.
+    async fn commit_upload(
+        &self,
+        doc_id: &str,
+        doc: &Document,
+        content: &Content,
+        dedup_key: Option<&str>,
+    ) -> Result<DocId>;
 
     /// Idempotent: deleting a missing session is a no-op.
     async fn delete_upload_session(&self, doc_id: &str) -> Result<()>;

@@ -28,9 +28,11 @@ use crate::chat::SessionRegistry;
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
-use crate::ingestion::{self, UploadsConfig, DEFAULT_BROADCAST_CAPACITY};
+use crate::ingestion::{
+    self, MetadataExtractor, NoopExtractor, UploadsConfig, DEFAULT_BROADCAST_CAPACITY,
+};
 use crate::llm::llm_from_env;
-use crate::object_store::{self, ObjectStore};
+use crate::object_store::{self, AccessMinter, ObjectStore};
 use crate::sources::{self, IngestApiClient};
 use crate::state::AppState;
 use crate::storage::RequestDbPool;
@@ -100,11 +102,14 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     let (events_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
 
-    let object_store: Arc<dyn ObjectStore> = object_store::from_url(
-        &std::env::var("OBJECT_STORE_URL")
-            .unwrap_or_else(|_| "file:///var/lib/delphi/originals".into()),
-    )
-    .context("constructing object store")?;
+    let object_store_url = std::env::var("OBJECT_STORE_URL")
+        .context("OBJECT_STORE_URL is required (e.g. s3://delphi/); LocalFs is removed")?;
+    let object_store: Arc<dyn ObjectStore> =
+        object_store::from_url(&object_store_url).context("constructing object store")?;
+    // Client-facing minter for direct-to-storage upload/download URLs.
+    // Same `OBJECT_STORE_URL` selects it; today always `S3PresignAccess`.
+    let access: Arc<dyn AccessMinter> = object_store::access_minter_from_url(&object_store_url)
+        .context("constructing access minter")?;
 
     // Slice 2 ships NoopFilter; the real semantic filter is a future
     // drop-in implementing the same `IngestFilter` trait.
@@ -121,17 +126,22 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     };
 
     let uploads_config = Arc::new(UploadsConfig::from_env());
+    // Metadata autofill seam: NoopExtractor ships today; the Phase-3
+    // LlmExtractor drops in here when an LLM provider is configured.
+    let metadata_extractor: Arc<dyn MetadataExtractor> = Arc::new(NoopExtractor);
     let state = AppState {
         llm,
         sessions: Arc::new(SessionRegistry::new()),
         request_db_pool: request_pool.clone(),
         object_store: object_store.clone(),
+        access,
         events: events_tx,
         text_extractor,
         chunk_embedder: embedders.chunk,
         document_embedder: embedders.document,
         system_db: system.clone(),
         uploads_config,
+        metadata_extractor,
     };
 
     // Source-adapter scheduler runs alongside the HTTP server. It POSTs
@@ -268,7 +278,7 @@ pub fn build_router(
         )
         .route("/api/discovery/feed", get(discovery::feed))
         .route("/api/discovery/feed/events", get(discovery::events))
-        .route("/api/documents/{key}/file", get(documents::file))
+        .route("/api/documents/{key}/view-url", get(documents::view_url))
         .route("/api/chunks/{key}", get(chunks::get_chunk));
 
     // Routes that don't require an authenticated identity.

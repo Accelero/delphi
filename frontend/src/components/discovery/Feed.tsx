@@ -111,9 +111,10 @@ export function Feed() {
   useEffect(() => {
     if (!search.doc) return;
     // Synthesise a minimal FeedDocument from the URL — the viewer only
-    // reads `id` + `title` for its chrome, the bytes come from
-    // `/api/documents/:key/file`. When the real row later joins the
-    // feed (via SSE or pagination) the viewer keeps its current state.
+    // reads `id` + `title` for its chrome; the bytes come from the
+    // presigned URL minted by `/api/documents/:key/view-url`. When the
+    // real row later joins the feed (via SSE or pagination) the viewer
+    // keeps its current state.
     setSelected({
       id: search.doc,
       canonical_id: search.doc,

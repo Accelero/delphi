@@ -47,6 +47,12 @@ http:
       middlewares:
         - oauth2-forward-auth
 
+    # Direct-to-storage object access (upload + download) does NOT pass
+    # through Traefik: the browser hits MinIO directly on its published
+    # `:9000` port via short-lived presigned URLs the backend mints. This
+    # matches prod, where a managed store is reached directly anyway.
+    # See docs/architecture/object-access.md.
+
     frontend:
       rule: "PathPrefix(`/`)"
       service: frontend

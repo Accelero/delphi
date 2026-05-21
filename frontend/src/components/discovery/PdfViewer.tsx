@@ -6,10 +6,13 @@
  * in the parent) so the back button returns the user to their exact
  * scroll position and any in-memory state.
  *
- * Bytes come from `GET /api/documents/:key/file` — same-origin so the
- * BFF session cookie travels with the request. We pull the response as
- * a Blob and hand react-pdf a stable `{ data }` reference; without the
- * memo, react-pdf reinitialises the worker on every render.
+ * Bytes come **directly from object storage**: we first ask the backend
+ * for a short-lived presigned URL (`GET /api/documents/:key/view-url`,
+ * same-origin so the BFF session cookie travels), then hand that URL to
+ * react-pdf / PDF.js, which fetches the bytes itself — including range
+ * requests — straight from MinIO. The backend is no longer in the byte
+ * path. See docs/architecture/object-access.md. The URL is memoised so
+ * react-pdf doesn't reinitialise the worker on every render.
  *
  * ## RAG v1 — chunk overlays
  *
@@ -28,7 +31,7 @@ import "react-pdf/dist/Page/TextLayer.css";
 
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { api, documentFileUrl, type ChunkPayload } from "@/lib/api";
+import { api, type ChunkPayload } from "@/lib/api";
 import { transformBbox, type PageMeta } from "./PdfViewerMath";
 
 // pdfjs ships its worker as a separate ESM module. Vite resolves the
@@ -50,14 +53,17 @@ type Props = {
 };
 
 export function PdfViewer({ documentId, title, onBack, chunkId }: Props) {
-  const { data, error, loading } = usePdfBlob(documentId);
+  const { url, error, loading } = usePdfUrl(documentId);
   const [numPages, setNumPages] = useState<number | null>(null);
   const chunk = useChunk(chunkId);
 
   // Page metadata per rendered page number (1-indexed).
   const [pageMeta, setPageMeta] = useState<Record<number, PageMeta>>({});
 
-  const fileProp = useMemo(() => (data ? { data } : null), [data]);
+  // Hand react-pdf the presigned URL directly so PDF.js fetches bytes
+  // (and issues range requests) straight from object storage. Memoise so
+  // a re-render doesn't reinitialise the worker.
+  const fileProp = useMemo(() => (url ? { url } : null), [url]);
 
   const wrapperRef = useRef<HTMLDivElement | null>(null);
   const width = useFitWidth(wrapperRef);
@@ -187,30 +193,25 @@ export function PdfViewer({ documentId, title, onBack, chunkId }: Props) {
   );
 }
 
-/** Fetch the PDF bytes for a document. Stays at the `Uint8Array` level so
- *  the result can be passed to react-pdf's `{ data }` prop without it
- *  detaching the underlying buffer between renders (which is what
- *  happens when you hand it an ArrayBuffer directly). */
-function usePdfBlob(documentId: string) {
-  const [data, setData] = useState<Uint8Array | null>(null);
+/** Mint a short-lived, direct-to-storage URL for a document's stored
+ *  original. The backend makes the authz decision and returns a
+ *  presigned URL; PDF.js then fetches the bytes (with range requests)
+ *  straight from object storage — the backend is not in the byte path. */
+function usePdfUrl(documentId: string) {
+  const [url, setUrl] = useState<string | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let aborted = false;
-    setData(null);
+    setUrl(null);
     setError(null);
     setLoading(true);
-    fetch(documentFileUrl(documentId), { credentials: "same-origin" })
-      .then(async (res) => {
-        if (!res.ok) {
-          throw new Error(`${res.status} ${res.statusText}`);
-        }
-        return new Uint8Array(await res.arrayBuffer());
-      })
-      .then((bytes) => {
+    api.documents
+      .viewUrl(documentId)
+      .then(({ url }) => {
         if (aborted) return;
-        setData(bytes);
+        setUrl(url);
         setLoading(false);
       })
       .catch((e) => {
@@ -223,7 +224,7 @@ function usePdfBlob(documentId: string) {
     };
   }, [documentId]);
 
-  return { data, error, loading };
+  return { url, error, loading };
 }
 
 /** Fetch a chunk's metadata + bboxes. Tolerates `chunkId === null` so

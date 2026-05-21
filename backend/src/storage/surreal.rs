@@ -56,7 +56,8 @@ struct DocumentWire {
     /// belongs to.
     #[serde(default, skip_serializing)]
     tenant_id: Option<RecordId>,
-    canonical_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_id: Option<String>,
     source_type: String,
     source_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,13 +223,20 @@ impl Storage for SurrealStorage {
 
     async fn upsert_document(&self, doc: &Document) -> Result<DocId> {
         // Look up by canonical_id alone — PERMISSIONS already scope to
-        // the caller's tenant.
-        let mut response = self
-            .db
-            .query("SELECT id FROM document WHERE canonical_id = $cid LIMIT 1")
-            .bind(("cid", doc.canonical_id.clone()))
-            .await?;
-        let existing: Option<IdRow> = response.take(0)?;
+        // the caller's tenant. Skip entirely when canonical_id is unset:
+        // such rows (manual uploads) are never deduped, and matching on
+        // `canonical_id = NONE` would false-match every prior NONE row.
+        let existing: Option<IdRow> = match &doc.canonical_id {
+            Some(cid) => {
+                let mut response = self
+                    .db
+                    .query("SELECT id FROM document WHERE canonical_id = $cid LIMIT 1")
+                    .bind(("cid", cid.clone()))
+                    .await?;
+                response.take(0)?
+            }
+            None => None,
+        };
 
         let wire = DocumentWire::from(doc);
 
@@ -771,6 +779,7 @@ impl Storage for SurrealStorage {
                     s3_upload_id: $s3_upload_id, \
                     state: 'uploading', \
                     canonical_id: $canonical_id, \
+                    dedup_key: $dedup_key, \
                     source_type: $source_type, \
                     source_uri: $source_uri, \
                     title: $title, \
@@ -783,6 +792,7 @@ impl Storage for SurrealStorage {
             .bind(("s3_key", params.s3_key.clone()))
             .bind(("s3_upload_id", params.s3_upload_id.clone()))
             .bind(("canonical_id", params.canonical_id.clone()))
+            .bind(("dedup_key", params.dedup_key.clone()))
             .bind(("source_type", params.source_type.clone()))
             .bind(("source_uri", params.source_uri.clone()))
             .bind(("title", params.title.clone()))
@@ -829,41 +839,107 @@ impl Storage for SurrealStorage {
         Ok(!rows.is_empty())
     }
 
-    async fn commit_upload(&self, doc_id: &str, doc: &Document) -> Result<DocId> {
+    async fn commit_upload(
+        &self,
+        doc_id: &str,
+        doc: &Document,
+        content: &Content,
+        dedup_key: Option<&str>,
+    ) -> Result<DocId> {
         // Pre-check for canonical_id conflict so we can return the
         // existing doc id to the SPA (rather than a UNIQUE-constraint
         // error from inside the transaction). Engine PERMISSIONS scope
         // both queries to the caller's tenant.
-        let mut conflict = self
-            .db
-            .query("SELECT id FROM document WHERE canonical_id = $cid LIMIT 1")
-            .bind(("cid", doc.canonical_id.clone()))
-            .await?;
-        let existing: Option<IdRow> = conflict.take(0)?;
-        if let Some(IdRow { id }) = existing {
-            return Err(Error::CanonicalIdConflict {
-                existing_doc_id: id.to_string(),
-            });
+        //
+        // CRITICAL: skip the pre-check entirely when canonical_id is
+        // unset. Manual uploads carry no canonical_id (identity is the
+        // record id) and are never deduped; `WHERE canonical_id = NONE`
+        // would false-match every prior manual upload and 422 every
+        // upload after the first.
+        if let Some(cid) = &doc.canonical_id {
+            let mut conflict = self
+                .db
+                .query("SELECT id FROM document WHERE canonical_id = $cid LIMIT 1")
+                .bind(("cid", cid.clone()))
+                .await?;
+            let existing: Option<IdRow> = conflict.take(0)?;
+            if let Some(IdRow { id }) = existing {
+                return Err(Error::CanonicalIdConflict {
+                    existing_doc_id: id.to_string(),
+                });
+            }
         }
 
-        let wire = DocumentWire::from(doc);
-        // One Surreal transaction: CREATE doc + DELETE session.
+        // One Surreal transaction:
+        //   1. CREATE document:<doc_id> — deterministic record id (doc_id
+        //      is a lowercased ULID, a legal record-id key: [0-9a-z]).
+        //      This is what lets `GET /uploads/:id` resolve `ready` by
+        //      record-id lookup after the session row is gone (B5).
+        //   2. UPSERT the extracted text into document_content
+        //      (document_content_doc is UNIQUE, so a retried commit must
+        //      not double-insert — UPSERT keys on `doc`).
+        //   3. DELETE the upload_session row.
+        // dedup_key is overlaid by a follow-up UPDATE (CONTENT can't be
+        // combined with SET in one CREATE). The engine can't compute it
+        // (it'd see tenant_id as NONE before DEFAULT runs; see schema
+        // comment), so the app supplies it. A colliding key trips the
+        // UNIQUE index → a non-transient error the handler maps (the
+        // app-level pre-check above already caught the common set-cid case).
         let sql = "
             BEGIN;
-            CREATE ONLY document CONTENT $data RETURN id;
+            CREATE ONLY $rid CONTENT $data RETURN id;
+            UPDATE $rid SET dedup_key = $dedup_key;
+            UPSERT document_content CONTENT $content WHERE doc = $rid;
             DELETE upload_session WHERE doc_id = $d;
             COMMIT;
         ";
-        let mut response = self
-            .db
-            .query(sql)
-            .bind(("data", wire))
-            .bind(("d", doc_id.to_string()))
-            .await?
-            .check()?;
-        // Slot 0 = CREATE … RETURN id.
-        let created: Option<IdRow> = response.take(0)?;
-        created.map(|r| r.id).ok_or(Error::EmptyResult)
+        // Retry on a transient write-write conflict: SurrealDB uses
+        // optimistic concurrency and returns "Resource busy" when
+        // concurrent commits collide (e.g. a multi-file upload, or two
+        // users at once). The transaction is atomic — a conflicting
+        // attempt rolls back fully — and the UPSERT keeps it idempotent,
+        // so re-running is safe. Genuine failures (e.g. a dedup_key UNIQUE
+        // violation) don't match `is_transient_conflict` and surface
+        // immediately.
+        let mut attempt = 0usize;
+        loop {
+            let rid = RecordId::from(("document", doc_id));
+            let content_data = ContentData {
+                doc: rid.clone(),
+                format: content.format.clone(),
+                text: content.text.clone(),
+                extractor: content.extractor.clone(),
+            };
+            let outcome: Result<DocId> = async {
+                let mut response = self
+                    .db
+                    .query(sql)
+                    .bind(("rid", rid))
+                    .bind(("data", DocumentWire::from(doc)))
+                    .bind(("dedup_key", dedup_key.map(|s| s.to_string())))
+                    .bind(("content", content_data))
+                    .bind(("d", doc_id.to_string()))
+                    .await?
+                    .check()?;
+                // Slot 0 = CREATE … RETURN id.
+                let created: Option<IdRow> = response.take(0)?;
+                created.map(|r| r.id).ok_or(Error::EmptyResult)
+            }
+            .await;
+
+            match outcome {
+                Err(e) if is_transient_conflict(&e) && attempt + 1 < TX_MAX_COMMIT_ATTEMPTS => {
+                    attempt += 1;
+                    // Tiny jittered backoff; contention clears in ms.
+                    let base = 5u64 << attempt; // 10, 20, 40 …
+                    let jitter = (doc_id.len() as u64 * 7 + attempt as u64 * 13) % 11;
+                    tokio::time::sleep(std::time::Duration::from_millis(base + jitter)).await;
+                    tracing::warn!(doc_id, attempt, "commit_upload transient conflict; retrying");
+                    continue;
+                }
+                other => return other,
+            }
+        }
     }
 
     async fn delete_upload_session(&self, doc_id: &str) -> Result<()> {
@@ -899,6 +975,24 @@ impl Storage for SurrealStorage {
             .await?;
         Ok(response.take(0)?)
     }
+}
+
+/// Max attempts for a write transaction that may hit a transient
+/// datastore conflict. SurrealDB is optimistic-concurrency; the client
+/// is expected to retry. 4 attempts (≈10–80 ms total backoff) clears
+/// realistic concurrent-upload contention without masking real failures.
+const TX_MAX_COMMIT_ATTEMPTS: usize = 4;
+
+/// True only for SurrealDB's *transient* write-write conflict errors
+/// (concurrent commits colliding) — safe to retry. Deliberately does NOT
+/// match the generic "failed transaction" wrapper, so a real failure
+/// inside the transaction (e.g. a UNIQUE-index violation) is not retried.
+/// There's no typed variant, so match the message.
+fn is_transient_conflict(e: &Error) -> bool {
+    let s = e.to_string().to_ascii_lowercase();
+    s.contains("resource busy")
+        || s.contains("read or write conflict")
+        || s.contains("transaction conflict")
 }
 
 /// Clamp `top_k` into a small literal-safe range. SurrealDB's KNN /

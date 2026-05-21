@@ -129,7 +129,11 @@ DEFINE TABLE IF NOT EXISTS document SCHEMAFULL
 DEFINE FIELD OVERWRITE tenant_id    ON document TYPE record<tenant>
     DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
-DEFINE FIELD IF NOT EXISTS canonical_id ON document TYPE string;
+-- canonical_id is OPTIONAL (was required). Manual uploads leave it unset
+-- (identity is the record id); natural-source docs (DOI etc.) set it for
+-- dedup. A field TYPE change is not idempotent under IF NOT EXISTS, so use
+-- OVERWRITE.
+DEFINE FIELD OVERWRITE canonical_id ON document TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS source_type  ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS source_uri   ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS storage_uri  ON document TYPE option<string>;
@@ -151,10 +155,30 @@ DEFINE FIELD IF NOT EXISTS metadata     ON document FLEXIBLE TYPE object DEFAULT
 DEFINE FIELD IF NOT EXISTS paper_embedding       ON document TYPE option<array<float>>;
 DEFINE FIELD IF NOT EXISTS paper_embedding_model ON document TYPE option<string>;
 
--- canonical_id is unique *per tenant*. Closes audit finding H1: pre-tenancy
--- schema had a global UNIQUE which silently merged cross-tenant rows.
+-- canonical_id is unique *per tenant*, but only WHEN SET. Manual uploads
+-- leave canonical_id NONE and are identified by their record id, never
+-- deduped — so the dedup UNIQUE must EXCLUDE NONE rows.
+--
+-- Engine constraints (SurrealDB v2.6, verified at build time):
+--   * `DEFINE INDEX … UNIQUE WHERE …` (filtered/partial unique) is NOT
+--     supported — parse error.
+--   * A row is excluded from a UNIQUE index only when ALL its indexed
+--     fields are NONE. A *composite* `(tenant_id, canonical_id)` UNIQUE
+--     therefore still rejects a second `(tenant, NONE)` row — useless for
+--     "unique-when-set".
+--   * A *single-field* UNIQUE over a NONE value IS excluded.
+--
+-- So we dedup over a single field `dedup_key` that is NONE when
+-- canonical_id is NONE (→ excluded, many manual uploads coexist) and
+-- `"<tenant_id>|<canonical_id>"` otherwise (→ unique per tenant). The
+-- value is computed by the storage layer (not a VALUE clause: a VALUE
+-- field is evaluated *before* the DEFAULT $auth.tenant_id fills tenant_id,
+-- so it would see NONE — verified). Closes audit finding H1 (pre-tenancy
+-- global UNIQUE merged cross-tenant rows).
 REMOVE INDEX IF EXISTS document_canonical_id ON document;
-DEFINE INDEX IF NOT EXISTS document_tenant_canonical ON document FIELDS tenant_id, canonical_id UNIQUE;
+REMOVE INDEX IF EXISTS document_tenant_canonical ON document;
+DEFINE FIELD IF NOT EXISTS dedup_key ON document TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS document_dedup_key ON document FIELDS dedup_key UNIQUE;
 DEFINE INDEX IF NOT EXISTS document_tenant_id        ON document FIELDS tenant_id;
 DEFINE INDEX IF NOT EXISTS document_source_type      ON document FIELDS source_type;
 DEFINE INDEX IF NOT EXISTS document_content_hash     ON document FIELDS content_hash;
@@ -297,7 +321,9 @@ DEFINE FIELD IF NOT EXISTS s3_key                ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS s3_upload_id          ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS state                 ON upload_session TYPE string
     ASSERT $value IN ['uploading', 'validating'];
-DEFINE FIELD IF NOT EXISTS canonical_id          ON upload_session TYPE string;
+-- Optional (was required): manual uploads leave it NONE. OVERWRITE because
+-- a TYPE change is not idempotent under IF NOT EXISTS.
+DEFINE FIELD OVERWRITE canonical_id              ON upload_session TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS source_type           ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS source_uri            ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS title                 ON upload_session TYPE option<string>;
@@ -307,7 +333,13 @@ DEFINE FIELD IF NOT EXISTS declared_metadata     ON upload_session FLEXIBLE TYPE
 DEFINE FIELD IF NOT EXISTS started_at            ON upload_session TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX IF NOT EXISTS upload_session_doc_id     ON upload_session FIELDS doc_id UNIQUE;
-DEFINE INDEX IF NOT EXISTS upload_session_canonical  ON upload_session FIELDS tenant_id, canonical_id UNIQUE;
+-- Unique-when-set via the same storage-computed `dedup_key` idiom as
+-- `document` (see that comment): two concurrent uploads of the same
+-- canonical_id collide (second gets a 409), but many NONE manual uploads
+-- coexist.
+REMOVE INDEX IF EXISTS upload_session_canonical ON upload_session;
+DEFINE FIELD IF NOT EXISTS dedup_key ON upload_session TYPE option<string>;
+DEFINE INDEX IF NOT EXISTS upload_session_canonical  ON upload_session FIELDS dedup_key UNIQUE;
 DEFINE INDEX IF NOT EXISTS upload_session_started_at ON upload_session FIELDS started_at;
 
 -- ---------------------------------------------------------------------------

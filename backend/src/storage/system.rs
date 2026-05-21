@@ -410,7 +410,8 @@ struct DocumentWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<RecordId>,
     tenant_id: RecordId,
-    canonical_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_id: Option<String>,
     source_type: String,
     source_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -518,16 +519,24 @@ struct ChunkData {
 #[async_trait]
 impl Storage for SystemStorage {
     async fn upsert_document(&self, doc: &Document) -> Result<DocId> {
-        let mut response = self
-            .db
-            .query(
-                "SELECT id FROM document \
-                 WHERE tenant_id = $t AND canonical_id = $cid LIMIT 1",
-            )
-            .bind(("t", self.tenant.clone()))
-            .bind(("cid", doc.canonical_id.clone()))
-            .await?;
-        let existing: Option<IdRow> = response.take(0)?;
+        // Skip the dedup pre-check when canonical_id is unset (manual
+        // uploads). Matching on `canonical_id = NONE` would false-match
+        // prior unset rows.
+        let existing: Option<IdRow> = match &doc.canonical_id {
+            Some(cid) => {
+                let mut response = self
+                    .db
+                    .query(
+                        "SELECT id FROM document \
+                         WHERE tenant_id = $t AND canonical_id = $cid LIMIT 1",
+                    )
+                    .bind(("t", self.tenant.clone()))
+                    .bind(("cid", cid.clone()))
+                    .await?;
+                response.take(0)?
+            }
+            None => None,
+        };
 
         let wire = self.into_wire(doc);
 
@@ -963,7 +972,13 @@ impl Storage for SystemStorage {
             "SystemStorage::cas_upload_session_state: use AuthedDb instead".into(),
         ))
     }
-    async fn commit_upload(&self, _doc_id: &str, _doc: &Document) -> Result<DocId> {
+    async fn commit_upload(
+        &self,
+        _doc_id: &str,
+        _doc: &Document,
+        _content: &Content,
+        _dedup_key: Option<&str>,
+    ) -> Result<DocId> {
         Err(Error::NotImplemented(
             "SystemStorage::commit_upload: use AuthedDb instead".into(),
         ))

@@ -21,7 +21,7 @@ async fn returns_chunk_payload_when_in_tenant() {
         .upsert_document(&Document {
             id: None,
             tenant_id: None,
-            canonical_id: "ch-tenant".into(),
+            canonical_id: Some("ch-tenant".into()),
             source_type: "manual".into(),
             source_uri: "https://example.test/ch-tenant".into(),
             storage_uri: None,
@@ -109,7 +109,7 @@ async fn returns_404_when_chunk_belongs_to_another_tenant() {
         .upsert_document(&Document {
             id: None,
             tenant_id: None,
-            canonical_id: "ct-2".into(),
+            canonical_id: Some("ct-2".into()),
             source_type: "manual".into(),
             source_uri: "https://example.test/ct-2".into(),
             storage_uri: None,

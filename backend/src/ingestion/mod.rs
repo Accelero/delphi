@@ -15,19 +15,29 @@
 //! wrapping a [`Pipeline`] in an outer [`IngestSink`] — middleware-style,
 //! not a parallel pipeline.
 
+mod autofill;
+mod completion;
 mod http;
 mod notifier;
 mod pipeline;
 mod rag;
+mod text_extract;
 mod uploads;
 mod validation;
 
+pub use autofill::{
+    merge_metadata, DocumentPrefill, ExtractedMetadata, ExtractionContext, MergedMetadata,
+    MetadataExtractor, NoopExtractor,
+};
+pub use completion::{run_completion, CompletionCtx, CompletionError};
 pub use http::{ingest_documents, IngestRequestBody};
 pub use notifier::{FeedItemEvent, NotifyingSink, DEFAULT_BROADCAST_CAPACITY};
 pub use pipeline::{IngestOutcome, IngestRequest, IngestSink, Pipeline};
 pub use rag::RagSink;
+pub use text_extract::extract_text;
 pub use uploads::{complete_upload, create_upload, get_upload_status, sign_upload_part, UploadsConfig};
 pub use validation::{
-    validate_ingestion_metadata, validate_uploaded_object, CreateUploadRequest, MetadataPolicy,
-    MetadataReject, ObjectPolicy, ObjectReject, ValidatedAttrs,
+    validate_descriptive_metadata, validate_ingestion_metadata, validate_uploaded_object,
+    CreateUploadRequest, DescriptiveView, MetadataField, MetadataPolicy, MetadataReject,
+    ObjectPolicy, ObjectReject, ValidatedAttrs,
 };

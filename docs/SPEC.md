@@ -38,7 +38,10 @@ Bringing new, relevant documents into the user's world.
 Working with the existing corpus.
 
 - **Corpus storage.** Each ingested document persists its metadata, full
-  content, vector embedding, and a link back to its origin URL.
+  content, vector embedding, and a link back to its origin URL. How
+  documents enter the corpus (user upload, adapters, LLM-assisted
+  metadata extraction) is specified in
+  [`specs/ingestion.md`](./specs/ingestion.md).
 - **Traditional search.** Metadata, keyword, and field-scoped queries over
   the corpus.
 - **RAG chat with the corpus.** A chat interface backed by retrieval over the

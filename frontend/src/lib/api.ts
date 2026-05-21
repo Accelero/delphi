@@ -50,7 +50,8 @@ export type Session = {
  *  `document:<key>`. */
 export type FeedDocument = {
   id: string;
-  canonical_id: string;
+  /** Optional dedup key — `null` for manual uploads (identity is `id`). */
+  canonical_id?: string | null;
   source_type: string;
   source_uri: string;
   storage_uri?: string | null;
@@ -80,12 +81,15 @@ export function documentKey(id: string): string {
   return idx >= 0 ? id.slice(idx + 1) : id;
 }
 
-/** URL for `GET /api/documents/:key/file` — the stored original
- *  (PDF) bytes. Plain string because callers feed it to `fetch` /
- *  react-pdf rather than going through the typed `request()`. */
-export function documentFileUrl(id: string): string {
-  return `/api/documents/${encodeURIComponent(documentKey(id))}/file`;
-}
+/** `GET /api/documents/:key/view-url` response: a short-lived,
+ *  direct-to-storage URL the browser fetches the original bytes from
+ *  (PDF.js issues range requests against it directly — the backend is
+ *  not in the byte path). See docs/architecture/object-access.md. */
+export type ViewUrlResponse = {
+  url: string;
+  /** RFC3339 instant after which `url` stops working. */
+  expires_at: string;
+};
 
 /** Wire shape returned by `/api/chat/conversations`. `id` is a
  *  SurrealDB record id stringified as `conversation:<key>`. */
@@ -139,9 +143,86 @@ export type ChunkPayload = {
 };
 
 
+// ---------------------------------------------------------------------------
+// Ingestion v2 — direct-to-S3 multipart upload
+// ---------------------------------------------------------------------------
+
+/** Single-file metadata prefill (multi-file uploads send none). All
+ *  optional — whatever the user supplies wins; the rest is autofilled
+ *  server-side. */
+export type UploadPrefill = {
+  title?: string;
+  summary?: string;
+  authors?: string[];
+  language?: string;
+};
+
+/** `POST /api/ingestion/uploads` request. `source_type` is omitted —
+ *  the server defaults it to "manual". `canonical_id` / `source_uri`
+ *  are never sent for manual uploads. */
+export type CreateUploadRequest = UploadPrefill & {
+  filename: string;
+  content_type: string;
+  size: number;
+};
+
+export type CreateUploadResponse = {
+  doc_id: string;
+  key: string;
+  upload_id: string;
+  part_size_bytes: number;
+  part_url_ttl_secs: number;
+};
+
+export type PartRef = { part_number: number; etag: string };
+
+export type SignPartResponse = { url: string };
+
+/** `POST /complete` — synchronous; returns `ready` on success or 422. */
+export type CompleteResponse =
+  | { result: "ready"; doc_id: string }
+  | { result: "conflict"; state: string; existing_doc_id: string | null }
+  | { result: "rejected"; reason: string };
+
+/** `GET /api/ingestion/uploads/:id` status. */
+export type UploadStatus =
+  | { state: "uploading" | "validating" }
+  | { state: "ready"; doc_id: string }
+  | { state: "rejected"; reason: string };
+
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   session: () => request<Session>("/api/auth/me"),
+  ingestion: {
+    createUpload: (req: CreateUploadRequest) =>
+      request<CreateUploadResponse>("/api/ingestion/uploads", {
+        method: "POST",
+        body: JSON.stringify(req),
+      }),
+    signUploadPart: (docId: string, partNumber: number) =>
+      request<SignPartResponse>(
+        `/api/ingestion/uploads/${encodeURIComponent(docId)}/sign-part`,
+        { method: "POST", body: JSON.stringify({ part_number: partNumber }) },
+      ),
+    completeUpload: (docId: string, parts: PartRef[]) =>
+      request<CompleteResponse>(
+        `/api/ingestion/uploads/${encodeURIComponent(docId)}/complete`,
+        { method: "POST", body: JSON.stringify({ parts }) },
+      ),
+    uploadStatus: (docId: string) =>
+      request<UploadStatus>(
+        `/api/ingestion/uploads/${encodeURIComponent(docId)}`,
+      ),
+  },
+  documents: {
+    /** Mint a short-lived direct-to-storage URL for a document's stored
+     *  original. The backend runs the tenant/doc authz check, then
+     *  returns a presigned URL; the caller fetches the bytes directly. */
+    viewUrl: (id: string) =>
+      request<ViewUrlResponse>(
+        `/api/documents/${encodeURIComponent(documentKey(id))}/view-url`,
+      ),
+  },
   chunks: {
     get: (id: string) => request<ChunkPayload>(chunkUrl(id)),
   },

@@ -150,6 +150,6 @@ async fn ingest_broadcasts_new_document_event() {
         .await
         .expect("event should arrive within 1s")
         .expect("channel still open");
-    assert_eq!(event.document.canonical_id, "broadcast-doc");
+    assert_eq!(event.document.canonical_id.as_deref(), Some("broadcast-doc"));
     assert_eq!(event.document.source_type, "test");
 }

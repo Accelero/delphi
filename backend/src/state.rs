@@ -16,9 +16,9 @@ use tokio::sync::broadcast;
 
 use crate::chat::SessionRegistry;
 use crate::embedder::Embedder;
-use crate::ingestion::FeedItemEvent;
+use crate::ingestion::{FeedItemEvent, MetadataExtractor};
 use crate::llm::LlmClient;
-use crate::object_store::ObjectStore;
+use crate::object_store::{AccessMinter, ObjectStore};
 use crate::storage::{RequestDbPool, SystemDb};
 use crate::text_extractor::TextExtractor;
 
@@ -40,6 +40,12 @@ pub struct AppState {
     /// directly; HTTP handlers can dereference `Document.storage_uri`
     /// through it for "show original" features.
     pub object_store: Arc<dyn ObjectStore>,
+    /// Client-facing object-access minter — the swappable seam for
+    /// direct-to-storage reads/writes. Handlers run the authz decision,
+    /// then mint a short-lived scoped URL (presigned today via
+    /// `S3PresignAccess`; CDN/STS/proxy drop in here later without caller
+    /// changes). See `docs/architecture/object-access.md`.
+    pub access: Arc<dyn AccessMinter>,
     /// Fan-out channel for "new document accepted" events. The Discovery
     /// SSE handler subscribes per request; the ingestion HTTP handler
     /// publishes via a per-request `NotifyingSink` on the `Created`
@@ -66,4 +72,7 @@ pub struct AppState {
     /// once at boot from env; handlers read this for per-request
     /// decisions without re-parsing env on every call.
     pub uploads_config: Arc<crate::ingestion::UploadsConfig>,
+    /// Metadata autofill seam. Ships as `NoopExtractor` today; the
+    /// Phase-3 `LlmExtractor` swaps in here without touching callers.
+    pub metadata_extractor: Arc<dyn MetadataExtractor>,
 }

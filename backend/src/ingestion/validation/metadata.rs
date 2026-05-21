@@ -22,9 +22,17 @@ use serde::{Deserialize, Serialize};
 /// depth + serialized size without imposing a particular schema.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CreateUploadRequest {
-    pub canonical_id: String,
-    pub source_type: String,
-    pub source_uri: String,
+    /// Optional dedup key. The SPA never sends it for manual uploads;
+    /// natural-source writers (v1 JSON ingest, future adapters) still do.
+    /// Validated for shape only *when present*.
+    #[serde(default)]
+    pub canonical_id: Option<String>,
+    /// Server-defaults to `"manual"` when absent (the manual-upload case).
+    #[serde(default)]
+    pub source_type: Option<String>,
+    /// Optional. Validated for shape only *when present*.
+    #[serde(default)]
+    pub source_uri: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     pub content_type: String,
@@ -50,6 +58,29 @@ pub struct CreateUploadRequest {
     pub upload_id: Option<serde_json::Value>,
 }
 
+impl CreateUploadRequest {
+    /// Resolved source type: the declared value, or `"manual"` when the
+    /// client omitted it (the manual-upload default).
+    pub fn resolved_source_type(&self) -> String {
+        self.source_type
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "manual".to_string())
+    }
+}
+
+/// App-level descriptive field, used by `MetadataPolicy.required_fields`
+/// to declare which fields must be present **after merge**. Distinct from
+/// the hard DB-required fields (`source_type`, `content_hash`, the record
+/// id), which the engine enforces at `CREATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetadataField {
+    Title,
+    Authors,
+    Summary,
+    Language,
+}
+
 #[derive(Debug, Clone)]
 pub struct MetadataPolicy {
     pub allowed_content_types: HashSet<String>,
@@ -58,6 +89,11 @@ pub struct MetadataPolicy {
     pub max_metadata_depth: usize,
     pub max_metadata_bytes: usize,
     pub canonical_id_pattern: Regex,
+    /// Descriptive fields that must be present after the prefill/autofill
+    /// merge. Starts **empty** — nothing is app-required until the LLM
+    /// extractor lands (otherwise every multi-file upload fails, since
+    /// autofill is a noop today).
+    pub required_fields: HashSet<MetadataField>,
 }
 
 impl Default for MetadataPolicy {
@@ -73,6 +109,8 @@ impl Default for MetadataPolicy {
             max_metadata_bytes: 64 * 1024,
             canonical_id_pattern: Regex::new(r"^[a-z][a-z0-9_-]*:[A-Za-z0-9._:-]{1,256}$")
                 .expect("default canonical_id pattern compiles"),
+            // Empty: nothing app-required until the LLM extractor lands.
+            required_fields: HashSet::new(),
         }
     }
 }
@@ -123,21 +161,16 @@ pub fn validate_ingestion_metadata(
         ));
     }
 
-    // 2. Required-string shape.
-    if req.canonical_id.is_empty() {
-        return Err(MetadataReject::MalformedRequest(
-            "canonical_id is empty".into(),
-        ));
-    }
-    if req.source_type.is_empty() {
-        return Err(MetadataReject::MalformedRequest(
-            "source_type is empty".into(),
-        ));
-    }
-    if req.source_uri.is_empty() {
-        return Err(MetadataReject::MalformedRequest(
-            "source_uri is empty".into(),
-        ));
+    // 2. Required-string shape. Only `content_type` is hard-required on
+    //    the wire — `canonical_id` and `source_uri` are optional (manual
+    //    uploads omit them), and `source_type` defaults to "manual"
+    //    server-side when absent.
+    if let Some(st) = &req.source_type {
+        if st.is_empty() {
+            return Err(MetadataReject::MalformedRequest(
+                "source_type is empty".into(),
+            ));
+        }
     }
     if req.content_type.is_empty() {
         return Err(MetadataReject::MalformedRequest(
@@ -145,12 +178,18 @@ pub fn validate_ingestion_metadata(
         ));
     }
 
-    // 3. Hardcoded fixed-rule limits.
-    if !policy.canonical_id_pattern.is_match(&req.canonical_id) {
-        return Err(MetadataReject::InvalidCanonicalId);
+    // 3. Hardcoded fixed-rule limits. `canonical_id` / `source_uri` shape
+    //    checks run *only when the field is present* — an absent value is
+    //    legal (manual upload).
+    if let Some(cid) = &req.canonical_id {
+        if cid.is_empty() || !policy.canonical_id_pattern.is_match(cid) {
+            return Err(MetadataReject::InvalidCanonicalId);
+        }
     }
-    if !is_plausible_uri(&req.source_uri) {
-        return Err(MetadataReject::InvalidSourceUri);
+    if let Some(uri) = &req.source_uri {
+        if uri.is_empty() || !is_plausible_uri(uri) {
+            return Err(MetadataReject::InvalidSourceUri);
+        }
     }
     if !policy.allowed_content_types.contains(&req.content_type) {
         return Err(MetadataReject::DisallowedContentType);
@@ -175,6 +214,78 @@ pub fn validate_ingestion_metadata(
         .unwrap_or(usize::MAX);
     if metadata_bytes > policy.max_metadata_bytes {
         return Err(MetadataReject::MetadataTooLarge);
+    }
+
+    Ok(())
+}
+
+/// A borrowed view of descriptive metadata, shared by the two
+/// pipeline call sites (autofill output, merged result). The pipeline
+/// builds one of these from `ExtractedMetadata` / `MergedMetadata`
+/// without those types depending on the validator.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DescriptiveView<'a> {
+    pub title: Option<&'a str>,
+    pub authors: &'a [String],
+    pub summary: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub published_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub extra: Option<&'a serde_json::Value>,
+}
+
+/// Layer-2 descriptive-metadata gate. Distinct from
+/// [`validate_ingestion_metadata`] (which checks the wire *request*:
+/// content-type, size, forbidden fields). This validates a
+/// **descriptive** result — autofill output (stage 7) or the merged
+/// metadata (stage 9). It shares the size/depth helpers with the wire
+/// validator, not its entry point.
+///
+/// Checks: `title` length, `published_at` sanity (not absurdly far in the
+/// future), `extra` depth + serialized size, and `required_fields`.
+pub fn validate_descriptive_metadata(
+    meta: &DescriptiveView<'_>,
+    policy: &MetadataPolicy,
+) -> Result<(), MetadataReject> {
+    if let Some(t) = meta.title {
+        if t.chars().count() > policy.max_title_chars {
+            return Err(MetadataReject::TitleTooLong);
+        }
+    }
+
+    if let Some(pub_at) = meta.published_at {
+        // Reject implausible far-future timestamps (a corrupt / adversarial
+        // extractor result). One year of slack covers clock skew + embargo
+        // dates.
+        let horizon = chrono::Utc::now() + chrono::Duration::days(366);
+        if pub_at > horizon {
+            return Err(MetadataReject::MalformedRequest(
+                "published_at is implausibly far in the future".into(),
+            ));
+        }
+    }
+
+    if let Some(extra) = meta.extra {
+        if json_depth(extra, 0) > policy.max_metadata_depth {
+            return Err(MetadataReject::MetadataTooDeep);
+        }
+        let bytes = serde_json::to_vec(extra).map(|v| v.len()).unwrap_or(usize::MAX);
+        if bytes > policy.max_metadata_bytes {
+            return Err(MetadataReject::MetadataTooLarge);
+        }
+    }
+
+    for field in &policy.required_fields {
+        let present = match field {
+            MetadataField::Title => meta.title.map(|s| !s.is_empty()).unwrap_or(false),
+            MetadataField::Authors => !meta.authors.is_empty(),
+            MetadataField::Summary => meta.summary.map(|s| !s.is_empty()).unwrap_or(false),
+            MetadataField::Language => meta.language.map(|s| !s.is_empty()).unwrap_or(false),
+        };
+        if !present {
+            return Err(MetadataReject::MalformedRequest(format!(
+                "required descriptive field missing: {field:?}"
+            )));
+        }
     }
 
     Ok(())
@@ -215,9 +326,9 @@ mod tests {
 
     fn ok_req() -> CreateUploadRequest {
         CreateUploadRequest {
-            canonical_id: "manual:abc123".into(),
-            source_type: "manual".into(),
-            source_uri: "https://example.test/abc123".into(),
+            canonical_id: Some("manual:abc123".into()),
+            source_type: Some("manual".into()),
+            source_uri: Some("https://example.test/abc123".into()),
             title: Some("A paper".into()),
             content_type: "application/pdf".into(),
             size: 1024,
@@ -228,6 +339,75 @@ mod tests {
             key: None,
             upload_id: None,
         }
+    }
+
+    fn manual_req() -> CreateUploadRequest {
+        // The shape the SPA actually sends: no canonical_id, no
+        // source_uri, no source_type (server defaults to "manual").
+        CreateUploadRequest {
+            canonical_id: None,
+            source_type: None,
+            source_uri: None,
+            title: Some("A manual upload".into()),
+            content_type: "application/pdf".into(),
+            size: 1024,
+            metadata: json!({}),
+            tenant_id: None,
+            user_id: None,
+            storage_uri: None,
+            key: None,
+            upload_id: None,
+        }
+    }
+
+    #[test]
+    fn descriptive_empty_passes_when_nothing_required() {
+        let p = MetadataPolicy::default(); // required_fields empty
+        let view = DescriptiveView::default();
+        assert!(validate_descriptive_metadata(&view, &p).is_ok());
+    }
+
+    #[test]
+    fn descriptive_title_too_long_rejected() {
+        let p = MetadataPolicy::default();
+        let long = "x".repeat(p.max_title_chars + 1);
+        let view = DescriptiveView {
+            title: Some(&long),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_descriptive_metadata(&view, &p),
+            Err(MetadataReject::TitleTooLong)
+        );
+    }
+
+    #[test]
+    fn descriptive_required_title_missing_rejected() {
+        let mut p = MetadataPolicy::default();
+        p.required_fields.insert(MetadataField::Title);
+        let view = DescriptiveView::default();
+        assert!(matches!(
+            validate_descriptive_metadata(&view, &p),
+            Err(MetadataReject::MalformedRequest(_))
+        ));
+        // With a title present it passes.
+        let view = DescriptiveView {
+            title: Some("present"),
+            ..Default::default()
+        };
+        assert!(validate_descriptive_metadata(&view, &p).is_ok());
+    }
+
+    #[test]
+    fn manual_upload_without_canonical_id_passes() {
+        let p = MetadataPolicy::default();
+        assert!(validate_ingestion_metadata(&manual_req(), &p).is_ok());
+    }
+
+    #[test]
+    fn resolved_source_type_defaults_to_manual() {
+        assert_eq!(manual_req().resolved_source_type(), "manual");
+        assert_eq!(ok_req().resolved_source_type(), "manual");
     }
 
     #[test]
@@ -345,7 +525,7 @@ mod tests {
     fn invalid_canonical_id_rejected() {
         let p = MetadataPolicy::default();
         let mut req = ok_req();
-        req.canonical_id = "no-colon-form".into();
+        req.canonical_id = Some("no-colon-form".into());
         assert_eq!(
             validate_ingestion_metadata(&req, &p),
             Err(MetadataReject::InvalidCanonicalId)
@@ -356,7 +536,7 @@ mod tests {
     fn invalid_source_uri_rejected() {
         let p = MetadataPolicy::default();
         let mut req = ok_req();
-        req.source_uri = "javascript:alert(1)".into();
+        req.source_uri = Some("javascript:alert(1)".into());
         assert_eq!(
             validate_ingestion_metadata(&req, &p),
             Err(MetadataReject::InvalidSourceUri)
@@ -364,14 +544,16 @@ mod tests {
     }
 
     #[test]
-    fn empty_required_field_rejected() {
+    fn empty_canonical_id_when_present_rejected() {
+        // An *absent* canonical_id is fine (manual upload); an empty
+        // string, when explicitly present, is malformed shape.
         let p = MetadataPolicy::default();
         let mut req = ok_req();
-        req.canonical_id = String::new();
-        assert!(matches!(
+        req.canonical_id = Some(String::new());
+        assert_eq!(
             validate_ingestion_metadata(&req, &p),
-            Err(MetadataReject::MalformedRequest(_))
-        ));
+            Err(MetadataReject::InvalidCanonicalId)
+        );
     }
 
     // ---- Property tests --------------------------------------------------
@@ -397,7 +579,7 @@ mod tests {
                     3 => r.key = Some(json!(format!("tenants/t/k-{i}"))),
                     4 => r.upload_id = Some(json!(format!("mpu-{i}"))),
                     5 => r.size = oversize,
-                    6 => r.canonical_id = format!("badid-{i}"),
+                    6 => r.canonical_id = Some(format!("badid-{i}")),
                     7 => {
                         let mut v = json!("leaf");
                         for _ in 0..(p.max_metadata_depth + 4) {

@@ -157,7 +157,9 @@ fn build_document(req: &IngestRequest, content_hash: String, version: i64) -> Do
     Document {
         id: None,
         tenant_id: None,
-        canonical_id: req.canonical_id.clone(),
+        // v1 JSON ingest always carries a canonical_id (it's required on
+        // `IngestRequest`); wrap it as Some for the now-optional column.
+        canonical_id: Some(req.canonical_id.clone()),
         source_type: req.source_type.clone(),
         source_uri: req.source_uri.clone(),
         storage_uri: req.storage_uri.clone(),

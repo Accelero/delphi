@@ -86,9 +86,21 @@ services:
       # Source adapters (Discovery pillar). All optional; SOURCES_ENABLED
       # gates the scheduler entirely. No in-tree adapters today.
       SOURCES_ENABLED: ${SOURCES_ENABLED:-false}
-      # Object storage for original artefacts (PDFs etc.). Path is the
-      # *container* path; the volume mount below maps it to the host.
-      OBJECT_STORE_URL: ${OBJECT_STORE_URL:-file:///var/lib/delphi/originals}
+      # Object storage for original artefacts (PDFs etc.). Direct-to-S3
+      # via MinIO (ingestion v2). The bucket from the URL is informational;
+      # the connection knobs come from INGEST_S3_* below.
+      OBJECT_STORE_URL: ${OBJECT_STORE_URL:-s3://delphi/}
+      # Backend → MinIO (internal docker network host).
+      INGEST_S3_ENDPOINT_INTERNAL: ${INGEST_S3_ENDPOINT_INTERNAL:-http://minio:9000}
+      # Embedded in presigned URLs the browser PUTs to directly. Tier-1
+      # exposes MinIO on :9000 to the host, same origin policy permitting
+      # via CORS (allows the Vite :5173 origin).
+      INGEST_S3_ENDPOINT_PUBLIC: ${INGEST_S3_ENDPOINT_PUBLIC:-http://localhost:9000}
+      INGEST_S3_REGION: ${INGEST_S3_REGION:-us-east-1}
+      INGEST_S3_BUCKET: ${INGEST_S3_BUCKET:-delphi}
+      INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-delphi}
+      INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+      INGEST_S3_FORCE_PATH_STYLE: ${INGEST_S3_FORCE_PATH_STYLE:-true}
       # RAG v1: embedder sidecars (tei-chunk + tei-paper). The backend
       # tolerates absent / disabled embedders — RAG is a pillar, not a
       # boot-critical dep — but the defaults wire it up.
@@ -98,17 +110,58 @@ services:
       EMBEDDER_DOCUMENT_ENABLED: ${EMBEDDER_DOCUMENT_ENABLED:-true}
       EMBEDDER_DOCUMENT_ENDPOINT: ${EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
       EMBEDDER_DOCUMENT_MODEL_NAME: ${EMBEDDER_DOCUMENT_MODEL_NAME:-specter2}
-    volumes:
-      - ./data/originals:/var/lib/delphi/originals
     ports:
       - "8081:8081"
     depends_on:
       surrealdb:
         condition: service_healthy
+      minio:
+        condition: service_healthy
       tei-chunk:
         condition: service_started
       tei-paper:
         condition: service_started
+
+  # MinIO: S3-compatible object store for direct-to-S3 ingestion uploads.
+  # Tier-1 exposes :9000 (S3 API) + :9001 (console) to the host so the
+  # browser PUTs parts directly via presigned URLs.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: delphi-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-delphi}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: create the bucket and lock down anonymous access.
+  # CORS is NOT configured here: MinIO's built-in default already echoes
+  # the request Origin, allows PUT, and exposes `ETag` (which Uppy needs
+  # to read each part's etag) — and MinIO doesn't implement the per-bucket
+  # `mc cors set` S3 API anyway. For prod you'd restrict origins via the
+  # server-level `MINIO_API_CORS_ALLOW_ORIGIN` env on the minio service.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: delphi-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-delphi}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+             mc mb --ignore-existing local/delphi &&
+             mc anonymous set none local/delphi"
 
   # Hugging Face Text Embeddings Inference (chunk-class — BGE-small).
   # Model weights are cached on a named volume so dev restarts are fast.
@@ -156,6 +209,7 @@ services:
 
 volumes:
   surreal_data:
+  minio_data:
   frontend_node_modules:
   tei_chunk_data:
   tei_paper_data:

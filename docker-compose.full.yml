@@ -169,13 +169,69 @@ services:
       EMBEDDER_DOCUMENT_ENABLED: ${EMBEDDER_DOCUMENT_ENABLED:-true}
       EMBEDDER_DOCUMENT_ENDPOINT: ${EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
       EMBEDDER_DOCUMENT_MODEL_NAME: ${EMBEDDER_DOCUMENT_MODEL_NAME:-specter2}
+      # Direct-to-storage object access (ingestion v2 + download). Backend
+      # → MinIO over the docker network (INTERNAL); presigned upload/download
+      # URLs carry the browser-facing host (PUBLIC = MinIO's published
+      # :9000 port). The browser hits MinIO directly — Traefik is no longer
+      # in the byte path. See docs/architecture/object-access.md.
+      OBJECT_STORE_URL: ${OBJECT_STORE_URL:-s3://delphi/}
+      INGEST_S3_ENDPOINT_INTERNAL: ${INGEST_S3_ENDPOINT_INTERNAL:-http://minio:9000}
+      INGEST_S3_ENDPOINT_PUBLIC: ${INGEST_S3_ENDPOINT_PUBLIC:-http://localhost:9000}
+      INGEST_S3_REGION: ${INGEST_S3_REGION:-us-east-1}
+      INGEST_S3_BUCKET: ${INGEST_S3_BUCKET:-delphi}
+      INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-delphi}
+      INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+      INGEST_S3_FORCE_PATH_STYLE: ${INGEST_S3_FORCE_PATH_STYLE:-true}
     depends_on:
       surrealdb:
+        condition: service_healthy
+      minio:
         condition: service_healthy
       tei-chunk:
         condition: service_started
       tei-paper:
         condition: service_started
+
+  # MinIO: S3-compatible object store for direct-to-storage object access.
+  # Published on :9000 (S3 API) + :9001 (console) so the browser PUTs
+  # upload parts and GETs downloads directly via presigned URLs; the
+  # backend reaches it over the docker network at minio:9000. No Traefik
+  # in the byte path. See docs/architecture/object-access.md.
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: delphi-full-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-delphi}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+    volumes:
+      - minio_data_full:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: delphi-full-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-delphi}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+    # No CORS step: MinIO's built-in default echoes the Origin, allows PUT,
+    # and exposes ETag; the per-bucket `mc cors set` S3 API isn't
+    # implemented by MinIO. Restrict origins in prod via the server-level
+    # `MINIO_API_CORS_ALLOW_ORIGIN` env on the minio service.
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+             mc mb --ignore-existing local/delphi &&
+             mc anonymous set none local/delphi"
 
   # RAG v1: TEI sidecars. Same images / model IDs as tier 1.
   tei-chunk:
@@ -213,5 +269,6 @@ services:
 
 volumes:
   surreal_data_full:
+  minio_data_full:
   tei_chunk_data_full:
   tei_paper_data_full:

@@ -6,8 +6,9 @@
 //! re-extraction or "show original" surfaces.
 //!
 //! Backend choice is **inferred from a URL** — single env var
-//! `OBJECT_STORE_URL` carries it. Local-FS for single-user, S3 for
-//! SaaS later. See [`from_url`].
+//! `OBJECT_STORE_URL` carries it. Production is always S3-compatible
+//! (`s3://<bucket>/...`); MinIO in dev, any S3 provider in prod. See
+//! [`from_url`].
 //!
 //! ## Why a separate module from `Storage`
 //!
@@ -22,14 +23,14 @@
 //!
 //! Direct-to-S3 uploads (ingestion v2) use the multipart methods:
 //! `create_multipart_upload` / `presign_upload_part` /
-//! `complete_multipart_upload`. `LocalFsObjectStore` ships an
-//! in-process shim implementing the same interface so integration
-//! tests don't need MinIO. The presigned-URL signing only makes sense
-//! against a real S3 endpoint; the shim returns a local HTTP-style URL
-//! reserved for tests that drive the upload via direct `put_part` calls
+//! `complete_multipart_upload`. `MemObjectStore` ships an in-process
+//! shim implementing the same interface so integration tests don't need
+//! MinIO. The presigned-URL signing only makes sense against a real S3
+//! endpoint; the shim returns a `mem-multipart://` URL reserved for
+//! tests that drive the upload via direct `upload_part_direct` calls
 //! rather than an HTTP client.
 
-mod local_fs;
+mod access;
 mod mem;
 mod multipart;
 mod s3;
@@ -42,13 +43,14 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 
-pub use local_fs::LocalFsObjectStore;
-pub use mem::MemObjectStore;
+pub use access::{AccessGrant, AccessMinter, AccessOp};
+pub use mem::{MemAccess, MemObjectStore};
 pub use multipart::{
     storage_uri_for_key, CompleteOutcome, MultipartEntry, ObjectEntry, ObjectMeta, PartRef,
     PresignedUrl,
 };
-pub use url::from_url;
+pub use s3::{S3ObjectStore, S3PresignAccess};
+pub use url::{access_minter_from_url, from_url};
 
 /// Read-write key/value blob store.
 ///
@@ -82,8 +84,8 @@ pub trait ObjectStore: Send + Sync {
     async fn exists(&self, key: &str) -> Result<bool>;
 
     /// Read back an object given the URL `put` previously returned.
-    /// Implementations parse their own URL form (`file://…`,
-    /// `mem://…`, eventually `s3://…`) and reject URLs they don't own.
+    /// Implementations parse their own URL form (`s3://…`, `mem://…`)
+    /// and reject URLs they don't own.
     async fn get_by_url(&self, url: &str) -> Result<Bytes>;
 
     /// HEAD: object metadata. Used by the validator at `/complete` to
@@ -170,8 +172,8 @@ pub trait ObjectStore: Send + Sync {
 
     // ---- test-only multipart shim ----------------------------------------
 
-    /// Direct part upload, used by the `LocalFsObjectStore` multipart
-    /// shim in tests. Production callers go through the presigned URL
+    /// Direct part upload, used by the `MemObjectStore` multipart shim
+    /// in tests. Production callers go through the presigned URL
     /// returned by `presign_upload_part` instead. Default implementation
     /// returns `NotImplemented`; the shim overrides.
     #[doc(hidden)]

@@ -79,7 +79,7 @@ async fn chat_streams_citations_block_before_text() {
         .upsert_document(&Document {
             id: None,
             tenant_id: None,
-            canonical_id: "ret-1".into(),
+            canonical_id: Some("ret-1".into()),
             source_type: "manual".into(),
             source_uri: "https://example.test/ret-1".into(),
             storage_uri: None,

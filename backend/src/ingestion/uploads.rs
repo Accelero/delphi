@@ -27,13 +27,13 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthContext;
-use crate::error::Error;
-use crate::object_store::storage_uri_for_key;
 use crate::state::AppState;
-use crate::storage::{AuthedDb, CreateUploadSessionParams, Document, IngestionRejection, Storage};
+use crate::storage::{AuthedDb, CreateUploadSessionParams, IngestionRejection, Storage};
 
+use super::autofill::DocumentPrefill;
+use super::completion::{run_completion, CompletionCtx, CompletionError};
 use super::validation::{
-    validate_ingestion_metadata, validate_uploaded_object, CreateUploadRequest, MetadataPolicy,
+    validate_ingestion_metadata, CreateUploadRequest, MetadataField, MetadataPolicy,
     MetadataReject, ObjectPolicy, ObjectReject,
 };
 
@@ -43,12 +43,14 @@ use super::validation::{
 pub struct UploadsConfig {
     pub part_size_bytes: u64,
     pub part_url_ttl: Duration,
+    /// TTL on minted download URLs. Download is the confidentiality-
+    /// sensitive direction, so this is short (default 120s). From
+    /// `INGEST_DOWNLOAD_URL_TTL_SECS`.
+    pub download_url_ttl: Duration,
     pub session_ttl: Duration,
     pub metadata_policy: MetadataPolicy,
     pub object_policy: ObjectPolicy,
     /// `INGEST_S3_BUCKET`. Used to render the canonical `storage_uri`.
-    /// Falls back to `"local"` when no S3 bucket is configured (single-
-    /// user / dev deployments backed by `LocalFsObjectStore`).
     pub bucket: String,
 }
 
@@ -57,9 +59,11 @@ impl UploadsConfig {
         let part_size_bytes = parse_env_u64("INGEST_UPLOAD_PART_SIZE_BYTES", 8 * 1024 * 1024);
         let part_url_ttl =
             Duration::from_secs(parse_env_u64("INGEST_UPLOAD_PART_URL_TTL_SECS", 900));
+        let download_url_ttl =
+            Duration::from_secs(parse_env_u64("INGEST_DOWNLOAD_URL_TTL_SECS", 120));
         let session_ttl =
             Duration::from_secs(parse_env_u64("INGEST_UPLOAD_SESSION_TTL_SECS", 3600));
-        let bucket = std::env::var("INGEST_S3_BUCKET").unwrap_or_else(|_| "local".into());
+        let bucket = std::env::var("INGEST_S3_BUCKET").unwrap_or_else(|_| "delphi".into());
 
         let mut metadata_policy = MetadataPolicy::default();
         if let Ok(max) = std::env::var("INGEST_UPLOAD_MAX_FILE_SIZE_BYTES") {
@@ -73,6 +77,22 @@ impl UploadsConfig {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
+                .collect();
+        }
+        // App-required descriptive fields after merge. Defaults empty
+        // (autofill is a noop today). Comma-separated: title,authors,
+        // summary,language.
+        if let Ok(fields) = std::env::var("INGEST_REQUIRED_METADATA_FIELDS") {
+            metadata_policy.required_fields = fields
+                .split(',')
+                .map(str::trim)
+                .filter_map(|s| match s.to_ascii_lowercase().as_str() {
+                    "title" => Some(MetadataField::Title),
+                    "authors" => Some(MetadataField::Authors),
+                    "summary" => Some(MetadataField::Summary),
+                    "language" => Some(MetadataField::Language),
+                    _ => None,
+                })
                 .collect();
         }
 
@@ -107,6 +127,7 @@ impl UploadsConfig {
         Self {
             part_size_bytes,
             part_url_ttl,
+            download_url_ttl,
             session_ttl,
             metadata_policy,
             object_policy,
@@ -121,6 +142,7 @@ impl UploadsConfig {
         Self {
             part_size_bytes: 8 * 1024 * 1024,
             part_url_ttl: Duration::from_secs(900),
+            download_url_ttl: Duration::from_secs(120),
             session_ttl: Duration::from_secs(3600),
             metadata_policy: MetadataPolicy::default(),
             object_policy: ObjectPolicy::default(),
@@ -184,10 +206,9 @@ pub enum CompleteResponse {
 pub enum StatusResponse {
     Uploading,
     Validating,
-    /// Reserved for the document-by-doc_id lookup once that wiring
-    /// lands — today the SPA learns the document id from the
-    /// `/complete` response directly.
-    #[allow(dead_code)]
+    /// Returned by the record-id lookup once the document is committed
+    /// (`document:<doc_id>`). The SPA's recovery poll uses this to learn
+    /// a dropped `/complete` actually succeeded.
     Ready {
         doc_id: String,
     },
@@ -277,9 +298,20 @@ pub async fn create_upload(
         doc_id: doc_id.clone(),
         s3_key: key.clone(),
         s3_upload_id: upload_id.clone(),
+        // Manual uploads send no canonical_id (None → stored NONE);
+        // natural-source writers still set it. source_type defaults to
+        // "manual"; source_uri defaults to a placeholder URN when absent
+        // (the schema column is TYPE string, non-option).
         canonical_id: req.canonical_id.clone(),
-        source_type: req.source_type.clone(),
-        source_uri: req.source_uri.clone(),
+        // Per-tenant dedup index value; None for manual uploads. Must
+        // match what `commit_upload` computes so the session and the
+        // committed document share the same key namespace.
+        dedup_key: crate::storage::dedup_key(&auth.tenant_id, req.canonical_id.as_deref()),
+        source_type: req.resolved_source_type(),
+        source_uri: req
+            .source_uri
+            .clone()
+            .unwrap_or_else(|| format!("urn:delphi:manual:{doc_id}")),
         title: req.title.clone(),
         declared_size: req.size,
         declared_content_type: req.content_type.clone(),
@@ -374,29 +406,29 @@ pub async fn sign_upload_part(
         }
     }
 
-    let url = match state
-        .object_store
-        .presign_upload_part(
+    // Route through the access-minting seam instead of calling the
+    // object store's presign directly. Returned URL shape is identical
+    // today (presigned PUT against the public endpoint); the indirection
+    // is the swap point for future CDN/STS minters.
+    let grant = match state
+        .access
+        .mint(
             &session.s3_key,
-            &session.s3_upload_id,
-            req.part_number,
+            crate::object_store::AccessOp::UploadPart {
+                upload_id: session.s3_upload_id.clone(),
+                part_number: req.part_number,
+            },
             state.uploads_config.part_url_ttl,
         )
         .await
     {
-        Ok(u) => u,
+        Ok(g) => g,
         Err(e) => {
-            tracing::error!(error = %e, doc_id, "presign_upload_part failed");
+            tracing::error!(error = %e, doc_id, "mint upload-part url failed");
             return (StatusCode::BAD_GATEWAY, "presign failed").into_response();
         }
     };
-    (
-        StatusCode::OK,
-        Json(SignPartResponse {
-            url: url.into_inner(),
-        }),
-    )
-        .into_response()
+    (StatusCode::OK, Json(SignPartResponse { url: grant.url })).into_response()
 }
 
 // ============================================================================
@@ -478,51 +510,34 @@ pub async fn complete_upload(
         }
     }
 
-    // 3. Object validator.
-    let validated = match validate_uploaded_object(
-        &session.s3_key,
-        session.declared_size as u64,
-        &session.declared_content_type,
-        &*state.object_store,
-        &state.uploads_config.object_policy,
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(rej) => {
-            return handle_object_reject(state.clone(), &auth, &session, rej).await;
-        }
+    // 3. Run the ordered completion pipeline (validate object → extract
+    //    text → autofill → validate autofill → merge → validate merged →
+    //    commit). The handler stays thin: it builds the ctx, runs the
+    //    workflow, and maps the terminal result to HTTP.
+    let prefill = DocumentPrefill {
+        title: session.title.clone(),
+        // Single-file prefill only carries title today on the session;
+        // authors/summary/language are threaded once the SPA sends them
+        // (it does — they live in declared_metadata). Pull what the SPA
+        // stashed in declared_metadata.
+        authors: prefill_authors(&session.declared_metadata),
+        summary: prefill_str(&session.declared_metadata, "summary"),
+        language: prefill_str(&session.declared_metadata, "language"),
+    };
+    let ctx = CompletionCtx {
+        object_store: &*state.object_store,
+        authed_db: &db,
+        system_db: &state.system_db,
+        auth: &auth,
+        session: &session,
+        extractor: &*state.metadata_extractor,
+        policy: &state.uploads_config.metadata_policy,
+        object_policy: &state.uploads_config.object_policy,
+        prefill: &prefill,
+        bucket: &state.uploads_config.bucket,
     };
 
-    // 4. Commit transaction.
-    let storage_uri = if state.uploads_config.bucket == "local" {
-        // Local-FS backend: storage_uri is the file:// URL the
-        // LocalFsObjectStore produced. Look up via head to get the
-        // canonical form back; for simplicity we re-derive from the key.
-        format!("file:///{}", session.s3_key)
-    } else {
-        storage_uri_for_key(&state.uploads_config.bucket, &session.s3_key)
-    };
-    let doc = Document {
-        id: None,
-        tenant_id: None,
-        canonical_id: session.canonical_id.clone(),
-        source_type: session.source_type.clone(),
-        source_uri: session.source_uri.clone(),
-        storage_uri: Some(storage_uri),
-        title: session.title.clone(),
-        authors: Vec::new(),
-        published_at: None,
-        ingested_at: None,
-        language: None,
-        summary: None,
-        paper_embedding: None,
-        paper_embedding_model: None,
-        content_hash: validated.etag.trim_matches('"').to_string(),
-        version: 1,
-        metadata: session.declared_metadata.clone(),
-    };
-    match db.commit_upload(&doc_id, &doc).await {
+    match run_completion(&ctx).await {
         Ok(doc_record) => (
             StatusCode::OK,
             Json(CompleteResponse::Ready {
@@ -530,7 +545,17 @@ pub async fn complete_upload(
             }),
         )
             .into_response(),
-        Err(Error::CanonicalIdConflict { existing_doc_id }) => {
+        Err(CompletionError::ObjectRejected(rej)) => {
+            let sniffed = match &rej {
+                ObjectReject::ContentTypeMismatch { sniffed, .. } => Some(sniffed.clone()),
+                _ => None,
+            };
+            handle_reject(&state, &auth, &session, rej.reason_code(), sniffed).await
+        }
+        Err(CompletionError::MetadataRejected(reason)) => {
+            handle_reject(&state, &auth, &session, "metadata_rejected", Some(reason)).await
+        }
+        Err(CompletionError::CanonicalIdConflict { existing_doc_id }) => {
             // Clean up: delete the S3 object + session, record rejection.
             let _ = state.object_store.delete(&session.s3_key).await;
             let _ = db.delete_upload_session(&doc_id).await;
@@ -557,7 +582,7 @@ pub async fn complete_upload(
             )
                 .into_response()
         }
-        Err(e) => {
+        Err(CompletionError::CommitFailed(e)) => {
             // Leave session in `validating` (cleaner reaps); the S3
             // object becomes an orphan and is reaped too.
             tracing::error!(error = %e, doc_id, "commit_upload failed");
@@ -566,31 +591,51 @@ pub async fn complete_upload(
     }
 }
 
-async fn handle_object_reject(
-    state: AppState,
+/// Pull prefill `authors` from the SPA-supplied `declared_metadata`
+/// (a JSON array of strings under the `authors` key).
+fn prefill_authors(meta: &serde_json::Value) -> Vec<String> {
+    meta.get("authors")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn prefill_str(meta: &serde_json::Value, key: &str) -> Option<String> {
+    meta.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Shared reject flow for both stage-4 (object) and stage-9 (merged
+/// metadata) rejections: wipe the S3 object + abort the multipart, delete
+/// the session, and log the rejection through SystemDb (the
+/// `ingestion_rejection` table denies user-session writes). Returns the
+/// 422 response.
+async fn handle_reject(
+    state: &AppState,
     auth: &AuthContext,
     session: &crate::storage::UploadSession,
-    rej: ObjectReject,
+    reason_code: &str,
+    sniffed: Option<String>,
 ) -> Response {
-    let reason = rej.reason_code().to_string();
+    let reason = reason_code.to_string();
     let _ = state.object_store.delete(&session.s3_key).await;
     let _ = state
         .object_store
         .abort_multipart_upload(&session.s3_key, &session.s3_upload_id)
         .await;
 
-    // Acquire a fresh authed handle? No — we already hold one. But the
-    // delete + rejection writes use SystemDb for the rejection (PERMISSIONS
-    // deny user writes), and AuthedDb-via-extension for the session delete.
-    // We don't have an Extension<AuthedDb> here, so go via SystemDb for
-    // both.
+    // Rejection write must go through SystemDb (PERMISSIONS deny
+    // user-session writes); the session delete also routes through it
+    // since this helper has no Extension<AuthedDb> handle.
     let sys = state.system_db.storage_for(auth.tenant_id.clone());
     let _ = sys.delete_upload_session(&session.doc_id).await;
 
-    let sniffed = match &rej {
-        ObjectReject::ContentTypeMismatch { sniffed, .. } => Some(sniffed.clone()),
-        _ => None,
-    };
     let rec = IngestionRejection {
         id: None,
         tenant_id: Some(auth.tenant_id.clone()),
@@ -640,17 +685,22 @@ pub async fn get_upload_status(
         }
     }
 
-    // 2. Committed document? (Engine PERMISSIONS restrict by tenant.)
-    // We don't have a `get_document_by_doc_id` lookup keyed on the
-    // session's `doc_id` string — the session never carried the document
-    // record id. The canonical_id from the session is what links the two,
-    // but we already deleted the session on commit. The status endpoint
-    // therefore relies on the `ingestion_rejection` table for failed
-    // uploads and on the SPA polling stop point for successful ones (the
-    // SPA knows `doc_id` from the create response).
-    //
-    // Look up by canonical_id stashed in the session if it's still
-    // around; otherwise rely on the rejection / 404 fallback.
+    // 2. Committed document? Now that `/complete` does
+    //    `CREATE document:<doc_id>` (deterministic record id, §1.4), the
+    //    document record id is `document:<doc_id>` — so after the session
+    //    row is gone on commit we can resolve `ready` by a direct
+    //    record-id lookup. Engine PERMISSIONS scope by tenant; this is
+    //    what the SPA's recovery poll relies on (§2.3 / B5).
+    let rid = surrealdb::RecordId::from(("document", doc_id.as_str()));
+    if let Ok(Some(_doc)) = db.get_document(&rid).await {
+        return (
+            StatusCode::OK,
+            Json(StatusResponse::Ready {
+                doc_id: rid.to_string(),
+            }),
+        )
+            .into_response();
+    }
 
     // 3. Rejection?
     if let Ok(Some(rej)) = db.get_ingestion_rejection(&doc_id).await {

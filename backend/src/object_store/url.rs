@@ -1,30 +1,47 @@
-//! `OBJECT_STORE_URL` → `Arc<dyn ObjectStore>` dispatcher.
+//! `OBJECT_STORE_URL` → `Arc<dyn ObjectStore>` / `Arc<dyn AccessMinter>`
+//! dispatchers.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-use super::s3;
-use super::{LocalFsObjectStore, ObjectStore};
+use super::s3::{S3ObjectStore, S3PresignAccess};
+use super::{AccessMinter, ObjectStore};
 
 /// Construct an `ObjectStore` from a URL.
 ///
 /// Recognised schemes:
-/// - `file:///abs/path` — filesystem-backed (the default).
-/// - `s3://bucket/prefix` — placeholder; returns
-///   `Error::NotImplemented` in slice 2.
-/// - no scheme (`/abs/path` or `./relative`) — filesystem-backed.
+/// - `s3://bucket/prefix` — S3-compatible (MinIO / Hetzner / R2 / B2 /
+///   AWS). The only production backend. The bucket from the URL is
+///   ignored in favour of `INGEST_S3_BUCKET`; the endpoints, region,
+///   credentials, and path-style flag come from the `INGEST_S3_*` env
+///   vars via [`S3ObjectStore::from_env`].
+///
+/// Any other scheme (including the old `file://` local-FS form) is
+/// rejected: there is no LocalFs fallback. Tests use `MemObjectStore`
+/// directly.
 pub fn from_url(url: &str) -> Result<Arc<dyn ObjectStore>> {
-    if let Some(rest) = url.strip_prefix("file://") {
-        let path = PathBuf::from(rest);
-        return Ok(Arc::new(LocalFsObjectStore::new(path)?));
-    }
     if url.starts_with("s3://") {
-        return Err(s3::not_yet_supported(url));
+        let store = S3ObjectStore::from_env()?;
+        return Ok(Arc::new(store));
     }
-    // No scheme → treat as filesystem path. Allows `OBJECT_STORE_URL=
-    // /var/lib/delphi/originals` or `./data/originals` shorthand.
-    let path = PathBuf::from(url);
-    Ok(Arc::new(LocalFsObjectStore::new(path)?))
+    Err(Error::InvalidConfig(format!(
+        "OBJECT_STORE_URL must be an s3:// URL (got {url}); LocalFs is removed"
+    )))
+}
+
+/// Construct the client-facing [`AccessMinter`] from the same
+/// `OBJECT_STORE_URL`. Today every `s3://` deployment uses
+/// [`S3PresignAccess`] (presigned URLs over the public endpoint); the
+/// deferred `CdnAccess` / `StsAccess` / `ProxyAccess` minters swap in
+/// here behind a deployment-config knob without touching callers — see
+/// `docs/architecture/object-access.md`.
+pub fn access_minter_from_url(url: &str) -> Result<Arc<dyn AccessMinter>> {
+    if url.starts_with("s3://") {
+        let access = S3PresignAccess::from_env()?;
+        return Ok(Arc::new(access));
+    }
+    Err(Error::InvalidConfig(format!(
+        "OBJECT_STORE_URL must be an s3:// URL (got {url}); LocalFs is removed"
+    )))
 }
