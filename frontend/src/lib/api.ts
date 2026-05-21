@@ -159,10 +159,11 @@ export type UploadPrefill = {
 
 /** `POST /api/ingestion/uploads` request. `source_type` is omitted —
  *  the server defaults it to "manual". `canonical_id` / `source_uri`
- *  are never sent for manual uploads. */
+ *  are never sent for manual uploads. No `content_type`: the backend
+ *  never sees the bytes here, so it determines the real type from the
+ *  uploaded object at `/complete`, not from a client claim. */
 export type CreateUploadRequest = UploadPrefill & {
   filename: string;
-  content_type: string;
   size: number;
 };
 

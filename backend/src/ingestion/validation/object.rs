@@ -24,6 +24,8 @@ use bytes::Bytes;
 
 use crate::object_store::ObjectStore;
 
+use super::metadata::canonical_content_type;
+
 #[derive(Debug, Clone)]
 pub struct ObjectPolicy {
     pub allowed_content_types: HashSet<String>,
@@ -100,6 +102,11 @@ pub async fn validate_uploaded_object(
     object_store: &dyn ObjectStore,
     policy: &ObjectPolicy,
 ) -> Result<ValidatedAttrs, ObjectReject> {
+    // The declared type is an untrusted client hint; canonicalize it the
+    // same way the metadata gate does (strip charset params / case /
+    // aliases) so the sniff comparison below is apples-to-apples.
+    let declared = canonical_content_type(declared_content_type);
+
     // 1. HEAD: actual size + ETag.
     let head = object_store
         .head(key)
@@ -113,7 +120,7 @@ pub async fn validate_uploaded_object(
     }
 
     // PDF-specific size cap before any further bytes touch us.
-    if declared_content_type == "application/pdf" && head.size > policy.pdf_max_input_bytes {
+    if declared == "application/pdf" && head.size > policy.pdf_max_input_bytes {
         // Reject without downloading — too large to parse safely.
         return Err(ObjectReject::SizeMismatch {
             declared: declared_size,
@@ -132,7 +139,8 @@ pub async fn validate_uploaded_object(
             .map_err(|e| ObjectReject::SniffFailed(e.to_string()))?
     };
 
-    let (sniffed, matched_types) = sniff_content_type(&sniff_bytes, declared_content_type);
+    let (sniffed, matched_types) = sniff_content_type(&sniff_bytes, &declared);
+    let sniffed = canonical_content_type(&sniffed);
 
     if policy.reject_polyglots
         && matched_types
@@ -146,18 +154,33 @@ pub async fn validate_uploaded_object(
         });
     }
 
+    // The sniffed (actual) type is authoritative — accept iff it's an
+    // allowlisted type. The declared type was only a hint.
     if !policy.allowed_content_types.contains(&sniffed) {
         return Err(ObjectReject::NotInAllowlist);
     }
-    if sniffed != declared_content_type {
+    // Anti-spoof: if the client declared a *specific allowlisted* type, the
+    // bytes must back it up. An "unknown" declaration (octet-stream / empty
+    // / a non-allowlisted hint) defers entirely to the sniff above.
+    if policy.allowed_content_types.contains(&declared) && sniffed != declared {
         return Err(ObjectReject::ContentTypeMismatch {
-            declared: declared_content_type.to_string(),
+            declared: declared.clone(),
             sniffed,
         });
     }
 
-    // 3. Format-specific parse.
-    match declared_content_type {
+    // PDF size cap also enforced against the *sniffed* type, in case the
+    // client under-declared a large PDF as "unknown" (the early cap only
+    // sees the declared type, before the sniff).
+    if sniffed == "application/pdf" && head.size > policy.pdf_max_input_bytes {
+        return Err(ObjectReject::SizeMismatch {
+            declared: declared_size,
+            actual: head.size,
+        });
+    }
+
+    // 3. Format-specific parse — keyed on the authoritative sniffed type.
+    match sniffed.as_str() {
         "application/pdf" => {
             // For PDFs we'd ideally shell out to a sandboxed parser to
             // detect page-count overruns / parse failures (with the
@@ -170,10 +193,10 @@ pub async fn validate_uploaded_object(
             // adds a streaming PDF cracker.
         }
         "text/plain" | "text/markdown" => {
-            // UTF-8 validation. Only need to validate the sniff window
-            // — if those 4 KiB aren't valid UTF-8 the whole file isn't
-            // either (UTF-8 is prefix-safe).
-            if std::str::from_utf8(&sniff_bytes).is_err() {
+            // UTF-8 validation over the sniff window (a multi-byte char
+            // split at the window boundary is tolerated by
+            // `looks_like_utf8_text`).
+            if !looks_like_utf8_text(&sniff_bytes) {
                 return Err(ObjectReject::Utf8DecodeFailed);
             }
         }
@@ -197,23 +220,41 @@ fn within_tolerance(declared: u64, actual: u64, tolerance: u64) -> bool {
     diff <= tolerance
 }
 
-/// Sniff the magic bytes and return (primary, all_matches). The primary
-/// is the strongest single match; `all_matches` lists every type the
-/// sniffer matched (for polyglot detection).
+/// True if `bytes` are (or are a valid UTF-8 prefix of) UTF-8 text. A
+/// multi-byte char split at the truncated sniff-window boundary yields an
+/// "unexpected end" error (`error_len() == None`) — that prefix is still
+/// valid text, so we accept it.
+fn looks_like_utf8_text(bytes: &[u8]) -> bool {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(e) => e.error_len().is_none() && e.valid_up_to() > 0,
+    }
+}
+
+/// Sniff the *actual* content type from the magic bytes and return
+/// (primary, all_matches). The declared type is consulted only to
+/// disambiguate text subtypes (`text/plain` vs `text/markdown`), which
+/// share no magic bytes — `infer` can't tell them apart. `all_matches`
+/// lists every type matched, for polyglot detection.
 fn sniff_content_type(bytes: &[u8], declared: &str) -> (String, Vec<String>) {
-    let primary = infer::get(bytes)
-        .map(|t| t.mime_type().to_string())
-        .or_else(|| {
-            // `infer` doesn't ship a text-plain detector. If declared is
-            // text/* and the bytes look like ASCII/UTF-8 text, accept
-            // the declared type.
-            if declared.starts_with("text/") && std::str::from_utf8(bytes).is_ok() {
-                Some(declared.to_string())
+    let primary = match infer::get(bytes) {
+        // A binary signature was recognised (pdf, png, zip, …).
+        Some(t) => t.mime_type().to_string(),
+        // No binary signature. Valid UTF-8 ⇒ it's text. `infer` ships no
+        // text detector, so we positively detect text here — this is what
+        // lets an "unknown"/octet-stream upload of a real text file pass.
+        // Honour an allowlisted markdown declaration since the bytes alone
+        // can't distinguish it from plain text.
+        None if looks_like_utf8_text(bytes) => {
+            if declared == "text/markdown" {
+                "text/markdown".to_string()
             } else {
-                None
+                "text/plain".to_string()
             }
-        })
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+        }
+        // Not a known binary and not valid UTF-8 ⇒ genuinely unknown.
+        None => "application/octet-stream".to_string(),
+    };
     let mut all = vec![primary.clone()];
     // Polyglot probe: PDFs that are also valid ZIPs (CDR-end-of-file at
     // EOF + PDF header at start). `infer` returns one match; for
@@ -307,6 +348,64 @@ mod tests {
             ),
             "unexpected reject variant: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn octet_stream_declared_text_accepted_as_text() {
+        // "Unknown" declared type + real text bytes → sniffed text/plain,
+        // accepted. This is the case a browser that can't type a .txt hits.
+        let store = MemObjectStore::new();
+        let body = text_bytes();
+        let key = "k/octet-text";
+        store.put(key, body.clone()).await.unwrap();
+        let res = validate_uploaded_object(
+            key,
+            body.len() as u64,
+            "application/octet-stream",
+            &store,
+            &ObjectPolicy::default(),
+        )
+        .await
+        .expect("octet-stream text should be accepted");
+        assert_eq!(res.sniffed_content_type, "text/plain");
+    }
+
+    #[tokio::test]
+    async fn octet_stream_declared_pdf_accepted_as_pdf() {
+        let store = MemObjectStore::new();
+        let body = pdf_bytes();
+        let key = "k/octet-pdf";
+        store.put(key, body.clone()).await.unwrap();
+        let res = validate_uploaded_object(
+            key,
+            body.len() as u64,
+            "application/octet-stream",
+            &store,
+            &ObjectPolicy::default(),
+        )
+        .await
+        .expect("octet-stream pdf should be accepted");
+        assert_eq!(res.sniffed_content_type, "application/pdf");
+    }
+
+    #[tokio::test]
+    async fn octet_stream_declared_binary_rejected() {
+        // Genuinely-unknown binary (not a known type, not UTF-8) → rejected
+        // by the authoritative sniff, even though declared is "unknown".
+        let store = MemObjectStore::new();
+        let body = Bytes::from_static(&[0xff, 0xfe, 0x00, 0x01, 0x02, 0x9c, 0xed]);
+        let key = "k/octet-bin";
+        store.put(key, body.clone()).await.unwrap();
+        let err = validate_uploaded_object(
+            key,
+            body.len() as u64,
+            "application/octet-stream",
+            &store,
+            &ObjectPolicy::default(),
+        )
+        .await
+        .expect_err("unknown binary should be rejected");
+        assert!(matches!(err, ObjectReject::NotInAllowlist), "got {err:?}");
     }
 
     #[tokio::test]

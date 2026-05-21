@@ -31,7 +31,6 @@ function fakeDriver(
         try {
           await manager.onCreate(fileId, {
             filename: file.name,
-            content_type: file.type || "text/plain",
             size: file.size,
             prefill: (meta.prefill as Record<string, unknown>) ?? {},
           });
@@ -184,5 +183,39 @@ describe("UploadManager", () => {
     expect(manager.getSnapshot()).toHaveLength(1);
     manager.dismiss(id);
     expect(manager.getSnapshot()).toHaveLength(0);
+  });
+
+  it("fails (not stuck in queued) when the driver can't add the file", async () => {
+    // Mirror uppyDriver: addFile throws (duplicate) → onAddFileError.
+    manager.setDriver({
+      addFile: (_file, meta) =>
+        manager.onAddFileError(meta.taskId as string, "duplicate_file"),
+    });
+    manager.enqueue([file()], {});
+    await vi.waitFor(() =>
+      expect(manager.getSnapshot()[0].state).toBe("failed"),
+    );
+    expect(manager.getSnapshot()[0].reason).toBe("duplicate_file");
+  });
+
+  it("releases the uploader's file on success and on dismiss", async () => {
+    const removed: string[] = [];
+    server.use(
+      createOk("doc6"),
+      signOk,
+      http.post("/api/ingestion/uploads/:id/complete", () =>
+        HttpResponse.json({ result: "ready", doc_id: "document:doc6" }),
+      ),
+    );
+    const base = fakeDriver(manager);
+    manager.setDriver({
+      addFile: base.addFile,
+      removeFile: (id) => removed.push(id),
+    });
+    manager.enqueue([file()], {});
+    await vi.waitFor(() => expect(manager.getSnapshot()[0].state).toBe("ready"));
+    // The file was released to the uploader when the task reached ready, so
+    // a re-upload of the same file won't collide as a duplicate.
+    expect(removed).toContain("f0");
   });
 });

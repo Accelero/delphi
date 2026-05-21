@@ -35,7 +35,10 @@ pub struct CreateUploadRequest {
     pub source_uri: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-    pub content_type: String,
+    // NOTE: no `content_type` — the backend never sees the bytes at create
+    // time, so a client-declared MIME is just an unverifiable claim. The
+    // actual type is determined from the bytes by the object validator at
+    // `/complete`.
     pub size: u64,
     #[serde(default)]
     pub metadata: serde_json::Value,
@@ -161,21 +164,15 @@ pub fn validate_ingestion_metadata(
         ));
     }
 
-    // 2. Required-string shape. Only `content_type` is hard-required on
-    //    the wire — `canonical_id` and `source_uri` are optional (manual
-    //    uploads omit them), and `source_type` defaults to "manual"
-    //    server-side when absent.
+    // 2. Required-string shape. `canonical_id` and `source_uri` are
+    //    optional (manual uploads omit them); `source_type` defaults to
+    //    "manual" server-side when absent.
     if let Some(st) = &req.source_type {
         if st.is_empty() {
             return Err(MetadataReject::MalformedRequest(
                 "source_type is empty".into(),
             ));
         }
-    }
-    if req.content_type.is_empty() {
-        return Err(MetadataReject::MalformedRequest(
-            "content_type is empty".into(),
-        ));
     }
 
     // 3. Hardcoded fixed-rule limits. `canonical_id` / `source_uri` shape
@@ -191,9 +188,8 @@ pub fn validate_ingestion_metadata(
             return Err(MetadataReject::InvalidSourceUri);
         }
     }
-    if !policy.allowed_content_types.contains(&req.content_type) {
-        return Err(MetadataReject::DisallowedContentType);
-    }
+    // Content type is no longer part of the request — it's determined from
+    // the actual bytes by the object validator at `/complete`.
     if req.size == 0 || req.size > policy.max_size_bytes {
         return Err(MetadataReject::SizeExceedsLimit);
     }
@@ -291,6 +287,33 @@ pub fn validate_descriptive_metadata(
     Ok(())
 }
 
+/// Canonicalize a client- or sniffer-supplied MIME type for allowlist
+/// comparison.
+///
+/// The wire value is an untrusted hint: browsers attach charset params
+/// (`text/plain; charset=utf-8`), vary case (`TEXT/PLAIN`), pad with
+/// whitespace, and use non-standard markdown aliases. None of those should
+/// hard-reject an otherwise-supported file (the byte-level
+/// [`super::validate_uploaded_object`] sniff is the real gate). We strip
+/// parameters, lowercase, trim, and fold known aliases onto their canonical
+/// type. An empty/unrecognized value passes through unchanged so the
+/// allowlist still rejects it.
+pub fn canonical_content_type(raw: &str) -> String {
+    let base = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        // Common non-standard markdown spellings → the canonical type.
+        "text/x-markdown" | "text/x-web-markdown" | "application/markdown" | "application/x-markdown" => {
+            "text/markdown".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 fn is_plausible_uri(s: &str) -> bool {
     // Very narrow: require an absolute http(s) URL. ArXiv adapter and
     // SPA both produce that; anything else is suspicious. We don't pull
@@ -330,7 +353,6 @@ mod tests {
             source_type: Some("manual".into()),
             source_uri: Some("https://example.test/abc123".into()),
             title: Some("A paper".into()),
-            content_type: "application/pdf".into(),
             size: 1024,
             metadata: json!({}),
             tenant_id: None,
@@ -349,7 +371,6 @@ mod tests {
             source_type: None,
             source_uri: None,
             title: Some("A manual upload".into()),
-            content_type: "application/pdf".into(),
             size: 1024,
             metadata: json!({}),
             tenant_id: None,
@@ -450,14 +471,15 @@ mod tests {
     }
 
     #[test]
-    fn disallowed_content_type_rejected() {
-        let p = MetadataPolicy::default();
-        let mut req = ok_req();
-        req.content_type = "application/octet-stream".into();
+    fn canonical_content_type_folds_variants() {
+        assert_eq!(canonical_content_type("text/plain; charset=utf-8"), "text/plain");
+        assert_eq!(canonical_content_type("  TEXT/PLAIN "), "text/plain");
+        assert_eq!(canonical_content_type("text/x-markdown"), "text/markdown");
         assert_eq!(
-            validate_ingestion_metadata(&req, &p),
-            Err(MetadataReject::DisallowedContentType)
+            canonical_content_type("application/octet-stream"),
+            "application/octet-stream"
         );
+        assert_eq!(canonical_content_type(""), "");
     }
 
     #[test]
@@ -587,7 +609,7 @@ mod tests {
                         }
                         r.metadata = v;
                     }
-                    _ => r.content_type = format!("application/x-bogus-{i}"),
+                    _ => r.title = Some("x".repeat(p.max_title_chars + 1)),
                 }
                 r
             })

@@ -55,6 +55,11 @@ export interface UploadDriver {
   /** Add a file and start it. `meta` carries the per-file prefill +
    *  client task id (stashed at enqueue time, never closed over). */
   addFile(file: File, meta: Record<string, unknown>): void;
+  /** Drop the uploader's copy of a file once its task is terminal or
+   *  dismissed. Prevents the uploader rejecting a re-upload of the same
+   *  file as a duplicate, and stops stale files accumulating. Optional so
+   *  test fakes can omit it. */
+  removeFile?(fileId: string): void;
 }
 
 /** Timers/poll knobs (overridable in tests for fake timers). */
@@ -134,6 +139,7 @@ export class UploadManager {
 
   dismiss(taskId: string): void {
     this.clearTimer(taskId);
+    this.releaseFile(taskId);
     this.tasks = this.tasks.filter((t) => t.id !== taskId);
     this.fileToTask.forEach((tid, fid) => {
       if (tid === taskId) this.fileToTask.delete(fid);
@@ -152,13 +158,25 @@ export class UploadManager {
     return this.fileToTask.get(fileId);
   }
 
+  /** Reverse lookup: the uploader file id currently bound to a task. */
+  private fileIdFor(taskId: string): string | undefined {
+    for (const [fid, tid] of this.fileToTask) if (tid === taskId) return fid;
+    return undefined;
+  }
+
+  /** Drop the uploader's copy of a task's file. Idempotent; safe once a
+   *  task is terminal (the uploader's own transfer has settled by then). */
+  private releaseFile(taskId: string): void {
+    const fid = this.fileIdFor(taskId);
+    if (fid) this.driver?.removeFile?.(fid);
+  }
+
   /** Stage create: POST /uploads, returns the create response so the Uppy
    *  callback can hand uploadId/key back to Uppy. Promotes task id → docId. */
   async onCreate(
     fileId: string,
     args: {
       filename: string;
-      content_type: string;
       size: number;
       prefill: UploadPrefill;
     },
@@ -170,7 +188,6 @@ export class UploadManager {
       const res = await api.ingestion.createUpload({
         ...args.prefill,
         filename: args.filename,
-        content_type: args.content_type,
         size: args.size,
       });
       // Promote the task id to the deterministic doc_id.
@@ -224,6 +241,14 @@ export class UploadManager {
     this.fail(taskId, reasonCode ?? "upload_failed");
   }
 
+  /** The driver couldn't even hand the file to the uploader — most often a
+   *  duplicate of a file the uploader still tracks (same name/size/type/
+   *  lastModified). Fail the task with a reason instead of leaving it
+   *  pinned in `queued` forever. */
+  onAddFileError(taskId: string, reason: string): void {
+    this.fail(taskId, reason);
+  }
+
   // ---- internal -----------------------------------------------------------
 
   private applyComplete(docId: string, res: CompleteResponse): void {
@@ -250,6 +275,7 @@ export class UploadManager {
   }
 
   private succeed(taskId: string, docId: string): void {
+    this.releaseFile(taskId);
     this.patch(taskId, {
       state: "ready",
       progress: 1,
@@ -259,6 +285,7 @@ export class UploadManager {
   }
 
   private fail(taskId: string, reason: string): void {
+    this.releaseFile(taskId);
     this.patch(taskId, { state: "failed", reason });
     this.scheduleDismiss(taskId, FAILED_DISMISS_MS);
   }

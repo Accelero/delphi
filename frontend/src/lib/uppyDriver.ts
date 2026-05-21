@@ -38,7 +38,6 @@ export function createUppyDriver(manager: UploadManager): UploadDriver {
       const prefill = (file.meta.prefill as UploadPrefill) ?? {};
       const res = await manager.onCreate(file.id, {
         filename: file.name ?? "upload",
-        content_type: file.type || "application/octet-stream",
         size: file.size ?? 0,
         prefill,
       });
@@ -81,13 +80,32 @@ export function createUppyDriver(manager: UploadManager): UploadDriver {
 
   return {
     addFile(file: File, meta: Record<string, unknown>) {
-      const fileId = uppy.addFile({
-        name: file.name,
-        type: file.type,
-        data: file,
-        meta,
-      });
-      manager.bindFile(String(fileId), meta.taskId as string);
+      const taskId = meta.taskId as string;
+      try {
+        const fileId = uppy.addFile({
+          name: file.name,
+          type: file.type,
+          data: file,
+          meta,
+        });
+        manager.bindFile(String(fileId), taskId);
+      } catch (err) {
+        // uppy.addFile throws on a duplicate (same name/size/type/
+        // lastModified as a file the uploader still tracks — e.g. retrying
+        // the very same file) or any restriction violation. Without this
+        // catch the throw is swallowed and the task hangs forever in
+        // `queued`. Fail it with a reason instead.
+        console.warn("[upload] uppy.addFile rejected", err);
+        manager.onAddFileError(taskId, "duplicate_file");
+      }
+    },
+    removeFile(fileId: string) {
+      // Idempotent — the file may already be gone.
+      try {
+        uppy.removeFile(fileId);
+      } catch {
+        /* already removed */
+      }
     },
   };
 }

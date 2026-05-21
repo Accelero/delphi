@@ -23,6 +23,8 @@ const REASONS: Record<string, string> = {
 export function uploadRejectReason(code: string | undefined): string {
   if (!code) return "Upload failed.";
   if (code in REASONS) return REASONS[code];
+  if (code === "duplicate_file")
+    return "This file is already being uploaded — wait for it to finish, or refresh the page before retrying.";
   if (code === "create_failed") return "Couldn't start the upload.";
   if (code === "upload_failed") return "The file failed to upload.";
   if (code === "complete_failed") return "Couldn't finalize the upload.";
