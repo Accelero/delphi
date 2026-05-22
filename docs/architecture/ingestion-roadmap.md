@@ -6,19 +6,69 @@ What is **not yet built** between the current implementation
 
 ## Where we are
 
-The upload path is complete and verified: presigned multipart upload →
-object validation → **bounded text extraction (real, via `pdftotext`)** →
-metadata merge → transactional commit, with a background task tracker on
-the frontend. Identity/dedup, the validation surface, the
-`MetadataExtractor` seam, and both compose tiers (MinIO) are in place.
+The upload **plumbing** is complete and verified end-to-end on tier-2:
+presigned multipart create → browser→S3 direct PUT via short-TTL signed
+URLs → `/complete` → transactional commit → document in the feed, with a
+persistent background task tracker on the frontend and the `ingester`
+role gate enforced. Identity/dedup and both compose tiers (MinIO) are in
+place.
 
-The **automated metadata extraction is a no-op** (`NoopExtractor`), and
-several lifecycle/cleanup pieces from the original design are not wired.
-Those are the delta below.
+Three pieces of the content path are **deliberately switched off or
+stubbed** right now (see §0–§1):
+
+- **Both content validators are bypassed** (commit `eebfc3d`) — the
+  metadata gate and the object/byte gate default-pass, to isolate the
+  upload plumbing during manual testing. The `content_type` field was
+  also removed from the create API, since the backend never sees the
+  bytes at create time and the declared MIME was an unverifiable claim.
+- **Text extraction is consequently empty** — with the object validator
+  off nothing sniffs the real type, so the extractor is handed
+  `application/octet-stream` and produces no text.
+- **Automated metadata autofill is a no-op** (`NoopExtractor`) — the
+  LLM-backed extractor was never built.
+
+Plus several lifecycle/cleanup pieces from the original design are still
+unwired. All of it is the delta below, ordered by priority.
 
 ---
 
-## 1. LLM metadata extractor (the headline gap)
+## 0. Re-enable the content validators + text extraction (undo the WIP bypass)
+
+**State:** commit `eebfc3d` bypassed both validators at their call sites
+to test the upload plumbing in isolation, and dropped the client-declared
+`content_type` from the create API. The validator *functions* and their
+unit tests are intact; the live pipeline simply doesn't call them, a stub
+`ValidatedAttrs` stands in, and three integration tests are `#[ignore]`d
+(`create_upload_400_when_forbidden_field_present`,
+`complete_with_validator_reject_records_rejection`,
+`manual_upload_without_canonical_id_commits`).
+
+**Goal:** restore the two gates and, with them, text extraction.
+
+- **Metadata validator** (`validate_ingestion_metadata`, called from
+  `ingestion/uploads.rs`): re-enable. It still enforces forbidden-field
+  rejection, size bounds, `canonical_id` / `source_uri` shape, and
+  metadata depth/size (audit item **M8**). It no longer checks
+  `content_type` — that field is gone from the request by design.
+- **Object validator** (`validate_uploaded_object`, called from
+  `ingestion/completion.rs`): re-enable. It is now **byte-authoritative** —
+  HEADs the object, sniffs magic bytes (with positive UTF-8 text
+  detection), accepts iff the *sniffed* type is allowlisted, rejects
+  polyglots, and enforces the PDF size cap. The declared type is only a
+  hint; an "unknown"/octet-stream upload is accepted or rejected purely on
+  its bytes.
+- **Text extraction** (`ingestion/text_extract.rs`): already real
+  (`pdftotext` for PDF, UTF-8 passthrough for text/markdown). It is empty
+  today only because the bypassed object validator hands it
+  `application/octet-stream`. Re-enabling the object validator restores it:
+  `/complete` feeds the **sniffed** type to the extractor, so PDFs and
+  text files extract again.
+
+**Re-enable checklist:** uncomment the two `TEMP`-marked calls, drop the
+stub `ValidatedAttrs` in `completion.rs`, and remove the three
+`#[ignore]` attributes in `backend/tests/ingestion_uploads.rs`.
+
+## 1. LLM metadata autofill — the `LlmExtractor` (the headline feature gap)
 
 **State:** `MetadataExtractor` is wired through `AppState` as
 `NoopExtractor` — automated metadata returns empty. Today a file-only
