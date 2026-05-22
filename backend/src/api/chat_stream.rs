@@ -2,9 +2,13 @@
 //!
 //! Route: `GET /api/chat/conversations/{key}/stream`.
 //!
-//! Every tab opens one of these on mount. The server replays the
-//! current turn's buffered SSE frames (if any) and then forwards live
-//! frames as the worker emits them.
+//! Every tab opens one of these on mount. The bus replays the current
+//! turn's buffered SSE frames (from the client's cursor, or the turn's
+//! start on a fresh connect) and then forwards live frames as the worker
+//! emits them. Each data frame carries an SSE `id:` line; on reconnect
+//! the browser resends it as `Last-Event-Id`, which we parse back into a
+//! [`Cursor`] so the bus resumes exactly where the client left off (or
+//! emits a `resync` if that cursor fell out of the window — §4.1).
 //!
 //! ### Pool starvation fix (critical)
 //!
@@ -16,8 +20,7 @@
 //! The fix is structural: perform the `get_conversation` permission
 //! check up front while we still hold the handle, then **explicitly
 //! drop the extension** before constructing the streaming body. The
-//! streaming body itself only fans bytes from the session's mpsc into
-//! the SSE response and doesn't touch the DB.
+//! streaming body only pulls bytes from the bus and never touches the DB.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -25,13 +28,13 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
 use surrealdb::RecordId;
-use tokio_stream::wrappers::ReceiverStream;
 
+use crate::chat::Cursor;
 use crate::state::AppState;
 use crate::storage::{AuthedDb, ConversationId, Storage};
 
@@ -43,6 +46,18 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     Ok(RecordId::from(("conversation", k)))
 }
 
+/// The browser resends the last frame's `id:` as a `Last-Event-Id`
+/// header on reconnect. Parse it into a [`Cursor`]; absent or malformed
+/// ⇒ `None` (a fresh connect).
+fn parse_last_event_id(headers: &HeaderMap) -> Option<Cursor> {
+    headers
+        .get("last-event-id")?
+        .to_str()
+        .ok()?
+        .parse::<Cursor>()
+        .ok()
+}
+
 pub async fn stream(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -52,6 +67,10 @@ pub async fn stream(
         Ok(id) => id,
         Err(r) => return r,
     };
+
+    // Resume cursor from `Last-Event-Id` (set by the browser from the
+    // last frame's `id:`). Read it before we consume `req`.
+    let from = parse_last_event_id(req.headers());
 
     // Permission check while we still hold the pooled handle. We grab
     // it out of the extensions ourselves (rather than via
@@ -81,12 +100,17 @@ pub async fn stream(
     // both are gone and the `AuthedDb` has been released.
     drop(db);
 
-    let session = state.sessions.for_conversation(&conv_id);
-    let rx = session.subscribe();
-    let stream = ReceiverStream::new(rx).map(Ok::<Bytes, Infallible>);
+    // Subscribe to the conversation's log from the resume cursor. Items
+    // already include their `id:` line (the bus prepends it); we write
+    // them verbatim.
+    let stream = state
+        .turn_bus
+        .subscribe(&conv_id, from)
+        .await
+        .map(Ok::<Bytes, Infallible>);
 
     // We build the response body manually rather than via axum's
-    // `Sse<Stream<Item = Event>>` adapter because our session emits
+    // `Sse<Stream<Item = Event>>` adapter because the bus emits
     // already-formatted SSE frames as `Bytes` (so we can replay them
     // verbatim to late subscribers). We add an explicit 15s heartbeat
     // task via a `tokio::time::interval` that injects `:\n\n` comment

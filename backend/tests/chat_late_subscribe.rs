@@ -1,4 +1,4 @@
-//! A subscriber attached mid-turn replays the current frames buffer.
+//! A subscriber attached mid-turn replays the current frame buffer.
 //!
 //! We can't simulate a "second SSE GET arriving mid-turn" cleanly via
 //! `tower::ServiceExt::oneshot` in the test harness — the test pool is
@@ -7,21 +7,21 @@
 //! the identity middleware waiting on the same pool.
 //!
 //! Instead we exercise the replay-on-subscribe invariant directly: POST
-//! the turn (worker buffers the user_message and at least one text
-//! frame into the per-conversation SessionState), then call
-//! `SessionRegistry::lookup` + `SessionState::subscribe` from the test
-//! body and drain the channel. This is exactly the same code path the
-//! HTTP handler runs after dropping its AuthedDb extension.
+//! the turn (worker buffers the user_message and at least one text frame
+//! into the conversation's bus log), then `TurnBus::subscribe(None)` from
+//! the test body and drain the stream. This is exactly the same code path
+//! the HTTP handler runs after dropping its AuthedDb extension.
 
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use surrealdb::RecordId;
 
@@ -84,22 +84,23 @@ async fn late_subscriber_replays_buffered_frames() {
         .await;
     assert_eq!(res.status, StatusCode::ACCEPTED);
 
-    // Wait until the worker has emitted at least user_message + 1 text,
-    // then "late-subscribe" via SessionState directly and assert the
-    // buffer was replayed in order.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // "Late-subscribe" via the bus and assert the buffer (user_message +
+    // the first text delta) was replayed in order. Re-subscribe each
+    // attempt until the worker has buffered both.
+    let deadline = Instant::now() + Duration::from_secs(2);
     let frames: Vec<Bytes> = loop {
-        if let Some(s) = app.sessions.lookup(&conv_id) {
-            let mut rx = s.subscribe();
-            let mut frames: Vec<Bytes> = Vec::new();
-            while let Ok(b) = rx.try_recv() {
-                frames.push(b);
-            }
-            if frames.len() >= 2 {
-                break frames;
+        let mut stream = app.turn_bus.subscribe(&conv_id, None).await;
+        let mut frames: Vec<Bytes> = Vec::new();
+        while frames.len() < 2 {
+            match tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+                Ok(Some(b)) => frames.push(b),
+                _ => break,
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if frames.len() >= 2 {
+            break frames;
+        }
+        if Instant::now() >= deadline {
             panic!("timed out waiting for worker to buffer frames");
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -112,17 +113,13 @@ async fn late_subscriber_replays_buffered_frames() {
 /// `subscribe()` the test above checks). This is the boundary
 /// `late_subscriber_replays_buffered_frames` explicitly can't reach.
 ///
-/// We sidestep the single-slot-pool deadlock by driving the
-/// `SessionState` directly (no worker parked on the pool slot), so the
-/// stream handler's perm-check `get_conversation` can acquire the slot,
-/// drop it, and stream. Frames are hand-built SSE bytes because
-/// `crate::api::sse` is `pub(crate)`.
+/// We sidestep the single-slot-pool deadlock by claiming the turn via the
+/// bus directly (no worker parked on the pool slot), so the stream
+/// handler's perm-check `get_conversation` can acquire the slot, drop it,
+/// and stream. Frames are hand-built SSE bytes because `crate::api::sse`
+/// is `pub(crate)`.
 #[tokio::test]
 async fn late_subscriber_replays_buffered_frames_over_http() {
-    use delphi::chat::TaskId;
-    use futures::StreamExt;
-    use tokio_util::sync::CancellationToken;
-
     let app = TestApp::build().await;
     let (base, server) = app.serve_local().await;
     let token = AuthRequestBuilder::default().mint_jwt();
@@ -143,18 +140,21 @@ async fn late_subscriber_replays_buffered_frames_over_http() {
     let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
 
     // Simulate an in-flight turn with buffered frames — no worker, so the
-    // single pool slot stays free for the GET /stream handler.
-    let session = app.sessions.for_conversation(&conv_id);
-    session
-        .start_turn(
-            TaskId::new(),
-            CancellationToken::new(),
+    // single pool slot stays free for the GET /stream handler. The handle
+    // is held for the rest of the test so the turn stays in flight.
+    let handle = app
+        .turn_bus
+        .try_start(
+            &conv_id,
             Bytes::from(
                 "event: user_message\ndata: {\"id\":\"message:01HXUSER\",\"content\":\"hi\"}\n\n",
             ),
         )
+        .await
         .expect("start turn");
-    session.emit(Bytes::from("event: text\ndata: \"partial\"\n\n"));
+    handle
+        .append(Bytes::from("event: text\ndata: \"partial\"\n\n"))
+        .await;
 
     // Late-join over real HTTP and read the replay burst.
     let resp = client
@@ -167,8 +167,8 @@ async fn late_subscriber_replays_buffered_frames_over_http() {
 
     let mut body = resp.bytes_stream();
     let mut acc = String::new();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_secs(1), body.next()).await {
             Ok(Some(Ok(chunk))) => {
                 acc.push_str(&String::from_utf8_lossy(&chunk));
@@ -182,6 +182,7 @@ async fn late_subscriber_replays_buffered_frames_over_http() {
         }
     }
     server.abort();
+    drop(handle);
 
     assert!(
         acc.contains("event: user_message"),
@@ -191,14 +192,24 @@ async fn late_subscriber_replays_buffered_frames_over_http() {
         acc.contains("event: text") && acc.contains("\"partial\""),
         "late HTTP subscriber must receive the buffered text frame; got: {acc:?}"
     );
+    // Every data frame carries an SSE `id:` line (v4 cursor contract).
+    assert!(
+        acc.contains("id: "),
+        "frames must carry an `id:` line; got: {acc:?}"
+    );
 }
 
 fn assert_replay_ordering(frames: &[Bytes], user_id: &str) {
-    // Frame 1 is always user_message; frame 2+ is text.
+    // Each frame is `id: <cursor>\n` + the SSE event. Frame 1 is always
+    // user_message; frame 2+ is text.
     let to_str = |b: &Bytes| String::from_utf8(b.to_vec()).unwrap();
     let first = to_str(&frames[0]);
     assert!(
-        first.starts_with("event: user_message\n"),
+        first.starts_with("id: "),
+        "every data frame carries an id: line: {first:?}"
+    );
+    assert!(
+        first.contains("event: user_message\n"),
         "first replay frame should be user_message: {first:?}"
     );
     assert!(
@@ -207,7 +218,7 @@ fn assert_replay_ordering(frames: &[Bytes], user_id: &str) {
     );
     let second = to_str(&frames[1]);
     assert!(
-        second.starts_with("event: text\n"),
+        second.contains("event: text\n"),
         "second replay frame should be text: {second:?}"
     );
     assert!(

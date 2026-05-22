@@ -5,8 +5,8 @@
 //! state machine — see `docs/architecture/chat.md` §
 //! Trade-off vs. v2).
 //!
-//! We exercise the rejection at the `SessionState::start_turn` layer
-//! directly: a second `start_turn` while a turn is in flight returns
+//! We exercise the rejection at the `TurnBus::try_start` layer directly:
+//! a second `try_start` while a turn is in flight returns
 //! `AlreadyRunning`, which the HTTP handler maps to 409 with
 //! `reason: in_flight`. We can't reasonably drive a second HTTP POST
 //! through the single-slot test pool while the worker is parked — see
@@ -22,12 +22,10 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
 use surrealdb::RecordId;
-use tokio_util::sync::CancellationToken;
 
 use bytes::Bytes;
 
 use common::{AuthRequestBuilder, TestApp};
-use delphi::chat::TaskId;
 use delphi::error::Result;
 use delphi::llm::{DeltaStream, LlmClient, LlmDelta, LlmMessage};
 
@@ -81,30 +79,17 @@ async fn second_post_while_in_flight_returns_409() {
         .await;
     assert_eq!(res.status, StatusCode::ACCEPTED);
 
-    // Wait for the worker to claim the session.
+    // The POST handler calls `try_start` synchronously before returning
+    // 202, so by now the turn is claimed. A second `try_start` against
+    // the same conversation returns `AlreadyRunning` — exactly what the
+    // HTTP handler maps to 409 `{"reason":"in_flight"}` without spawning a
+    // second worker. Frame content is opaque (the claim is rejected before
+    // it's buffered).
     let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
-    let session = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(s) = app.sessions.lookup(&conv_id) {
-                break s;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("worker never registered with session");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    };
-
-    // A second `start_turn` against the same session returns
-    // AlreadyRunning. The HTTP POST handler translates that into a 409
-    // (with `reason: in_flight`) and never spawns a second worker.
-    // Frame content is opaque here — the rejection happens before any
-    // fanout so the bytes never leave the buffer.
     let dummy_frame = Bytes::from_static(b"event: user_message\ndata: {}\n\n");
-    let err = session.start_turn(TaskId::new(), CancellationToken::new(), dummy_frame);
+    let second = app.turn_bus.try_start(&conv_id, dummy_frame).await;
     assert!(
-        err.is_err(),
-        "second start_turn while in-flight must be rejected"
+        second.is_err(),
+        "second try_start while in-flight must be AlreadyRunning"
     );
 }

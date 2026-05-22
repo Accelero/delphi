@@ -1,5 +1,5 @@
 /**
- * `useChatStream(conversationKey, opts)` — multi-tab chat surface (v3).
+ * `useChatStream(conversationKey, opts)` — multi-tab chat surface (v4).
  *
  * Every tab opens a long-lived `EventSource` against
  * `/api/chat/conversations/{key}/stream` on mount and treats it as the
@@ -16,14 +16,16 @@
  * new turn or a reconnect-replay of an in-flight turn. Without this rule
  * a mid-turn reconnect would produce `hellohelloworld`.
  *
- * Reconcile-on-reopen rule: every time the EventSource (re)opens we
- * trigger `onTurnEnd?.()` to refetch committed history. A freshly
- * mounted late joiner (e.g. switching chat sessions in the same tab)
- * or a tab reconnecting after a blip may have missed the `finish` for
- * a turn that committed while it was disconnected — that committed
- * pair lives only in the DB, not in this client's cached seed, and the
- * replay buffer was dropped at `finish`. Refetching surfaces it. Any
- * *in-flight* turn is replayed on top via the SSE buffer.
+ * Reconnect model (v4): each data frame carries an SSE `id:` (an opaque
+ * cursor). The browser resends the last one as `Last-Event-Id` on
+ * reconnect, so the bus resumes exactly where we left off — no client
+ * bookkeeping. Two reconciliations layer on top:
+ *   - **First-connect refetch.** On the first `open` for a conversation
+ *     we refetch committed history once (a turn may have committed while
+ *     this surface was unmounted). Later reopens do not refetch.
+ *   - **`resync`.** If our cursor fell out of the bus window (a turn
+ *     committed while we were disconnected), the server sends a `resync`
+ *     control frame; we drop transient overlay state and refetch.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -41,13 +43,17 @@ export type LocalMessage = {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  /** Resolved citations for an assistant message. Carried per-message
+   *  so a committed/history assistant row renders its own `[N]` markers
+   *  (the live `citations` state only describes the in-flight turn). */
+  citations?: CitationEntry[];
 };
 
 export type UseChatStreamOptions = {
   initialMessages?: LocalMessage[];
-  /** Called after a turn ends (`finish`, `error`, `clear`, or 409),
-   *  and on EventSource (re)open when overlay is non-empty. Callers
-   *  use it to invalidate the conversation query. */
+  /** Called after a turn ends (`finish`, `error`, `clear`, or 409), on
+   *  the first EventSource connect, and on `resync`. Callers use it to
+   *  invalidate the conversation query so committed history is refetched. */
   onTurnEnd?: () => void;
 };
 
@@ -85,6 +91,12 @@ export function useChatStream(
   const [citations, setCitations] = useState<CitationEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
 
+  /** Mirror of `citations` readable inside the SSE effect closure (which
+   *  is created once per `conversationKey` and would otherwise close over
+   *  a stale state value). The `finish` handler reads it to stamp the
+   *  committed assistant message with its own citation table. */
+  const citationsRef = useRef<CitationEntry[]>([]);
+
   const lastKnownMessageIdRef = useRef<string | null>(
     tailMessageId(initialMessages),
   );
@@ -94,6 +106,14 @@ export function useChatStream(
   /** Assistant overlay buffer. Rendered as the last assistant message
    *  while status is `streaming`. */
   const overlayRef = useRef<string>("");
+
+  /** True once this EventSource has opened at least once for the current
+   *  conversation. First connect refetches committed history (a turn may
+   *  have committed while this surface was unmounted); later reopens do
+   *  not — cursor resume (`Last-Event-Id`) and the server's `resync`
+   *  control frame cover reconnects. Reset per `conversationKey` inside
+   *  the SSE effect. */
+  const hasConnectedRef = useRef(false);
 
   const onTurnEndRef = useRef(onTurnEnd);
   useEffect(() => {
@@ -125,22 +145,43 @@ export function useChatStream(
   // -----------------------------------------------------------------
   useEffect(() => {
     const url = `/api/chat/conversations/${encodeURIComponent(conversationKey)}/stream`;
+    hasConnectedRef.current = false;
     const es = new EventSource(url);
 
     es.addEventListener("open", () => {
-      // Reconcile committed history on every (re)connect. A freshly
-      // mounted late joiner — or a tab reconnecting after a blip — may
-      // have missed the `finish` for a turn that committed while it was
-      // disconnected. The classic case: the user submits, navigates
+      // Reconcile committed history on the FIRST connect only. A freshly
+      // mounted late joiner may have missed the `finish` for a turn that
+      // committed while it was unmounted: the user submits, navigates
       // away (this surface unmounts, closing its EventSource), the turn
-      // commits, then they navigate back. The tab that would have
-      // invalidated the conversation cache on `finish` is gone, so the
-      // committed pair lives only in the DB — not in this client's
-      // cached seed, and no replay covers it (the buffer is dropped at
-      // `finish`). Refetching here surfaces that completed turn. Any
-      // *in-flight* turn is still replayed on top via the SSE buffer,
-      // and the seed-reset is guarded by `status` so the refetch can't
-      // wipe a live overlay.
+      // commits, then they navigate back. That committed pair lives only
+      // in the DB — not in this client's cached seed — so we refetch
+      // once on connect to surface it. Any *in-flight* turn is replayed
+      // on top via the bus buffer, and the seed-reset is guarded by
+      // `status` so the refetch can't wipe a live overlay.
+      //
+      // Subsequent reopens (EventSource auto-reconnect after a blip) do
+      // NOT refetch: the browser resends `Last-Event-Id`, so the bus
+      // resumes exactly where we left off, and emits a `resync` frame if
+      // our cursor fell out of the window (handled below). v3 refetched
+      // on every reopen, which double-counted; v4 narrows it.
+      if (!hasConnectedRef.current) {
+        hasConnectedRef.current = true;
+        onTurnEndRef.current?.();
+      }
+    });
+
+    es.addEventListener("resync", () => {
+      // The bus could not resume from our cursor — a turn committed while
+      // we were disconnected and its frames were trimmed. Drop any
+      // transient in-flight overlay and refetch committed history; the
+      // stream continues with fresh frames (a new turn's `user_message`,
+      // if any, re-establishes the overlay via the reset rule).
+      overlayRef.current = "";
+      inFlightUserIdRef.current = null;
+      citationsRef.current = [];
+      setCitations([]);
+      setMessages((prev) => prev.filter((m) => m.id !== STREAMING_ASSISTANT_ID));
+      setStatus("ready");
       onTurnEndRef.current?.();
     });
 
@@ -159,6 +200,7 @@ export function useChatStream(
       // and any prior in-flight user id.
       overlayRef.current = "";
       inFlightUserIdRef.current = id;
+      citationsRef.current = [];
       setCitations([]);
       setError(null);
       setStatus("submitted");
@@ -201,6 +243,7 @@ export function useChatStream(
       try {
         const arr = JSON.parse(ev.data);
         if (Array.isArray(arr)) {
+          citationsRef.current = arr as CitationEntry[];
           setCitations(arr as CitationEntry[]);
         }
       } catch {
@@ -235,6 +278,10 @@ export function useChatStream(
       }
       const asstId = parsed.assistantMessageId;
       const overlay = overlayRef.current;
+      // Snapshot the live citation table onto the committed message so it
+      // keeps its `[N]` markers in the gap before the history refetch
+      // returns (and matches what reload will render).
+      const committedCitations = citationsRef.current;
       overlayRef.current = "";
       inFlightUserIdRef.current = null;
       if (typeof asstId === "string" && asstId.length > 0) {
@@ -242,13 +289,21 @@ export function useChatStream(
         setMessages((prev) =>
           prev.map((m) =>
             m.id === STREAMING_ASSISTANT_ID
-              ? { id: asstId, role: "assistant", content: overlay }
+              ? {
+                  id: asstId,
+                  role: "assistant",
+                  content: overlay,
+                  citations: committedCitations.length
+                    ? committedCitations
+                    : undefined,
+                }
               : m,
           ),
         );
       } else {
         setMessages((prev) => prev.filter((m) => m.id !== STREAMING_ASSISTANT_ID));
       }
+      citationsRef.current = [];
       setStatus("ready");
       onTurnEndRef.current?.();
     });
@@ -262,6 +317,7 @@ export function useChatStream(
           (m) => m.id !== STREAMING_ASSISTANT_ID && m.id !== dropUserId,
         ),
       );
+      citationsRef.current = [];
       setCitations([]);
       setStatus("ready");
       onTurnEndRef.current?.();

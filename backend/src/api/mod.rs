@@ -24,7 +24,7 @@ use crate::auth::{
     self, service_identity_from_env, validator_from_jwt_access, AuthConfig, AuthMode,
     ClaimsExtractor, IdentityDeps, JwtClaimsExtractor,
 };
-use crate::chat::SessionRegistry;
+use crate::chat::InProcessBus;
 use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
@@ -129,9 +129,14 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     // Metadata autofill seam: NoopExtractor ships today; the Phase-3
     // LlmExtractor drops in here when an LLM provider is configured.
     let metadata_extractor: Arc<dyn MetadataExtractor> = Arc::new(NoopExtractor);
+    // In-process turn transport (Phase 1). Held as the concrete type so
+    // the GC sweeper can iterate its sessions, then stored as
+    // `Arc<dyn TurnBus>`.
+    let turn_bus = Arc::new(InProcessBus::new());
+    InProcessBus::spawn_gc(turn_bus.clone());
     let state = AppState {
         llm,
-        sessions: Arc::new(SessionRegistry::new()),
+        turn_bus,
         request_db_pool: request_pool.clone(),
         object_store: object_store.clone(),
         access,

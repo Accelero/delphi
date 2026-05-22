@@ -28,9 +28,9 @@ use surrealdb::{Datetime, RecordId, Surreal};
 use crate::error::{Error, Result};
 
 use super::{
-    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
-    CreateUploadSessionParams, DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId,
-    Storage, UploadSession,
+    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
+    ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
+    IngestionRejection, MessageId, Storage, UploadSession,
 };
 
 const SCHEMA_SURQL: &str = include_str!("../../schema.surql");
@@ -921,6 +921,7 @@ impl Storage for SystemStorage {
         _user_text: &str,
         _parent_id: Option<&MessageId>,
         _assistant_text: &str,
+        _citations: &[Citation],
     ) -> Result<MessageId> {
         Err(Error::NotImplemented(
             "SystemStorage does not commit turns".into(),

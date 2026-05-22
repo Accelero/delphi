@@ -8,10 +8,10 @@
 //!
 //!  1. Parses + validates `{ id, text, parent_id }`.
 //!  2. PERMISSIONS gate + parent-id check on the caller's `AuthedDb`.
-//!  3. Buffers the `user_message` SSE frame and registers the worker's
-//!     cancel token via [`SessionState::start_turn`]. If a turn is
-//!     already in flight for this conversation, returns **409**.
-//!  4. Spawns the worker.
+//!  3. Claims the in-flight slot via [`crate::chat::TurnBus::try_start`],
+//!     which buffers the `user_message` SSE frame atomically. If a turn
+//!     is already in flight for this conversation, returns **409**.
+//!  4. Spawns the worker with the returned `TurnHandle`.
 //!  5. Returns **202 Accepted** with an empty body.
 //!
 //! The client doesn't read this response for streaming bytes — every
@@ -26,7 +26,6 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::Deserialize;
 use surrealdb::RecordId;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 
 use crate::api::sse;
@@ -146,22 +145,23 @@ pub async fn post_message(
         None => return (StatusCode::UNAUTHORIZED, "missing bearer").into_response(),
     };
 
-    // Buffer the user_message frame and claim the in-flight slot. On
-    // AlreadyRunning we 409 — the client should wait for the existing
-    // turn to finish (it sees the same live SSE stream).
-    let session = state.sessions.for_conversation(&conv_id);
+    // Claim the in-flight slot, buffering the `user_message` frame
+    // atomically. On AlreadyRunning we 409 — the client should wait for
+    // the existing turn to finish (it sees the same live SSE stream).
     let user_record_id = format!("message:{}", req.id);
     let user_frame = sse::user_message(&user_record_id, &req.text);
-    let task_id = TaskId::new();
-    let cancel = CancellationToken::new();
-    if let Err(_already) = session.start_turn(task_id, cancel.clone(), user_frame) {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"reason": "in_flight"})),
-        )
-            .into_response();
-    }
+    let handle = match state.turn_bus.try_start(&conv_id, user_frame).await {
+        Ok(h) => h,
+        Err(_already) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"reason": "in_flight"})),
+            )
+                .into_response();
+        }
+    };
 
+    let task_id = TaskId::new();
     let turn = turn_request(
         conv_id.clone(),
         req.id,
@@ -171,7 +171,7 @@ pub async fn post_message(
         auth.clone(),
         &state,
     );
-    spawn_worker(session, task_id, cancel, turn);
+    spawn_worker(handle, task_id, turn);
 
     info!(
         user_id = %auth.user_id,

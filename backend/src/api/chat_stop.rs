@@ -51,10 +51,9 @@ pub async fn stop(
         }
     }
 
-    // Look up the session WITHOUT creating one — if no turn has ever
-    // touched this conversation, there is nothing to stop.
-    if let Some(session) = app.sessions.lookup(&conv_id) {
-        session.abort();
-    }
+    // Flip the in-flight turn's cancel token (no-op if idle). The worker,
+    // sole writer of the stream, turns this into the `clear` frame; this
+    // handler emits nothing itself.
+    app.turn_bus.cancel(&conv_id).await;
     StatusCode::NO_CONTENT.into_response()
 }

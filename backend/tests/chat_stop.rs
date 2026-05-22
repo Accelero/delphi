@@ -1,21 +1,21 @@
-//! `POST /api/chat/conversations/{key}/stop` semantics (v3).
+//! `POST /api/chat/conversations/{key}/stop` semantics (v4).
 //!
-//! Covers the contract from `docs/architecture/chat.md` § Stop:
+//! Covers the contract from `docs/architecture/chat-v4.md` § stop:
 //!
 //! - 204 when no turn is in flight (idempotent).
 //! - 404 when the caller cannot see the conversation.
-//! - 204 + clear-frame + no-DB-rows when a turn is in flight.
+//! - clear-frame + no-DB-rows when a turn is in flight.
 //!
 //! The "in-flight" case can't reasonably go through the HTTP stop
 //! endpoint with the single-slot test pool: the worker holds the only
 //! pool slot while it's parked inside the LLM stream, so the stop
-//! handler's perm-check `db.get_conversation` would deadlock waiting
-//! for the slot. Production has a multi-slot pool with physically
-//! independent connections and is not subject to this. We exercise
-//! the same `SessionState::abort` code path the production handler
-//! reaches by calling `app.sessions.lookup(...).abort()` directly,
-//! and assert the resulting clear-frame + empty-DB outcome that the
-//! HTTP path would produce.
+//! handler's perm-check `db.get_conversation` would deadlock waiting for
+//! the slot. Production has a multi-slot pool with physically independent
+//! connections and is not subject to this. We exercise the same
+//! `TurnBus::cancel` code path the production handler reaches — driving
+//! the *real* worker (single writer), which observes the flipped token
+//! and emits `clear` itself — and assert the clear-frame + empty-DB
+//! outcome the HTTP path would produce.
 
 mod common;
 
@@ -25,7 +25,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use bytes::Bytes;
+use futures::StreamExt;
 use serde_json::{json, Value};
 use surrealdb::RecordId;
 
@@ -121,7 +121,7 @@ async fn stop_is_404_for_unknown_conversation() {
 }
 
 #[tokio::test]
-async fn abort_during_in_flight_turn_broadcasts_clear_and_persists_nothing() {
+async fn stop_during_in_flight_turn_broadcasts_clear_and_persists_nothing() {
     let app = TestApp::build_with_llm(Arc::new(OneShotThenPark)).await;
     let key = create_conversation(&app).await;
     let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
@@ -139,54 +139,45 @@ async fn abort_during_in_flight_turn_broadcasts_clear_and_persists_nothing() {
         .await;
     assert_eq!(res.status, StatusCode::ACCEPTED);
 
-    // Wait until the worker has registered with the session (buffered
-    // user_message at minimum), then subscribe directly via the
-    // SessionState. See the module doc for why we don't subscribe via
-    // a second HTTP request in tests.
-    let session = {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Some(s) = app.sessions.lookup(&conv_id) {
-                break s;
-            }
-            if std::time::Instant::now() >= deadline {
-                panic!("worker never registered with session");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    };
-    let mut rx = session.subscribe();
-
-    // Wait until at least user_message + text are buffered.
+    // Subscribe via the bus (no pool slot needed) and wait until the turn
+    // is mid-stream: user_message + the "partial" text delta. See the
+    // module doc for why we don't open a second HTTP stream in tests.
+    let mut stream = app.turn_bus.subscribe(&conv_id, None).await;
+    let mut acc = String::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let mut got: Vec<Bytes> = Vec::new();
-    while got.len() < 2 {
-        if let Ok(b) = rx.try_recv() {
-            got.push(b);
-            continue;
+    while !(acc.contains("event: user_message") && acc.contains("\"partial\"")) {
+        if let Ok(Some(b)) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            acc.push_str(&String::from_utf8_lossy(&b));
         }
         if std::time::Instant::now() >= deadline {
-            panic!("worker never emitted user_message + text; got {got:?}");
+            panic!("worker never emitted user_message + text; got {acc:?}");
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Same code path the production /stop handler runs after its perm
-    // check. Single-slot test pool deadlocks the HTTP path here (see
-    // module doc) — calling SessionState::abort directly exercises
-    // exactly the same chat-side machinery.
-    session.abort();
+    // Stop via the bus — the exact code path the production /stop handler
+    // runs after its perm check. The worker (sole writer) observes the
+    // flipped token and emits `clear` itself.
+    app.turn_bus.cancel(&conv_id).await;
 
-    // The clear frame should arrive on our subscriber.
-    let frame = rx.recv().await.expect("clear frame");
-    let s = String::from_utf8(frame.to_vec()).unwrap();
-    assert!(
-        s.starts_with("event: clear\n"),
-        "expected clear, got {s:?}"
-    );
+    // The clear frame arrives on our subscriber.
+    let mut got_clear = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(b)) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            if String::from_utf8_lossy(&b).contains("event: clear") {
+                got_clear = true;
+                break;
+            }
+        }
+    }
+    assert!(got_clear, "stop must broadcast a clear frame");
 
-    // Give the worker a moment to notice cancel and bail before
-    // anything else can race the read.
+    // Give the worker a moment to notice cancel, terminate, and release
+    // its pool slot before the GET below acquires it.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let res = app

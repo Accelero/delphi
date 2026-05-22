@@ -32,9 +32,9 @@ use crate::error::{Error, Result};
 use super::surreal::SurrealStorage;
 use super::system::engine_requires_auth;
 use super::{
-    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
-    CreateUploadSessionParams, DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId,
-    Storage, UploadSession,
+    ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
+    ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
+    IngestionRejection, MessageId, Storage, UploadSession,
 };
 
 /// Default pool size when `REQUEST_DB_POOL_SIZE` is unset. Sized to
@@ -392,9 +392,17 @@ impl Storage for AuthedDb {
         user_text: &str,
         parent_id: Option<&MessageId>,
         assistant_text: &str,
+        citations: &[Citation],
     ) -> Result<MessageId> {
         self.storage()
-            .commit_turn(conv, user_message_id, user_text, parent_id, assistant_text)
+            .commit_turn(
+                conv,
+                user_message_id,
+                user_text,
+                parent_id,
+                assistant_text,
+                citations,
+            )
             .await
     }
     async fn rename_conversation(&self, id: &ConversationId, title: &str) -> Result<()> {

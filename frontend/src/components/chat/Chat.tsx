@@ -58,12 +58,13 @@ import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
-import { MessageBody } from "./MessageBody";
+import { MessageBody, type CitationEntry } from "./MessageBody";
 
 type InitialMessage = {
   id: string;
   role: string;
   content: string;
+  citations?: CitationEntry[] | null;
 };
 
 export type ChatProps = {
@@ -119,6 +120,7 @@ type ChatMessage = {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  citations?: CitationEntry[];
 };
 
 type Turn = {
@@ -171,6 +173,7 @@ export function Chat({
           id: m.id,
           role: m.role as LocalMessage["role"],
           content: m.content,
+          citations: m.citations ?? undefined,
         })),
     [initialMessages],
   );
@@ -363,7 +366,13 @@ export function Chat({
                             content={m.content}
                             isStreaming={isLoading && isTailAssistant}
                             citations={
-                              m.role === "assistant" ? citations : undefined
+                              m.role !== "assistant"
+                                ? undefined
+                                : isLoading && isTailAssistant
+                                  ? // in-flight turn: live citation table
+                                    citations
+                                  : // committed / reloaded: the row's own
+                                    m.citations
                             }
                           />
                         </MessageContent>

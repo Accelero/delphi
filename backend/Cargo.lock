@@ -1701,6 +1701,7 @@ name = "delphi"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "aws-config",
  "aws-credential-types",

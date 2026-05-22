@@ -242,6 +242,25 @@ pub struct Conversation {
     pub updated_at: Option<DateTime<Utc>>,
 }
 
+/// One resolved RAG citation, persisted on an assistant `message` row so
+/// a reloaded conversation can render its `[N]` markers without re-running
+/// retrieval. Storage-owned (no `api` dependency); its field layout is
+/// the wire shape the SPA consumes, identical to `sse::CitationEntry` —
+/// the worker maps from one to the other.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Citation {
+    /// Bracket number rendered as `[n]` in the assistant text.
+    pub n: usize,
+    /// `chunk:<key>` — what the frontend feeds to `/api/chunks/:id`.
+    pub chunk_id: String,
+    /// `document:<key>` — used by the deep-link `/feed?doc=&chunk=`.
+    pub doc_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<i64>,
+}
+
 /// A single chat message inside a [`Conversation`]. `tenant_id` and the
 /// `conversation` link are engine-managed; on the wire we only expose
 /// what the SPA needs to render the message.
@@ -266,6 +285,11 @@ pub struct ChatMessage {
         with = "opt_record_id_str"
     )]
     pub parent_id: Option<RecordId>,
+    /// Resolved RAG citations for an assistant message. `None` for user
+    /// messages and assistant turns that cited nothing. Populated on read
+    /// (history) and written by [`Storage::commit_turn`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<Citation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<DateTime<Utc>>,
 }

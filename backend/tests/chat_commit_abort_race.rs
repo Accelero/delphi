@@ -1,23 +1,15 @@
 //! Stop racing a commit must not produce a ghost-message inconsistency.
 //!
-//! The phase machine in `SessionState` (`enter_committing` flips
-//! `Streaming → Committing`, `abort()` only emits `clear` when phase
-//! is `Streaming`) closes the race.
+//! v4 makes this structural, not a phase machine (§8): the worker is the
+//! single writer of the turn's stream, so the terminal frame is `clear`
+//! XOR `finish` — never both, and a committed turn always ends in
+//! `finish`. A `/stop` that arrives after the worker already broke on EOF
+//! is a no-op: the token is never re-checked, the turn commits, and the
+//! wire shows `finish`.
 //!
-//! Integration-level shape asserted here:
-//!
-//! - If the worker reached commit (DB has both rows), a subsequent
-//!   `session.abort()` is a no-op — must not drop the rows.
-//!
-//! The "Streaming-phase abort emits clear AND clears current" half of
-//! the race lives in `chat_stop.rs::abort_during_in_flight_turn_...`
-//! and in the session.rs unit test `abort_during_committing_does_not_emit_clear`.
-//! Between the two we cover both phase-machine branches.
-//!
-//! We can't drive the HTTP `/stop` mid-turn on the single-slot test
-//! pool — see the `chat_stop.rs` doc — so we invoke
-//! `SessionState::abort` directly. That is the exact code path the
-//! production handler reaches after its perm-check + drop.
+//! Asserted here, end to end: after a turn has committed both rows, a
+//! late `TurnBus::cancel` (the `/stop` code path) neither drops the rows
+//! nor appends a `clear` — the lingering log still ends in `finish`.
 
 mod common;
 
@@ -25,10 +17,12 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use futures::StreamExt;
 use serde_json::{json, Value};
 use surrealdb::RecordId;
 
 use common::{AuthRequestBuilder, TestApp};
+use delphi::chat::Cursor;
 
 fn auth_post(uri: &str, body: Value) -> Request<Body> {
     AuthRequestBuilder::default().apply(
@@ -56,7 +50,7 @@ fn key_of(id: &str) -> String {
 }
 
 #[tokio::test]
-async fn abort_after_commit_does_not_drop_rows() {
+async fn late_stop_after_commit_keeps_rows_and_shows_finish_not_clear() {
     let app = TestApp::build().await; // FakeLlm: one "ok" delta, EOF.
     let res = app
         .send(auth_post("/api/chat/conversations", json!({})))
@@ -95,20 +89,35 @@ async fn abort_after_commit_does_not_drop_rows() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Late abort: turn is done, `current` is None. `SessionState::abort`
-    // must be a no-op for both the wire (no spurious `clear`) and the
-    // DB (rows stay put). This is exactly the situation a /stop arriving
-    // a few ms after commit would create.
-    let session = app
-        .sessions
-        .lookup(&conv_id)
-        .expect("session entry exists after a finished turn");
-    session.abort();
+    // Late stop: the turn is done (token already cleared at `terminate`),
+    // so `cancel` is a structural no-op. This is the situation a `/stop`
+    // arriving a few ms after commit creates.
+    app.turn_bus.cancel(&conv_id).await;
 
+    // Resume from the turn's start (cursor 0): the lingering log must end
+    // in `finish`, with no `clear` anywhere — clear XOR finish (§8).
+    let c0: Cursor = "0".parse().expect("cursor");
+    let mut stream = app.turn_bus.subscribe(&conv_id, Some(c0)).await;
+    let mut acc = String::new();
+    while let Ok(Some(b)) =
+        tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+    {
+        acc.push_str(&String::from_utf8_lossy(&b));
+    }
+    assert!(
+        acc.contains("event: finish"),
+        "committed turn must end in finish; got: {acc:?}"
+    );
+    assert!(
+        !acc.contains("event: clear"),
+        "a committed turn must never emit clear; got: {acc:?}"
+    );
+
+    // Rows survive the late stop.
     let res = app
         .send(auth_get(&format!("/api/chat/conversations/{key}")))
         .await;
     let body: Value = res.json();
     let msgs = body["messages"].as_array().expect("messages");
-    assert_eq!(msgs.len(), 2, "late abort must not drop committed rows");
+    assert_eq!(msgs.len(), 2, "late stop must not drop committed rows");
 }

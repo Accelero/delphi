@@ -156,10 +156,11 @@ that hand-written code typically doesn't:
 - **Property tests** for `HeaderClaimsExtractor` (auth boundary parser).
   Generates arbitrary `HeaderMap`s and asserts `extract().is_ok() ↔`
   required headers present and non-empty. *Planned.*
-- **Snapshot tests** on the AI SDK protocol writers in
-  `api/stream.rs` (`proto::text`, `proto::error`, `proto::finish`).
-  Byte-level snapshots so the first time someone "cleans up" the
-  streaming code, the diff is loud. *Planned.*
+- **Snapshot tests** on the SSE protocol writers in `api/sse.rs`
+  (`sse::user_message`, `sse::text`, `sse::citations`, `sse::error`,
+  `sse::finish`, `sse::clear`, `sse::resync`). Byte-level snapshots so the
+  first time someone "cleans up" the streaming code, the diff is loud.
+  *In place* (`api/sse.rs::tests`).
 - **Type-drift check** via ts-rs in CI: regenerate, fail on
   `git diff frontend/src/types/api.gen.ts`. *Planned.*
 - **Equivalence test** between dev-mode header injector and the
@@ -224,9 +225,6 @@ Listed so the gap between "designed" and "running" is honest:
 
 - `ts-rs` type generation + drift check.
 - Property tests on `HeaderClaimsExtractor`.
-- Snapshot tests on `api/stream.rs`.
-- `chat_streaming.rs` integration test (POST `/api/chat` against the
-  fake LLM).
 - A frontend component test (e.g. `user-menu.test.tsx`).
 - CI workflow wiring the four cadences.
 

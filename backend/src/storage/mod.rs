@@ -28,9 +28,9 @@ mod surreal;
 mod system;
 
 pub use models::{
-    dedup_key, Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content,
-    Conversation, ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
-    IngestionRejection, MessageId, UploadSession,
+    dedup_key, Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation,
+    Content, Conversation, ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor,
+    Filters, IngestionRejection, MessageId, UploadSession,
 };
 pub use request::{AuthRecord, AuthedDb, RequestDbPool};
 pub use surreal::SurrealStorage;
@@ -159,6 +159,10 @@ pub trait Storage: Send + Sync {
     /// causes the DELETE step to scrub everything in the conversation
     /// — that is correct: a first-turn submit is asserting the chat
     /// was empty.
+    ///
+    /// `citations` are written onto the assistant row so a reloaded
+    /// conversation renders its `[N]` markers; pass an empty slice when
+    /// the turn cited nothing (stored as `NONE`).
     async fn commit_turn(
         &self,
         conv: &ConversationId,
@@ -166,6 +170,7 @@ pub trait Storage: Send + Sync {
         user_text: &str,
         parent_id: Option<&MessageId>,
         assistant_text: &str,
+        citations: &[Citation],
     ) -> Result<MessageId>;
 
     /// Update the title. Engine PERMISSIONS refuse cross-user / cross-

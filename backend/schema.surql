@@ -416,6 +416,12 @@ DEFINE FIELD IF NOT EXISTS parts          ON message FLEXIBLE TYPE array DEFAULT
 DEFINE FIELD IF NOT EXISTS parent_id      ON message TYPE option<record<message>>;
 DEFINE FIELD IF NOT EXISTS model          ON message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS finish_reason  ON message TYPE option<string>;
+-- Resolved RAG citations for an assistant turn, so a reloaded
+-- conversation renders its `[N]` markers without re-running retrieval.
+-- Assistant rows only (NONE elsewhere). FLEXIBLE: the element objects
+-- ({n, chunk_id, doc_id, doc_title?, page?}) carry their own shape and
+-- aren't worth a nested SCHEMAFULL definition.
+DEFINE FIELD IF NOT EXISTS citations      ON message FLEXIBLE TYPE option<array> DEFAULT NONE;
 DEFINE FIELD IF NOT EXISTS created_at     ON message TYPE datetime DEFAULT time::now();
 DEFINE INDEX IF NOT EXISTS message_conversation   ON message FIELDS conversation;
 REMOVE INDEX IF EXISTS message_tenant_created ON message;

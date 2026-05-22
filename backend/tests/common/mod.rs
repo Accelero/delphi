@@ -31,7 +31,7 @@ use delphi::auth::{
     self, AuthMode, ClaimsExtractor, HeaderConfig, Hs512Validator, IdentityDeps,
     JwtClaimsExtractor, JwtValidator,
 };
-use delphi::chat::SessionRegistry;
+use delphi::chat::{InProcessBus, TurnBus};
 use delphi::embedder::Embedder;
 use delphi::object_store::{AccessMinter, MemAccess, MemObjectStore, ObjectStore};
 use delphi::state::AppState;
@@ -57,10 +57,11 @@ pub struct TestApp {
     /// can `subscribe()` to verify ingest fan-out without parsing the
     /// SSE stream.
     pub events: tokio::sync::broadcast::Sender<delphi::ingestion::FeedItemEvent>,
-    /// Same `SessionRegistry` the router holds in its `AppState`.
-    /// Tests that need to inspect per-conversation chat sessions reach
-    /// in via this handle instead of going through the HTTP path.
-    pub sessions: Arc<SessionRegistry>,
+    /// Same `TurnBus` the router holds in its `AppState`. Tests that need
+    /// to drive the chat transport directly (subscribe to a conversation's
+    /// SSE log, claim a turn, cancel) reach in via this handle instead of
+    /// going through the HTTP path.
+    pub turn_bus: Arc<dyn TurnBus>,
     /// Same per-request pool the router uses; lets tests drive
     /// `commit_turn` and other request-path Storage methods directly
     /// against a JWT-authed handle (mint the bearer via
@@ -178,11 +179,11 @@ impl TestApp {
         let object_store: Arc<dyn ObjectStore> = Arc::new(MemObjectStore::new());
         let access: Arc<dyn AccessMinter> = Arc::new(MemAccess::new());
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
-        let sessions = Arc::new(SessionRegistry::new());
+        let turn_bus: Arc<dyn TurnBus> = Arc::new(InProcessBus::new());
         let uploads_config = Arc::new(delphi::ingestion::UploadsConfig::test_default());
         let state = AppState {
             llm: llm.unwrap_or_else(|| Arc::new(FakeLlmClient::default())),
-            sessions: sessions.clone(),
+            turn_bus: turn_bus.clone(),
             request_db_pool: request_pool.clone(),
             object_store: object_store.clone(),
             access,
@@ -208,7 +209,7 @@ impl TestApp {
             default_tenant_id,
             default_tenant_slug,
             events: events_tx,
-            sessions,
+            turn_bus,
             request_db_pool: request_pool,
         }
     }

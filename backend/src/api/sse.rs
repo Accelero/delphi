@@ -88,6 +88,17 @@ pub fn clear() -> Bytes {
     frame("clear", "null")
 }
 
+/// Resync control frame (v4). Tells a client whose cursor fell out of the
+/// in-memory window (a turn committed while it was disconnected) to
+/// re-read committed history from SurrealDB and keep streaming. The
+/// universal correctness net: because the durable copy exists before any
+/// ephemeral byte is trimmed, no GC policy can lose data. Carries no
+/// `id:` line (it is a control signal, not a replayable data frame, and
+/// must not become the client's `Last-Event-Id`). Payload is `null`.
+pub fn resync() -> Bytes {
+    frame("resync", "null")
+}
+
 /// Per-marker payload streamed inside the `citations` array.
 #[derive(Debug, Clone, Serialize)]
 pub struct CitationEntry {
@@ -150,6 +161,11 @@ mod tests {
     #[test]
     fn clear_snapshot() {
         assert_eq!(as_str(&clear()), "event: clear\ndata: null\n\n");
+    }
+
+    #[test]
+    fn resync_snapshot() {
+        assert_eq!(as_str(&resync()), "event: resync\ndata: null\n\n");
     }
 
     #[test]

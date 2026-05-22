@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::broadcast;
 
-use crate::chat::SessionRegistry;
+use crate::chat::TurnBus;
 use crate::embedder::Embedder;
 use crate::ingestion::{FeedItemEvent, MetadataExtractor};
 use crate::llm::LlmClient;
@@ -25,12 +25,13 @@ use crate::text_extractor::TextExtractor;
 #[derive(Clone)]
 pub struct AppState {
     pub llm: Arc<dyn LlmClient>,
-    /// Per-conversation chat sessions. Each entry buffers the in-flight
-    /// turn's SSE frames and tracks live subscribers, so every tab on
-    /// the same conversation sees the same byte stream. The `/stop`
-    /// endpoint cancels by conversation id (no task id in the public
-    /// API in v3).
-    pub sessions: Arc<SessionRegistry>,
+    /// Per-conversation turn transport (v4). Owns the single-flight slot,
+    /// the ordered SSE delta log (replay + live fan-out), and cancel
+    /// delivery, behind one trait so the in-memory impl swaps for a
+    /// Redis-backed one without touching callers. `/stop` cancels by
+    /// conversation id (no task id in the public API). `Arc<dyn TurnBus>`
+    /// = `InProcessBus` in Phase 1.
+    pub turn_bus: Arc<dyn TurnBus>,
     /// Per-request DB pool, shared with the identity middleware. The
     /// chat worker checks out its own `AuthedDb` for the commit step
     /// because the request that spawned it has already released its

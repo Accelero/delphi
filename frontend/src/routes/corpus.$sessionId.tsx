@@ -60,6 +60,7 @@ function CorpusConversation() {
                 id: m.id,
                 role: m.role,
                 content: m.content,
+                citations: m.citations ?? undefined,
               }))}
               emptyTitle="Chat with corpus"
               emptyDescription="Ask anything. v1 is plain LLM passthrough — corpus retrieval comes next."

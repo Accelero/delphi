@@ -1,8 +1,11 @@
 # Chat Streaming — v4 (server-authoritative replication, scale-ready)
 
-Status: **design + Phase-1 implementation plan**. Forward-looking
-companion to the shipped [`chat.md`](./chat.md) (v3) and the functional
-spec [`specs/chat.md`](../specs/chat.md). When v4 ships it supersedes v3.
+Status: **Phase 1 implemented** (single instance, in-memory; Redis is
+Phase 2). Supersedes [`chat.md`](./chat.md) (v3); companion to the
+functional spec [`specs/chat.md`](../specs/chat.md). The design sections
+below describe the shipped Phase-1 shape; the
+[Phase-1 implementation plan](#phase-1-implementation-plan) is retained as
+the build record (all steps landed).
 
 > **For an implementing agent:** the design sections (1–9) give the model
 > and the *why*; the **[Phase-1 implementation plan](#phase-1-implementation-plan)**

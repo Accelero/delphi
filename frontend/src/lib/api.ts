@@ -100,10 +100,25 @@ export type Conversation = {
   updated_at: string | null;
 };
 
+/** One resolved RAG citation on a persisted assistant message. Wire
+ *  shape mirrors the live SSE `citations` frame (`sse::CitationEntry`)
+ *  and the storage `Citation` struct — structurally identical to
+ *  `CitationEntry` in `MessageBody`. */
+export type Citation = {
+  n: number;
+  chunk_id: string;
+  doc_id: string;
+  doc_title?: string | null;
+  page?: number | null;
+};
+
 export type ChatMessageWire = {
   id: string;
   role: "user" | "assistant" | "system";
   content: string;
+  /** Resolved citations for an assistant message; absent/null on user
+   *  messages and uncited turns. */
+  citations?: Citation[] | null;
   created_at: string | null;
 };
 

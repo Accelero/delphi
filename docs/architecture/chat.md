@@ -1,6 +1,15 @@
 # Chat Streaming — v3 (multi-tab via SSE)
 
-Status: shipped. Sister doc to [`ARCH.md`](../ARCH.md).
+> **Superseded by [chat-v4.md](./chat-v4.md).** v4 (server-authoritative
+> replication: the `TurnBus` trait, a cursor/`resync` wire, single-writer
+> worker, in-memory now / Redis-ready) is implemented and replaces the
+> `SessionRegistry`/`SessionState` machinery described here. This document
+> is retained for the requirement cross-reference and the v3 rationale;
+> where the two disagree, **v4 is authoritative**. The functional spec
+> ([`specs/chat.md`](../specs/chat.md), R1–R10) is unchanged — v4 changes
+> *how*, not *what*.
+
+Status: superseded by v4. Sister doc to [`ARCH.md`](../ARCH.md).
 
 ## Implements
 

@@ -61,16 +61,30 @@ async fn first_turn_two_concurrent_commits_leave_one_pair() {
     let conv2 = conv_id.clone();
     let t1 = tokio::spawn(async move {
         let db = pool1.acquire(&bearer1).await.expect("acquire1");
-        db.commit_turn(&conv1, "01abctest1xxxxxxxxxxxxxxxx", "hello A", None, "reply A")
-            .await
+        db.commit_turn(
+            &conv1,
+            "01abctest1xxxxxxxxxxxxxxxx",
+            "hello A",
+            None,
+            "reply A",
+            &[],
+        )
+        .await
     });
     // Give task 1 a head start; even on a multi-slot pool the in-memory
     // engine serialises transactions, so the order is deterministic.
     tokio::time::sleep(Duration::from_millis(20)).await;
     let t2 = tokio::spawn(async move {
         let db = pool2.acquire(&bearer2).await.expect("acquire2");
-        db.commit_turn(&conv2, "01abctest2xxxxxxxxxxxxxxxx", "hello B", None, "reply B")
-            .await
+        db.commit_turn(
+            &conv2,
+            "01abctest2xxxxxxxxxxxxxxxx",
+            "hello B",
+            None,
+            "reply B",
+            &[],
+        )
+        .await
     });
     let r1 = t1.await.expect("join1");
     let r2 = t2.await.expect("join2");
@@ -106,7 +120,7 @@ async fn second_turn_respects_parent_chain() {
 
     let db = app.request_db_pool.acquire(&bearer).await.expect("acquire");
     let asst1 = db
-        .commit_turn(&conv_id, "01turn1aaaaaaaaaaaaaaaaaaa", "q1", None, "a1")
+        .commit_turn(&conv_id, "01turn1aaaaaaaaaaaaaaaaaaa", "q1", None, "a1", &[])
         .await
         .expect("turn1");
     drop(db);
@@ -123,6 +137,7 @@ async fn second_turn_respects_parent_chain() {
             "q2",
             Some(&asst1),
             "a2",
+            &[],
         )
         .await
         .expect("turn2");
@@ -141,4 +156,83 @@ async fn second_turn_respects_parent_chain() {
     assert_eq!(msgs[1].parent_id.as_ref(), msgs[0].id.as_ref());
     assert_eq!(msgs[2].parent_id.as_ref(), Some(&asst1));
     assert_eq!(msgs[3].parent_id.as_ref(), msgs[2].id.as_ref());
+}
+
+#[tokio::test]
+async fn commit_turn_persists_and_returns_citations() {
+    use delphi::storage::Citation;
+
+    let app = TestApp::build().await;
+    let conv_id = create_conversation(&app).await;
+    let bearer = AuthRequestBuilder::default().mint_jwt();
+
+    let citations = vec![
+        Citation {
+            n: 1,
+            chunk_id: "chunk:abc".into(),
+            doc_id: "document:xyz".into(),
+            doc_title: Some("A Title".into()),
+            page: Some(3),
+        },
+        Citation {
+            n: 2,
+            chunk_id: "chunk:def".into(),
+            doc_id: "document:xyz".into(),
+            doc_title: None,
+            page: None,
+        },
+    ];
+
+    let db = app.request_db_pool.acquire(&bearer).await.expect("acquire");
+    db.commit_turn(
+        &conv_id,
+        "01citetestxxxxxxxxxxxxxxxx",
+        "what does it say?",
+        None,
+        "it says things [1][2]",
+        &citations,
+    )
+    .await
+    .expect("commit");
+
+    let msgs = db.list_messages(&conv_id).await.expect("list");
+    assert_eq!(msgs.len(), 2, "user+assistant pair: {msgs:?}");
+    // User message carries no citations.
+    assert_eq!(msgs[0].role, "user");
+    assert!(msgs[0].citations.is_none(), "user row must not carry citations");
+    // Assistant message round-trips the full citation table.
+    assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(
+        msgs[1].citations.as_deref(),
+        Some(citations.as_slice()),
+        "assistant citations must round-trip exactly"
+    );
+}
+
+#[tokio::test]
+async fn commit_turn_with_no_citations_reads_back_none() {
+    let app = TestApp::build().await;
+    let conv_id = create_conversation(&app).await;
+    let bearer = AuthRequestBuilder::default().mint_jwt();
+
+    let db = app.request_db_pool.acquire(&bearer).await.expect("acquire");
+    db.commit_turn(
+        &conv_id,
+        "01nocitetestxxxxxxxxxxxxxx",
+        "no rag here",
+        None,
+        "plain answer",
+        &[],
+    )
+    .await
+    .expect("commit");
+
+    let msgs = db.list_messages(&conv_id).await.expect("list");
+    assert_eq!(msgs.len(), 2);
+    // An empty citation slice stores NONE, not [], so it reads back None.
+    assert!(
+        msgs[1].citations.is_none(),
+        "uncited assistant turn must read back as None, got {:?}",
+        msgs[1].citations
+    );
 }

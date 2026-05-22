@@ -1,45 +1,42 @@
-//! Per-turn background worker (v3).
+//! Per-turn background worker (v4 — single writer).
 //!
 //! Spawned by `POST /api/chat/conversations/{key}/messages` after the
-//! POST handler has already called `SessionState::start_turn` (which
-//! buffers the `user_message` SSE frame and registers the cancel
-//! token). The worker:
+//! handler has claimed the turn via [`crate::chat::TurnBus::try_start`]
+//! (which buffered the `user_message` frame and returned a
+//! [`TurnHandle`]). The worker is the **only** writer of this turn's
+//! stream, which makes the commit↔abort race structurally impossible —
+//! there is no phase machine (§8). It:
 //!
 //! 1. Acquires its own [`AuthedDb`] from the pool using the caller's
 //!    snapshotted bearer (`AuthedDb` is `!Clone` and released-on-Drop,
 //!    so we don't smuggle the request's handle — we mint a fresh one
 //!    here).
 //! 2. Loads history + optionally runs RAG retrieval, builds the prompt.
-//! 3. Emits `citations` (if any) via `SessionState::emit`, then
-//!    streams the LLM reply into the session as `text` frames.
-//! 4. A per-turn [`CancellationToken`] races each delta. On cancel we
-//!    bail — `SessionState::abort` (called by the `/stop` handler) has
-//!    already emitted the `clear` frame and cleared `current`.
-//! 5. On natural EOF / mid-stream error we flip phase to `Committing`
-//!    (via [`SessionState::enter_committing`]); if the flip fails the
-//!    turn was aborted while we were still in the LLM loop and we bail
-//!    without writing to the DB.
-//! 6. We commit the user+assistant pair atomically via
-//!    [`Storage::commit_turn`], then call [`SessionState::finish`] —
-//!    that emits the trailing `finish` frame, marks phase `Committed`,
-//!    and clears `current`.
-//! 7. Title generation is detached: `tokio::spawn` after `finish`, so
-//!    the SSE `finish` frame reaches the UI immediately. The title
-//!    task acquires its own `AuthedDb`.
+//! 3. `append`s the `citations` frame (if any), then streams the LLM
+//!    reply as `text` frames via the handle.
+//! 4. A biased `select!` races [`TurnHandle::cancelled`] against each
+//!    delta:
+//!    - **cancel branch** ⟺ `terminate(clear)`, no DB write — a
+//!      cancelled turn persists nothing (R7).
+//!    - **EOF / error branch** ⟺ `commit_turn` then `terminate(finish)`.
+//!    These are mutually exclusive, so "clear emitted **and** rows
+//!    persisted" cannot happen.
+//! 5. Title generation is detached: `tokio::spawn` after `terminate`, so
+//!    the `finish` frame reaches the UI immediately. The title task
+//!    acquires its own `AuthedDb`.
 //!
 //! ### Panic guard
 //!
-//! The worker body runs inside a `WorkerGuard` whose `Drop` calls
-//! `session.abort()` on unwind. Without it, a panic mid-turn would
-//! leave `current` permanently `Some` and every subsequent POST for
-//! that conversation would return 409 forever.
+//! [`TurnHandle::Drop`] emits `clear` and releases the single-flight slot
+//! if `terminate` never ran (worker panic / early return), so a panic
+//! mid-turn can't wedge the conversation at 409 forever. This replaces
+//! v3's separate `WorkerGuard`.
 
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::api::sse::{self, CitationEntry};
@@ -48,12 +45,11 @@ use crate::embedder::Embedder;
 use crate::llm::{LlmClient, LlmDelta, LlmMessage, Role};
 use crate::state::AppState;
 use crate::storage::{
-    AuthedDb, ChatMessage, ChunkSearchResult, ConversationId, Filters, MessageId, RequestDbPool,
-    Storage,
+    AuthedDb, ChatMessage, ChunkSearchResult, Citation, ConversationId, Filters, MessageId,
+    RequestDbPool, Storage,
 };
 
-use super::registry::TaskId;
-use super::session::SessionState;
+use super::bus::{TaskId, TurnHandle};
 
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_NEIGHBOR_RADIUS: i64 = 1;
@@ -98,50 +94,30 @@ pub struct TurnRequest {
     pub pool: RequestDbPool,
 }
 
-/// Spawn the worker. The POST handler has already buffered the
-/// `user_message` frame via [`SessionState::start_turn`]; this just
-/// detaches the LLM loop. The session pointer is shared (Arc); the
-/// cancel token comes from `start_turn` so `/stop` can flip it.
-pub fn spawn_worker(
-    session: Arc<SessionState>,
-    task_id: TaskId,
-    cancel: CancellationToken,
-    req: TurnRequest,
-) {
-    tokio::spawn(run(session, task_id, cancel, req));
+/// Spawn the worker. The POST handler has already claimed the turn via
+/// `TurnBus::try_start` (buffering the `user_message` frame) and handed
+/// us the [`TurnHandle`]; this just detaches the LLM loop.
+pub fn spawn_worker(handle: TurnHandle, task_id: TaskId, req: TurnRequest) {
+    tokio::spawn(run(handle, task_id, req));
 }
 
-async fn run(
-    session: Arc<SessionState>,
-    task_id: TaskId,
-    cancel: CancellationToken,
-    req: TurnRequest,
-) {
-    let mut guard = WorkerGuard {
-        session: session.clone(),
-        armed: true,
-    };
-
-    let outcome = drive_turn(&session, task_id, &cancel, &req).await;
-
-    if let Err(e) = outcome {
+async fn run(mut handle: TurnHandle, task_id: TaskId, req: TurnRequest) {
+    // Every branch in `drive_turn` terminates the handle explicitly
+    // (`finish` or `clear`); if it returns early on an internal error it
+    // has already terminated. `TurnHandle::Drop` is the panic-only
+    // backstop.
+    if let Err(e) = drive_turn(&mut handle, task_id, &req).await {
         error!(conv = %req.conversation_id, task = %task_id, error = %e, "turn ended with internal error");
     }
-
-    // Normal exit path: the guard's abort-on-drop has already been
-    // disarmed below (in the no-panic branch). On panic, `armed`
-    // remains true and `Drop` calls `session.abort()`.
-    guard.armed = false;
-    drop(guard);
 }
 
-/// Drive one full turn against the session. Returns `Err` only for
+/// Drive one full turn through the handle. Returns `Err` only for
 /// internal failures the caller should log; user-visible errors are
-/// reported via SSE `error` frames inside this function.
+/// reported via SSE `error` frames inside this function. Every path
+/// terminates the handle before returning.
 async fn drive_turn(
-    session: &SessionState,
+    handle: &mut TurnHandle,
     task_id: TaskId,
-    cancel: &CancellationToken,
     req: &TurnRequest,
 ) -> Result<(), String> {
     // Pool checkout — fresh `AuthedDb` for this worker, released back
@@ -150,8 +126,8 @@ async fn drive_turn(
         Ok(d) => d,
         Err(e) => {
             error!(conv = %req.conversation_id, error = %e, "worker pool acquire failed");
-            session.emit(sse::error("auth setup failed"));
-            session.abort();
+            handle.append(sse::error("auth setup failed")).await;
+            handle.terminate(sse::clear()).await;
             return Err(format!("pool acquire: {e}"));
         }
     };
@@ -160,8 +136,8 @@ async fn drive_turn(
         Ok(m) => m,
         Err(e) => {
             error!(conv = %req.conversation_id, error = %e, "list_messages failed");
-            session.emit(sse::error("history lookup failed"));
-            session.abort();
+            handle.append(sse::error("history lookup failed")).await;
+            handle.terminate(sse::clear()).await;
             return Err(format!("list_messages: {e}"));
         }
     };
@@ -205,7 +181,7 @@ async fn drive_turn(
             },
         );
         let entries = citation_entries(&citations);
-        session.emit(sse::citations(&entries));
+        handle.append(sse::citations(&entries)).await;
     }
 
     info!(
@@ -220,31 +196,32 @@ async fn drive_turn(
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "stream_chat init failed");
-            session.emit(sse::error("llm error"));
-            session.abort();
+            handle.append(sse::error("llm error")).await;
+            handle.terminate(sse::clear()).await;
             return Err(format!("stream_chat: {e}"));
         }
     };
 
-    // Per-delta loop. Cancellation races each `.next()`; on cancel we
-    // BAIL — `SessionState::abort` has already emitted `clear` and
-    // cleared `current`.
+    // Per-delta loop. A biased `select!` races the cancel token against
+    // each `.next()`. The worker is the sole writer, so the branch we
+    // break on *is* the decision: cancel ⇒ clear (no DB); EOF/error ⇒
+    // commit + finish. No phase machine (§8).
     let mut assistant_buf = String::new();
     let stop_reason = loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
+            _ = handle.cancelled() => {
                 info!(conv = %req.conversation_id, task = %task_id, "turn cancelled by /stop");
                 break StopReason::Cancelled;
             }
             item = upstream.next() => match item {
                 Some(Ok(LlmDelta::Text(t))) => {
                     assistant_buf.push_str(&t);
-                    session.emit(sse::text(&t));
+                    handle.append(sse::text(&t)).await;
                 }
                 Some(Err(e)) => {
                     error!(error = %e, "llm stream error");
-                    session.emit(sse::error("llm stream error"));
+                    handle.append(sse::error("llm stream error")).await;
                     break StopReason::Error;
                 }
                 None => break StopReason::Eof,
@@ -255,15 +232,11 @@ async fn drive_turn(
     drop(upstream); // run rig's stream Drop before commit
 
     if matches!(stop_reason, StopReason::Cancelled) {
-        // No DB write, no finish — abort already cleared everything.
-        return Ok(());
-    }
-
-    // Commit/abort race: try to flip phase to Committing. If the abort
-    // raced us between the last LLM delta and here, the flip returns
-    // false and we bail without touching the DB.
-    if !session.enter_committing() {
-        info!(conv = %req.conversation_id, task = %task_id, "abort raced before commit; skipping commit");
+        // Cancel branch: emit `clear`, write nothing (R7). Mutually
+        // exclusive with the commit branch below — a `/stop` that arrives
+        // after we already broke on EOF is a no-op (the token is never
+        // re-checked), so that turn commits and emits `finish` instead.
+        handle.terminate(sse::clear()).await;
         return Ok(());
     }
 
@@ -274,22 +247,25 @@ async fn drive_turn(
             &req.user_text,
             req.parent_id.as_ref(),
             &assistant_buf,
+            &storage_citations(&citations),
         )
         .await
     {
         Ok(id) => id,
         Err(e) => {
             error!(error = %e, "commit_turn failed");
-            session.emit(sse::error("commit failed"));
-            session.finish(sse::finish("error", ""));
+            handle.append(sse::error("commit failed")).await;
+            handle.terminate(sse::finish("error", "")).await;
             return Err(format!("commit_turn: {e}"));
         }
     };
 
     let assistant_id_str = assistant_id.to_string();
 
-    // Emit finish FIRST so the UI unblocks; detach title generation.
-    session.finish(sse::finish(stop_reason.wire(), &assistant_id_str));
+    // Terminate with `finish` FIRST so the UI unblocks; detach title gen.
+    handle
+        .terminate(sse::finish(stop_reason.wire(), &assistant_id_str))
+        .await;
 
     if !conversation_had_title && !assistant_buf.is_empty() {
         let pool = req.pool.clone();
@@ -319,26 +295,6 @@ async fn drive_turn(
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Worker panic guard
-// ---------------------------------------------------------------------------
-
-struct WorkerGuard {
-    session: Arc<SessionState>,
-    armed: bool,
-}
-
-impl Drop for WorkerGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            // Unwind path: clear the turn so the conversation isn't
-            // wedged at 409 forever. The `clear` frame tells live
-            // subscribers to roll back the overlay.
-            self.session.abort();
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +408,23 @@ fn citation_entries(rows: &[Retrieved]) -> Vec<CitationEntry> {
     rows.iter()
         .enumerate()
         .map(|(i, r)| CitationEntry {
+            n: i + 1,
+            chunk_id: r.chunk_id.to_string(),
+            doc_id: r.doc_id.to_string(),
+            doc_title: r.doc_title.clone(),
+            page: r.page,
+        })
+        .collect()
+}
+
+/// Durable form of the same citation table — written onto the assistant
+/// `message` row by `commit_turn`. Identical field layout to
+/// [`CitationEntry`] (the live SSE shape), but storage-owned so the
+/// storage layer carries no `api` dependency.
+fn storage_citations(rows: &[Retrieved]) -> Vec<Citation> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, r)| Citation {
             n: i + 1,
             chunk_id: r.chunk_id.to_string(),
             doc_id: r.doc_id.to_string(),

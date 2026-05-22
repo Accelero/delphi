@@ -21,9 +21,9 @@ use surrealdb::{Datetime, RecordId, Surreal};
 
 use crate::error::{Error, Result};
 use crate::storage::{
-    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Content, Conversation, ConversationId,
-    CreateUploadSessionParams, DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId,
-    Storage, UploadSession,
+    Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
+    ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
+    IngestionRejection, MessageId, Storage, UploadSession,
 };
 
 /// Storage trait implementation against a SurrealDB connection.
@@ -176,6 +176,8 @@ struct ChatMessageWire {
     #[serde(default)]
     parent_id: Option<RecordId>,
     #[serde(default)]
+    citations: Option<Vec<Citation>>,
+    #[serde(default)]
     created_at: Option<Datetime>,
 }
 
@@ -186,6 +188,7 @@ impl From<ChatMessageWire> for ChatMessage {
             role: w.role,
             content: w.content,
             parent_id: w.parent_id,
+            citations: w.citations,
             created_at: w.created_at.map(datetime_to_chrono),
         }
     }
@@ -583,7 +586,7 @@ impl Storage for SurrealStorage {
         let mut response = self
             .db
             .query(
-                "SELECT id, role, content, parent_id, created_at \
+                "SELECT id, role, content, parent_id, citations, created_at \
                  FROM message WHERE conversation = $conv \
                  ORDER BY created_at ASC",
             )
@@ -632,6 +635,7 @@ impl Storage for SurrealStorage {
         user_text: &str,
         parent_id: Option<&MessageId>,
         assistant_text: &str,
+        citations: &[Citation],
     ) -> Result<MessageId> {
         // Atomic transaction:
         //   1. DELETE any messages created after our parent (the
@@ -684,11 +688,19 @@ impl Storage for SurrealStorage {
                 conversation: $conv,
                 role: 'assistant',
                 content: $asst_text,
-                parent_id: $user_rid
+                parent_id: $user_rid,
+                citations: $citations
             } RETURN id;
             UPDATE $conv SET updated_at = time::now();
             COMMIT;
         ";
+        // Store `NONE` (not `[]`) for an uncited turn, so user rows and
+        // citationless assistant rows read back as `citations: None`.
+        let citations_bind: Option<Vec<Citation>> = if citations.is_empty() {
+            None
+        } else {
+            Some(citations.to_vec())
+        };
         let mut response = self
             .db
             .query(sql)
@@ -697,6 +709,7 @@ impl Storage for SurrealStorage {
             .bind(("user_text", user_text.to_string()))
             .bind(("asst_text", assistant_text.to_string()))
             .bind(("parent_id", parent_id.cloned()))
+            .bind(("citations", citations_bind))
             .await?
             .check()?;
         // Statement-slot map (BEGIN/COMMIT framing, LET counts):

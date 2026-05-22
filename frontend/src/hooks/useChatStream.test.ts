@@ -234,6 +234,58 @@ describe("useChatStream", () => {
     ]);
   });
 
+  it("finish stamps the live citation table onto the committed message", () => {
+    // The in-flight turn streamed a citations frame; on finish the
+    // committed assistant row must carry those citations itself, so it
+    // keeps its `[N]` markers before the history refetch returns.
+    const { result } = renderHook(() => useChatStream("k"));
+    const es = lastEs();
+    const table = [{ n: 1, chunk_id: "chunk:1", doc_id: "document:x", page: 3 }];
+    act(() => es.emit("user_message", { id: "message:u1", content: "hi" }));
+    act(() => es.emit("citations", table));
+    act(() => es.emit("text", "see [1]"));
+    act(() =>
+      es.emit("finish", {
+        finishReason: "stop",
+        assistantMessageId: "message:a1",
+      }),
+    );
+    expect(result.current.messages[1]).toEqual({
+      id: "message:a1",
+      role: "assistant",
+      content: "see [1]",
+      citations: table,
+    });
+  });
+
+  it("preserves per-message citations seeded from history", () => {
+    // Reload path: a committed assistant message arrives via
+    // initialMessages carrying its own citations. They must survive into
+    // the rendered message list (the live `citations` state is empty on a
+    // fresh load), so reload renders `[N]` markers.
+    const table = [
+      { n: 1, chunk_id: "chunk:1", doc_id: "document:x", page: 3 },
+    ];
+    const { result } = renderHook(() =>
+      useChatStream("k", {
+        initialMessages: [
+          { id: "message:u0", role: "user", content: "q" },
+          {
+            id: "message:a0",
+            role: "assistant",
+            content: "a [1]",
+            citations: table,
+          },
+        ],
+      }),
+    );
+    expect(result.current.citations).toEqual([]);
+    expect(result.current.messages[1]).toMatchObject({
+      id: "message:a0",
+      citations: table,
+    });
+  });
+
   it("named error event sets status=error and error message", () => {
     const { result } = renderHook(() => useChatStream("k"));
     const es = lastEs();
@@ -255,18 +307,41 @@ describe("useChatStream", () => {
     expect(onTurnEnd).toHaveBeenCalledTimes(1);
   });
 
-  it("fires onTurnEnd on reopen when overlay is non-empty", () => {
+  it("refetches only on the first connect, not on reopen (v4)", () => {
+    // v4: cursor resume (`Last-Event-Id`) + `resync` cover reconnects, so
+    // a transient-blip reopen must NOT refetch (v3 did, double-counting).
     const onTurnEnd = vi.fn();
     renderHook(() => useChatStream("k", { onTurnEnd }));
     const es = lastEs();
-    // Simulate a turn in progress.
+    act(() => es.emitOpen()); // first connect
+    expect(onTurnEnd).toHaveBeenCalledTimes(1);
+    onTurnEnd.mockClear();
+    act(() => es.emitOpen()); // reconnect after a blip
+    expect(onTurnEnd).not.toHaveBeenCalled();
+  });
+
+  it("resync drops the overlay, clears citations, and refetches", () => {
+    const onTurnEnd = vi.fn();
+    const { result } = renderHook(() => useChatStream("k", { onTurnEnd }));
+    const es = lastEs();
+    // Mid-turn: a user row, a citation table, and a streaming overlay.
     act(() => es.emit("user_message", { id: "message:u1", content: "hi" }));
+    act(() =>
+      es.emit("citations", [{ n: 1, chunk_id: "chunk:1", doc_id: "document:x" }]),
+    );
     act(() => es.emit("text", "partial"));
+    expect(result.current.messages).toHaveLength(2);
     onTurnEnd.mockClear();
 
-    // Reopen (e.g. after transient disconnect): overlay non-empty →
-    // caller should refetch.
-    act(() => es.emitOpen());
+    // Server says our cursor fell out of the window.
+    act(() => es.emit("resync", null));
+    // Streaming overlay dropped (user row kept), citations cleared, ready,
+    // and a refetch fired.
+    expect(result.current.messages).toEqual([
+      { id: "message:u1", role: "user", content: "hi" },
+    ]);
+    expect(result.current.citations).toEqual([]);
+    expect(result.current.status).toBe("ready");
     expect(onTurnEnd).toHaveBeenCalledTimes(1);
   });
 });
