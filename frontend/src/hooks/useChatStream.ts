@@ -16,10 +16,14 @@
  * new turn or a reconnect-replay of an in-flight turn. Without this rule
  * a mid-turn reconnect would produce `hellohelloworld`.
  *
- * Refetch-on-reopen rule: every time the EventSource (re)opens while
- * we still have an assistant overlay or non-ready status, we trigger
- * `onTurnEnd?.()`. This catches the "turn ended while the connection
- * was down and the buffer is now empty" case.
+ * Reconcile-on-reopen rule: every time the EventSource (re)opens we
+ * trigger `onTurnEnd?.()` to refetch committed history. A freshly
+ * mounted late joiner (e.g. switching chat sessions in the same tab)
+ * or a tab reconnecting after a blip may have missed the `finish` for
+ * a turn that committed while it was disconnected — that committed
+ * pair lives only in the DB, not in this client's cached seed, and the
+ * replay buffer was dropped at `finish`. Refetching surfaces it. Any
+ * *in-flight* turn is replayed on top via the SSE buffer.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -124,13 +128,20 @@ export function useChatStream(
     const es = new EventSource(url);
 
     es.addEventListener("open", () => {
-      // Reset error state on (re)open. If we have a non-empty overlay
-      // or an unfinished status, the turn might have completed while
-      // the connection was down — fire onTurnEnd so the caller
-      // refetches and we pick up any committed pair.
-      if (overlayRef.current.length > 0 || statusRef.current !== "ready") {
-        onTurnEndRef.current?.();
-      }
+      // Reconcile committed history on every (re)connect. A freshly
+      // mounted late joiner — or a tab reconnecting after a blip — may
+      // have missed the `finish` for a turn that committed while it was
+      // disconnected. The classic case: the user submits, navigates
+      // away (this surface unmounts, closing its EventSource), the turn
+      // commits, then they navigate back. The tab that would have
+      // invalidated the conversation cache on `finish` is gone, so the
+      // committed pair lives only in the DB — not in this client's
+      // cached seed, and no replay covers it (the buffer is dropped at
+      // `finish`). Refetching here surfaces that completed turn. Any
+      // *in-flight* turn is still replayed on top via the SSE buffer,
+      // and the seed-reset is guarded by `status` so the refetch can't
+      // wipe a live overlay.
+      onTurnEndRef.current?.();
     });
 
     es.addEventListener("user_message", (ev: MessageEvent) => {

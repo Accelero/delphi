@@ -155,6 +155,60 @@ describe("useChatStream", () => {
     expect(result.current.messages[1].content).toBe("helloworld");
   });
 
+  it("late-join: replay burst layers onto a committed seed", () => {
+    // Switch-back scenario: the fresh mount seeds from committed history
+    // (which does NOT contain the in-flight turn), then the new
+    // EventSource replays the buffered burst — user_message + text —
+    // which must appear on top of the committed messages.
+    const { result } = renderHook(() =>
+      useChatStream("k", {
+        initialMessages: [{ id: "message:a0", role: "assistant", content: "prior" }],
+      }),
+    );
+    const es = lastEs();
+    // One network chunk → EventSource dispatches both frames in the same
+    // task. React batches the setState calls into a single commit.
+    act(() => {
+      es.emit("user_message", { id: "message:u1", content: "hi" });
+      es.emit("text", "partial");
+    });
+    expect(result.current.status).toBe("streaming");
+    expect(result.current.messages).toEqual([
+      { id: "message:a0", role: "assistant", content: "prior" },
+      { id: "message:u1", role: "user", content: "hi" },
+      { id: "__streaming-assistant__", role: "assistant", content: "partial" },
+    ]);
+  });
+
+  it("late-join: a mid-stream seed refetch does not wipe the overlay", () => {
+    // On remount, useConversation refetches (refetchOnMount). The resolved
+    // committed history is re-passed as initialMessages WHILE the replay
+    // stream is mid-flight. The seed-reset must not clobber the overlay.
+    const seed = [{ id: "message:a0", role: "assistant" as const, content: "prior" }];
+    const { result, rerender } = renderHook(
+      ({ init }) => useChatStream("k", { initialMessages: init }),
+      { initialProps: { init: seed } },
+    );
+    const es = lastEs();
+    act(() => {
+      es.emit("user_message", { id: "message:u1", content: "hi" });
+      es.emit("text", "partial");
+    });
+    expect(result.current.messages).toHaveLength(3);
+
+    // Background refetch resolves with the SAME committed history but a
+    // fresh array identity (caller forgot to memoise / TanStack new ref).
+    act(() => {
+      rerender({ init: [{ id: "message:a0", role: "assistant", content: "prior" }] });
+    });
+    expect(result.current.status).toBe("streaming");
+    expect(result.current.messages).toEqual([
+      { id: "message:a0", role: "assistant", content: "prior" },
+      { id: "message:u1", role: "user", content: "hi" },
+      { id: "__streaming-assistant__", role: "assistant", content: "partial" },
+    ]);
+  });
+
   it("clear drops the optimistic user row and any overlay", () => {
     const { result } = renderHook(() => useChatStream("k"));
     const es = lastEs();
@@ -186,6 +240,19 @@ describe("useChatStream", () => {
     act(() => es.emit("error", "llm stream error"));
     expect(result.current.status).toBe("error");
     expect(result.current.error).toBe("llm stream error");
+  });
+
+  it("reconciles committed history on a fresh connect (empty overlay)", () => {
+    // Switch-back-in-same-tab scenario: the fresh mount has an empty
+    // overlay and ready status. A turn may have committed while this
+    // surface was unmounted (the tab that would have invalidated the
+    // cache is gone), so the late joiner must refetch on connect rather
+    // than trust its possibly-stale seed. Pre-fix this did NOT fire.
+    const onTurnEnd = vi.fn();
+    renderHook(() => useChatStream("k", { onTurnEnd }));
+    const es = lastEs();
+    act(() => es.emitOpen());
+    expect(onTurnEnd).toHaveBeenCalledTimes(1);
   });
 
   it("fires onTurnEnd on reopen when overlay is non-empty", () => {

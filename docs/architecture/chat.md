@@ -229,12 +229,14 @@ then joins live deltas. This is the late-join (R3) mechanism.
   current turn's buffer, then forwards live frames. The reset rule
   on `user_message` keeps the client overlay consistent.
 - **Tab subscribes after the turn ended:** the buffer was cleared on
-  `finish` / `clear`, so subscribe gets no replay. The `onopen`
-  refetch-when-overlay-non-empty rule on the client doesn't fire (no
-  overlay), so the tab just shows the committed history from the
-  initial GET. Cross-tab consistency comes via the
-  `queryClient.invalidateQueries` the originating tab fires from its
-  `onTurnEnd`.
+  `finish` / `clear`, so subscribe gets no replay. The client's
+  `onopen` handler unconditionally fires `onTurnEnd?.()`, which
+  refetches committed history — so the just-committed pair shows up
+  even when no live tab was around to invalidate the cache on `finish`
+  (e.g. the submitting tab navigated away mid-turn). Relying on the
+  originating tab's `onTurnEnd` alone is **not** sufficient: if it
+  unmounted before commit, nobody invalidates, and a late joiner that
+  trusted its `staleTime`-fresh cache would show stale history.
 
 ## Late join and reconnect
 
@@ -254,11 +256,15 @@ Mechanism for spec [R3](../specs/chat.md#r3-late-join-replay) and
   assistant overlay; this is what closes the "rebuild idempotently"
   invariant. Without the reset, a re-delivered `text "He"` followed by
   the live `text "llo"` would render `HeHello`.
-- **Reconnect, turn ended while down:** Backend's `current` is `None`,
-  replay is empty, no events arrive. Client's `onopen` callback checks
-  whether the local overlay is non-empty; if it is, it fires
-  `onTurnEnd?.()`, which makes the caller refetch history. The
-  committed pair replaces the stale overlay.
+- **Reconnect / late join, turn ended while disconnected:** Backend's
+  `current` is `None`, replay is empty, no events arrive. The client's
+  `onopen` callback **always** fires `onTurnEnd?.()`, refetching
+  committed history. This covers both a transient reconnect and a fresh
+  late joiner (switching chat sessions in the same tab), where the
+  surface that submitted the turn unmounted before `finish` and so
+  never invalidated the conversation cache — without the refetch the
+  client would render its `staleTime`-fresh-but-stale seed and the
+  completed turn would be invisible.
 
 ## Concurrency: one turn per conversation
 
@@ -281,9 +287,10 @@ defence-in-depth but is no longer the primary concurrency mechanism.
 
 - Opens an `EventSource` on mount, closes on unmount.
 - Registers per-event handlers (`user_message`, `text`, `citations`,
-  `error`, `finish`, `clear`) and an `open` handler that triggers
-  `onTurnEnd?.()` whenever the overlay is non-empty (catches the
-  case where the turn finished while the connection was down).
+  `error`, `finish`, `clear`) and an `open` handler that
+  unconditionally triggers `onTurnEnd?.()` on every (re)connect, so a
+  late joiner / reconnecting tab reconciles committed history it may
+  have missed while disconnected.
 - `submit(text)` POSTs `{id: ulid(), text, parent_id}`; on 202 returns
   and waits for SSE. On 409 sets a "conversation changed" error,
   fires `onTurnEnd`. **No optimistic insert** — the user message
