@@ -23,8 +23,8 @@ use super::autofill::{
 };
 use super::text_extract::extract_text;
 use super::validation::{
-    validate_descriptive_metadata, DescriptiveView, MetadataPolicy, ObjectPolicy, ObjectReject,
-    ValidatedAttrs,
+    validate_descriptive_metadata, validate_uploaded_object, DescriptiveView, MetadataPolicy,
+    ObjectPolicy, ObjectReject, ValidatedAttrs,
 };
 
 /// Everything the ordered stages need. Carries **both** DB handles:
@@ -65,17 +65,37 @@ pub enum CompletionError {
 /// Ordered post-upload ingestion stages. The order is load-bearing; read
 /// it top-to-bottom.
 pub async fn run_completion(ctx: &CompletionCtx<'_>) -> Result<DocId, CompletionError> {
-    // 4. TEMP (plumbing test): object validator bypassed — default pass.
-    //    Re-enable by restoring the validate_uploaded_object call:
-    //      let validated = validate_uploaded_object(
-    //          &ctx.session.s3_key, ctx.session.declared_size as u64,
-    //          &ctx.session.declared_content_type, ctx.object_store,
-    //          ctx.object_policy,
-    //      ).await.map_err(CompletionError::ObjectRejected)?;
-    let validated = ValidatedAttrs {
-        size: ctx.session.declared_size as u64,
-        etag: String::new(),
-        sniffed_content_type: "application/octet-stream".to_string(),
+    // 4. Object validation in **always-accept mode** (full reject policy is
+    //    roadmap §0). We still run the magic-byte sniff — passing
+    //    octet-stream as the declared hint forces the validator to defer to
+    //    the bytes — so stage 5 gets the real content type (application/pdf,
+    //    text/plain) and text extraction + autofill actually fire. A
+    //    would-be rejection is downgraded to warn-and-accept: the bytes are
+    //    already committed and we don't fail uploads while the gate is off.
+    //    To restore enforcement, replace the fallback with
+    //    `.map_err(CompletionError::ObjectRejected)?`.
+    let validated = match validate_uploaded_object(
+        &ctx.session.s3_key,
+        ctx.session.declared_size as u64,
+        "application/octet-stream",
+        ctx.object_store,
+        ctx.object_policy,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(reject) => {
+            tracing::warn!(
+                reason = reject.reason_code(),
+                key = %ctx.session.s3_key,
+                "object validation would reject; accepting anyway (always-accept mode; roadmap §0 will enforce)"
+            );
+            ValidatedAttrs {
+                size: ctx.session.declared_size as u64,
+                etag: String::new(),
+                sniffed_content_type: "application/octet-stream".to_string(),
+            }
+        }
     };
 
     // 5. Extract raw text (LLM needs something to read; also persisted).
