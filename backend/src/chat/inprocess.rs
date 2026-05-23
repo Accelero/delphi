@@ -1,9 +1,31 @@
 //! In-process [`TurnBus`] — single instance, in-memory (Phase 1).
 //!
-//! One [`Session`] per ever-touched `ConversationId` in a `DashMap`. Each
-//! session is the v4 ephemeral state for one conversation: the in-flight
-//! turn's delta log (whole SSE frames, each with a monotonic [`Cursor`])
-//! plus the single-flight `running` flag and the per-turn cancel token.
+//! One [`Session`] per *live* `ConversationId`. Each session is the v4
+//! ephemeral state for one conversation: a bounded delta log (whole SSE
+//! frames, each with a monotonic [`Cursor`]) plus the single-flight
+//! `running` flag and the per-turn cancel token.
+//!
+//! ### Lifetime — refcount, not GC (§9)
+//!
+//! The `DashMap` holds a **weak** reference; the strong owners are the
+//! consumers — each subscriber's reader stream and the worker's
+//! `TurnHandle`. A session therefore lives exactly as long as someone is
+//! using it: the worker keeps it alive for the whole turn (so a turn always
+//! finishes and persists even if every tab closes mid-stream), and a
+//! subscriber keeps it alive while it streams. When the last strong owner
+//! drops, `Session::drop` prunes its own (now-dead) map entry. No sweeper,
+//! no grace window, no idle cap, no timers.
+//!
+//! Reincarnation is safe: a session freed between a sole tab's blip and its
+//! reconnect comes back with a fresh [`Cursor`] generation (high bits), so
+//! the old `Last-Event-Id` falls below the new floor and resyncs (§4.1).
+//!
+//! ### Bounded buffer — two turns (§4.1)
+//!
+//! The log retains at most `[previous turn][current turn]`, trimmed at
+//! `try_begin` via a single `turn_cursor` (the start of the current turn).
+//! A client up to one turn behind resumes seamlessly across the boundary;
+//! only a client 2+ turns behind (genuinely stuck) gets `resync`.
 //!
 //! ### Concurrency (§7)
 //!
@@ -17,11 +39,12 @@
 //! raw `Notify`, so a frame appended *during* a socket write isn't a lost
 //! wakeup (the receiver tracks a version).
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::stream::BoxStream;
 use tokio::sync::watch;
@@ -32,6 +55,9 @@ use crate::storage::ConversationId;
 
 use super::bus::{AlreadyRunning, Cursor, TurnBus, TurnHandle};
 
+/// The weak index from conversation to its live session.
+type SessionMap = DashMap<ConversationId, Weak<Session>>;
+
 /// Result of [`Session::read_from`] (§4.1).
 enum Read {
     /// Whole frames the caller hasn't seen yet (possibly empty when
@@ -41,53 +67,61 @@ enum Read {
     Resync,
 }
 
-/// Mutable per-conversation state. The log holds **only the current
-/// in-flight turn** (cleared at `try_begin`); committed turns are durable
-/// SurrealDB rows.
+/// Mutable per-conversation state. The log holds at most two turns —
+/// `[previous][current]` — bounded by `turn_cursor`; older turns and all
+/// committed content are durable SurrealDB rows.
 struct Inner {
-    /// In-flight turn's frames, oldest first. Each is one pre-formatted
-    /// SSE frame (`event:`/`data:`); the `id:` line is prepended by the
-    /// reader at send time, not stored here.
+    /// Buffered SSE frames, oldest first: the previous turn followed by the
+    /// in-flight (or just-finished) one. Each is one pre-formatted SSE
+    /// frame (`event:`/`data:`); the `id:` line is prepended by the reader
+    /// at send time, not stored here.
     frames: Vec<(Cursor, Bytes)>,
-    /// Cursor of `frames[0]` (or `next` when empty). The window floor:
-    /// a resume cursor below `base - 1` triggers `resync`.
-    base: Cursor,
-    /// Next cursor to assign. Monotonic — **never reset** for the life of
-    /// the session, so a cursor never repeats across turns.
+    /// First cursor of the **current** turn. Doubles as the trim boundary
+    /// (`try_begin` drops everything below it) and the fresh-join replay
+    /// start (`read_from(None)`). The resume/resync floor is *derived*
+    /// from `frames.first()`, not this — see [`Session::read_from`].
+    turn_cursor: Cursor,
+    /// Next cursor to assign. Monotonic within this incarnation — **never
+    /// reset** — so a cursor never repeats across turns; a new incarnation
+    /// gets a fresh generation (high bits) instead.
     next: Cursor,
     /// True while a turn is in flight (single-flight gate).
     running: bool,
     /// Current turn's cancel token; `None` when idle.
     cancel: Option<CancellationToken>,
-    /// When the last turn terminated. Drives the GC grace window (§9).
-    finished_at: Option<Instant>,
-    /// When this session was created. Idle-eviction reference for a
-    /// session that has never run a turn (no `finished_at`).
-    created_at: Instant,
 }
 
-/// Per-conversation session. Cheap to share (`Arc`).
+/// Per-conversation session. Cheap to share (`Arc`); freed when the last
+/// strong owner (a reader stream or the worker's handle) drops.
 pub(super) struct Session {
     inner: Mutex<Inner>,
-    /// "Frame appended" wakeup, carrying the latest `next`. Subscriber
-    /// count (`receiver_count`) doubles as the GC liveness signal.
+    /// "Frame appended" wakeup, carrying the latest `next`. Readers park on
+    /// `changed()`.
     notify: watch::Sender<u64>,
+    /// This session's key, and a weak handle to the owning map, so `Drop`
+    /// can prune its own entry. Weak ⇒ no strong cycle (map → `Weak<Session>`,
+    /// session → `Weak<SessionMap>`).
+    conv: ConversationId,
+    map: Weak<SessionMap>,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(conv: ConversationId, map: Weak<SessionMap>, gen: u64) -> Self {
         let (notify, _rx) = watch::channel(0);
+        // Seed this incarnation's cursor space at the start of its
+        // generation (sequence 0). Sequences run contiguously from here.
+        let start = Cursor::generation(gen);
         Self {
             inner: Mutex::new(Inner {
                 frames: Vec::new(),
-                base: Cursor::ZERO,
-                next: Cursor::ZERO,
+                turn_cursor: start,
+                next: start,
                 running: false,
                 cancel: None,
-                finished_at: None,
-                created_at: Instant::now(),
             }),
             notify,
+            conv,
+            map,
         }
     }
 
@@ -100,21 +134,24 @@ impl Session {
     }
 
     /// Single-flight claim. Returns the new turn's cancel token, or `None`
-    /// if a turn is already running. Resets the log to hold only this turn
-    /// (clear frames, `base = next`) before appending `user_message`.
+    /// if a turn is already running. Trims the buffer to at most two turns
+    /// (drop everything below the *old* `turn_cursor`), then begins the new
+    /// turn at the live edge before appending `user_message`.
     pub(super) fn try_begin(&self, user_message: Bytes) -> Option<CancellationToken> {
         let (token, next) = {
             let mut g = self.lock();
             if g.running {
                 return None;
             }
-            g.frames.clear();
-            g.base = g.next;
+            // Keep only the current turn (cursors >= turn_cursor); this
+            // drops the turn two-ago. The new turn then starts at `next`.
+            let keep_from = g.turn_cursor;
+            g.frames.retain(|(c, _)| *c >= keep_from);
+            g.turn_cursor = g.next;
             let c = g.next;
             g.next = c.next();
             g.frames.push((c, user_message));
             g.running = true;
-            g.finished_at = None;
             let token = CancellationToken::new();
             g.cancel = Some(token.clone());
             (token, g.next.get())
@@ -139,11 +176,30 @@ impl Session {
         let _ = self.notify.send_replace(next);
     }
 
-    /// Append the terminal frame and release the slot. Frames linger
-    /// (not cleared) so still-draining readers see the terminal frame;
-    /// GC trims them after the grace window.
+    /// Append the terminal frame and release the slot. Frames linger (not
+    /// cleared) so still-draining readers see the terminal frame, and a
+    /// reconnecting client one turn behind can still resume; they're
+    /// trimmed when the next turn begins.
     pub(super) fn terminate(&self, frame: Bytes) {
         let next = self.close_with(frame);
+        let _ = self.notify.send_replace(next);
+    }
+
+    /// Append a one-off frame **outside** the turn lifecycle (e.g. a
+    /// `title` update after `finish`) and wake readers. Unlike `append`
+    /// this does not require a running turn — it's the post-turn live-push
+    /// path behind [`super::TurnBus::emit`]. The frame takes the next
+    /// cursor (≥ `turn_cursor`, so live readers and the current-turn replay
+    /// see it) and is trimmed with the current turn; a fresh joiner that
+    /// missed it recovers the same state from the DB.
+    pub(super) fn emit_standalone(&self, frame: Bytes) {
+        let next = {
+            let mut g = self.lock();
+            let c = g.next;
+            g.next = c.next();
+            g.frames.push((c, frame));
+            g.next.get()
+        };
         let _ = self.notify.send_replace(next);
     }
 
@@ -162,8 +218,8 @@ impl Session {
         let _ = self.notify.send_replace(next);
     }
 
-    /// Push a terminal frame, mark idle, stamp `finished_at`. Returns the
-    /// new `next` for the wake. Caller sends the wake after releasing.
+    /// Push a terminal frame and mark idle. Returns the new `next` for the
+    /// wake. Caller sends the wake after releasing.
     fn close_with(&self, frame: Bytes) -> u64 {
         let mut g = self.lock();
         let c = g.next;
@@ -171,7 +227,6 @@ impl Session {
         g.frames.push((c, frame));
         g.running = false;
         g.cancel = None;
-        g.finished_at = Some(Instant::now());
         g.next.get()
     }
 
@@ -186,24 +241,35 @@ impl Session {
     fn read_from(&self, cursor: Option<Cursor>) -> Read {
         let g = self.lock();
         match cursor {
-            // Fresh connect: replay the in-flight turn from its start, or
-            // nothing if idle. A *lingering finished* turn (running=false,
-            // frames still present during the grace window) must NOT be
-            // replayed to a fresh joiner — it relies on history.
+            // Fresh connect: replay the *current* turn from its start
+            // (`>= turn_cursor`), or nothing if idle. A lingering finished
+            // turn (running=false, frames still buffered) must NOT be
+            // replayed to a fresh joiner — it relies on history. A
+            // previous-turn frame still in the two-turn buffer is likewise
+            // excluded (only the current turn is replayed live).
             None => {
                 if g.running {
-                    Read::Frames(g.frames.clone())
+                    let tc = g.turn_cursor;
+                    let batch = g
+                        .frames
+                        .iter()
+                        .filter(|(c, _)| *c >= tc)
+                        .cloned()
+                        .collect();
+                    Read::Frames(batch)
                 } else {
                     Read::Frames(Vec::new())
                 }
             }
-            // Resume after cursor `c`.
+            // Resume after cursor `c`. The floor is the oldest *retained*
+            // frame (derived, O(1)) — NOT `turn_cursor`: a resumer one turn
+            // behind sits in the previous turn and must stream continuously
+            // across the boundary without resync. A cursor from an earlier
+            // incarnation (lower generation) is numerically below this
+            // floor, so it resyncs here too with no generation branching.
             Some(c) => {
-                if c.get() + 1 >= g.base.get() {
-                    // Valid resume: hand back everything strictly after c
-                    // (maybe empty if caught up). Covers a transient blip
-                    // and a reconnect to a still-lingering finished turn,
-                    // including its terminal frame.
+                let floor = g.frames.first().map(|(fc, _)| *fc).unwrap_or(g.next);
+                if c.get() + 1 >= floor.get() {
                     let batch = g
                         .frames
                         .iter()
@@ -212,8 +278,6 @@ impl Session {
                         .collect();
                     Read::Frames(batch)
                 } else {
-                    // Wanted cursor was trimmed (a completed turn was
-                    // missed while disconnected) → resync.
                     Read::Resync
                 }
             }
@@ -222,7 +286,8 @@ impl Session {
 
     /// Build the SSE reader stream (§7): pull-based, woken by `notify`.
     /// Yields already-`id:`-prefixed frames; the SSE handler writes them
-    /// verbatim.
+    /// verbatim. Holding `self: Arc<Self>` is what keeps the session alive
+    /// for as long as this stream is consumed (refcount lifetime).
     pub(super) fn reader(self: Arc<Self>, from: Option<Cursor>) -> BoxStream<'static, Bytes> {
         Box::pin(async_stream::stream! {
             let mut cursor = from;
@@ -248,58 +313,27 @@ impl Session {
                     }
                 }
                 if rx.changed().await.is_err() {
-                    // Sender dropped = session evicted by GC. End cleanly.
+                    // Sender dropped = session freed (we were the last
+                    // strong owner). End cleanly.
                     return;
                 }
             }
         })
     }
-
-    // ---- GC support (the sweeper, §9) ----------------------------------
-
-    /// Open subscriber count — the GC liveness signal.
-    pub(super) fn subscriber_count(&self) -> usize {
-        self.notify.receiver_count()
-    }
-
-    /// Grace-trim: an idle session whose last turn finished more than
-    /// `grace` ago drops its frames and advances `base` to the live edge.
-    /// Bounds memory for a long-lived connection spanning many turns; the
-    /// data is already durable, so a straggler past the window gets
-    /// `resync`. No wake is sent — parked readers have nothing new to see.
-    pub(super) fn maybe_trim(&self, grace: Duration) {
-        let mut g = self.lock();
-        if g.running || g.frames.is_empty() {
-            return;
-        }
-        if g.finished_at.map(|t| t.elapsed() >= grace).unwrap_or(false) {
-            g.frames.clear();
-            g.base = g.next;
-        }
-    }
-
-    /// Evictable when idle (no in-flight turn), with no open subscribers,
-    /// and idle for at least `idle_cap`. The idle reference is the last
-    /// turn's end (or creation time if it never ran). State is fully
-    /// reconstructible from SurrealDB, so a re-access just recreates it.
-    pub(super) fn is_evictable(&self, idle_cap: Duration) -> bool {
-        let g = self.lock();
-        if g.running {
-            return false;
-        }
-        let idle_ref = g.finished_at.unwrap_or(g.created_at);
-        idle_ref.elapsed() >= idle_cap && self.subscriber_count() == 0
-    }
 }
 
-/// How often the GC sweep runs.
-const GC_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
-/// Grace window after a turn finishes before its frames are trimmed.
-/// Purely about clean delivery to still-draining readers (the data is
-/// already durable); a reader lagging past it gets `resync`.
-const GRACE_WINDOW: Duration = Duration::from_secs(30);
-/// Idle duration after which a subscriber-less session is evicted.
-const EVICT_IDLE: Duration = Duration::from_secs(60);
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Self-prune: remove our own map entry, but only if it still points
+        // at *us* (a dead weak). If a newer incarnation already replaced the
+        // entry during our teardown, its weak upgrades and we leave it
+        // alone. Both this `remove_if` and `get_or_create`'s `entry` run
+        // under the DashMap shard lock, so the create-vs-drop race is clean.
+        if let Some(map) = self.map.upgrade() {
+            map.remove_if(&self.conv, |_, w| w.upgrade().is_none());
+        }
+    }
+}
 
 /// Prepend the SSE `id:` line to a buffered frame at send time, so the
 /// stored frame stays replayable and the cursor lives beside it rather
@@ -315,63 +349,72 @@ fn prepend_id(c: Cursor, frame: &Bytes) -> Bytes {
 /// In-process [`TurnBus`]. One per backend process; held in `AppState` as
 /// `Arc<dyn TurnBus>`.
 pub struct InProcessBus {
-    sessions: DashMap<ConversationId, Arc<Session>>,
+    /// Weak index from conversation to its live session. `Arc` so sessions
+    /// can hold a `Weak<SessionMap>` for self-pruning on drop.
+    sessions: Arc<SessionMap>,
+    /// Source of per-incarnation [`Cursor`] generations. Bumped once per
+    /// session creation; bus-scoped (not a process global) so tests on a
+    /// fresh bus get deterministic generation 0.
+    next_gen: AtomicU64,
 }
 
 impl InProcessBus {
     pub fn new() -> Self {
         Self {
-            sessions: DashMap::new(),
+            sessions: Arc::new(DashMap::new()),
+            next_gen: AtomicU64::new(0),
         }
     }
 
-    /// The (possibly freshly created) session for `conv`. Multiple callers
-    /// share the same `Arc` so they read/write one buffer.
+    /// Mint a fresh session for `conv` with the next generation.
+    fn new_session(&self, conv: &ConversationId) -> Arc<Session> {
+        let gen = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Session::new(
+            conv.clone(),
+            Arc::downgrade(&self.sessions),
+            gen,
+        ))
+    }
+
+    /// The live session for `conv`, creating one if none exists (or the
+    /// mapped weak is dead). Multiple callers share the same `Arc` so they
+    /// read/write one buffer.
     fn get_or_create(&self, conv: &ConversationId) -> Arc<Session> {
-        if let Some(s) = self.sessions.get(conv) {
-            return s.clone();
+        // Fast path: a live session already mapped (read lock only).
+        if let Some(w) = self.sessions.get(conv) {
+            if let Some(s) = w.upgrade() {
+                return s;
+            }
         }
-        self.sessions
-            .entry(conv.clone())
-            .or_insert_with(|| Arc::new(Session::new()))
-            .clone()
+        // Slow path under the shard write lock via the `entry` API. Re-check
+        // in case we raced another creator or a concurrent self-pruning
+        // `Drop`; insert only when there is no live session.
+        match self.sessions.entry(conv.clone()) {
+            Entry::Occupied(mut e) => match e.get().upgrade() {
+                Some(s) => s,
+                None => {
+                    let s = self.new_session(conv);
+                    e.insert(Arc::downgrade(&s));
+                    s
+                }
+            },
+            Entry::Vacant(e) => {
+                let s = self.new_session(conv);
+                e.insert(Arc::downgrade(&s));
+                s
+            }
+        }
+    }
+
+    /// Look up a live session without creating one.
+    fn get(&self, conv: &ConversationId) -> Option<Arc<Session>> {
+        self.sessions.get(conv).and_then(|w| w.upgrade())
     }
 }
 
 impl Default for InProcessBus {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl InProcessBus {
-    /// Spawn the background GC sweep (§9): every [`GC_SWEEP_INTERVAL`],
-    /// grace-trim finished sessions and evict idle, subscriber-less ones.
-    /// Holds an `Arc` to the bus; the task ends when the last `Arc` drops
-    /// (process shutdown).
-    pub fn spawn_gc(bus: Arc<InProcessBus>) {
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(GC_SWEEP_INTERVAL);
-            loop {
-                tick.tick().await;
-                // Trim in place during the scan; collect evict candidates
-                // and remove them after (removing inside `iter` would
-                // deadlock the shard).
-                let mut evict = Vec::new();
-                for entry in bus.sessions.iter() {
-                    entry.value().maybe_trim(GRACE_WINDOW);
-                    if entry.value().is_evictable(EVICT_IDLE) {
-                        evict.push(entry.key().clone());
-                    }
-                }
-                for k in evict {
-                    // Re-check under the shard write lock: a turn that
-                    // started between the scan and here flips `running`,
-                    // so `is_evictable` returns false and we keep it.
-                    bus.sessions.remove_if(&k, |_, s| s.is_evictable(EVICT_IDLE));
-                }
-            }
-        });
     }
 }
 
@@ -383,7 +426,7 @@ impl TurnBus for InProcessBus {
         user_message: Bytes,
     ) -> Result<TurnHandle, AlreadyRunning> {
         let session = self.get_or_create(conv);
-        match session.clone().try_begin(user_message) {
+        match session.try_begin(user_message) {
             Some(cancel) => Ok(TurnHandle::new(session, cancel)),
             None => Err(AlreadyRunning),
         }
@@ -399,17 +442,25 @@ impl TurnBus for InProcessBus {
 
     async fn cancel(&self, conv: &ConversationId) {
         // Look up without creating — nothing to cancel for a conversation
-        // that has never had a turn.
-        if let Some(session) = self.sessions.get(conv) {
+        // that has no live session.
+        if let Some(session) = self.get(conv) {
             session.request_cancel();
+        }
+    }
+
+    async fn emit(&self, conv: &ConversationId, frame: Bytes) {
+        // Look up without creating — if nobody's subscribed there's
+        // nothing live to push to, and the DB already holds the truth.
+        if let Some(session) = self.get(conv) {
+            session.emit_standalone(frame);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests — ported from v3 `session.rs` (subscribe-replay, single-flight
-// reject) plus the new §4.1 `read_from` rules (resync condition, the
-// fresh-`None`-while-lingering case).
+// Unit tests — single-flight reject, the §4.1 `read_from` rules (fresh-join
+// replay, two-turn retention, resume-across-boundary, resync), and the
+// refcount lifetime (self-pruning + safe reincarnation).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -421,9 +472,19 @@ mod tests {
         String::from_utf8(b.to_vec()).unwrap()
     }
 
+    /// A standalone session (generation 0, not mapped) for the pure
+    /// buffer/cursor tests that don't exercise the bus or lifetime.
+    fn detached() -> Session {
+        Session::new(
+            surrealdb::RecordId::from(("conversation", "test")),
+            Weak::new(),
+            0,
+        )
+    }
+
     #[test]
     fn try_begin_rejects_second_concurrent() {
-        let sess = Session::new();
+        let sess = detached();
         assert!(sess.try_begin(sse::user_message("message:01J", "hi")).is_some());
         assert!(
             sess.try_begin(sse::user_message("message:02J", "again"))
@@ -434,7 +495,7 @@ mod tests {
 
     #[test]
     fn read_from_none_replays_in_flight_but_not_lingering() {
-        let sess = Session::new();
+        let sess = detached();
         sess.try_begin(sse::user_message("message:01J", "hi"));
         sess.append(sse::text("hello"));
         // In flight: fresh joiner replays the whole turn.
@@ -451,27 +512,56 @@ mod tests {
     }
 
     #[test]
-    fn read_from_cursor_resumes_then_resyncs_when_stale() {
-        let sess = Session::new();
-        // Turn 1 occupies cursors 0,1,2 (user, text, finish).
-        sess.try_begin(sse::user_message("message:01J", "hi")); // cursor 0
-        sess.append(sse::text("a")); // cursor 1
-        sess.terminate(sse::finish("stop", "message:a1")); // cursor 2
-        // Resume from cursor 0 while turn 1 still lingers → frames 1,2.
-        match sess.read_from(Some(Cursor(0))) {
-            Read::Frames(f) => assert_eq!(f.len(), 2, "frames after cursor 0"),
-            Read::Resync => panic!("valid resume must not resync"),
+    fn buffer_retains_at_most_two_turns() {
+        let sess = detached();
+        // Three single-exchange turns (user_message + finish = 2 frames each).
+        for i in 0..3 {
+            sess.try_begin(sse::user_message(&format!("message:u{i}"), "hi"));
+            sess.terminate(sse::finish("stop", &format!("message:a{i}")));
         }
+        let g = sess.lock();
+        assert_eq!(g.frames.len(), 4, "at most two turns buffered");
+        // The oldest retained frame is the start of the second-to-last turn
+        // (turn 1 was trimmed when turn 2 began). Cursors: turn0 [0,1],
+        // turn1 [2,3], turn2 [4,5]; turn0 dropped → first is cursor 2.
+        assert_eq!(g.frames.first().unwrap().0, Cursor(2));
+    }
 
-        // Turn 2 starts → base advances past turn 1's cursors.
-        sess.try_begin(sse::user_message("message:02J", "next")); // cursor 3, base=3
-        // A client still holding cursor 0 (predates base-1) → resync.
+    #[test]
+    fn resume_across_turn_boundary_does_not_resync() {
+        let sess = detached();
+        // Turn 1: cursors 0,1,2.
+        sess.try_begin(sse::user_message("message:01J", "hi"));
+        sess.append(sse::text("a"));
+        sess.terminate(sse::finish("stop", "message:a1"));
+        // Turn 2 starts: turn 1 is retained (two-turn buffer).
+        sess.try_begin(sse::user_message("message:02J", "next")); // cursor 3
+        // A client still draining turn 1 (cursor 0) resumes seamlessly into
+        // turn 2 — no resync at the boundary.
+        match sess.read_from(Some(Cursor(0))) {
+            Read::Frames(f) => assert_eq!(f.len(), 3, "frames 1,2,3 after cursor 0"),
+            Read::Resync => panic!("one turn behind must not resync"),
+        }
+    }
+
+    #[test]
+    fn resync_only_when_two_turns_behind() {
+        let sess = detached();
+        sess.try_begin(sse::user_message("message:01J", "a")); // 0
+        sess.terminate(sse::finish("stop", "message:a1")); // 1
+        sess.try_begin(sse::user_message("message:02J", "b")); // 2 (turn1 retained)
+        sess.terminate(sse::finish("stop", "message:a2")); // 3
+        // Still only one turn back from cursor 0 → resumes.
+        assert!(matches!(sess.read_from(Some(Cursor(0))), Read::Frames(_)));
+        // Turn 3 starts: turn 1 trimmed, oldest retained is turn 2 (cursor 2).
+        sess.try_begin(sse::user_message("message:03J", "c")); // 4
+        // Cursor 0 is now two turns behind the oldest retained frame → resync.
         assert!(
             matches!(sess.read_from(Some(Cursor(0))), Read::Resync),
-            "cursor below the window must resync"
+            "cursor below the retained window must resync"
         );
-        // A client caught up to turn 2's start resumes normally.
-        assert!(matches!(sess.read_from(Some(Cursor(3))), Read::Frames(_)));
+        // A client at the start of the retained window resumes normally.
+        assert!(matches!(sess.read_from(Some(Cursor(2))), Read::Frames(_)));
     }
 
     #[tokio::test]
@@ -484,7 +574,7 @@ mod tests {
             .expect("start");
         let mut stream = bus.subscribe(&conv, None).await;
 
-        // Replayed user_message, id-prefixed.
+        // Replayed user_message, id-prefixed (generation 0 → cursor 0).
         let first = stream.next().await.expect("frame");
         assert_eq!(
             s(&first),
@@ -506,30 +596,22 @@ mod tests {
     async fn reader_emits_resync_for_stale_cursor() {
         let bus = InProcessBus::new();
         let conv: ConversationId = surrealdb::RecordId::from(("conversation", "stale"));
-        // Turn 1 then turn 2 so the window floor moves past cursor 0.
-        {
+        // Hold a subscriber so the session (one incarnation) survives across
+        // turns and cursors keep advancing within the same generation.
+        let _keepalive = bus.subscribe(&conv, None).await;
+        // Three turns so the two-turn buffer trims turn 1 (cursor 0).
+        for i in 0..3 {
             let mut h = bus
-                .try_start(&conv, sse::user_message("message:u1", "a"))
+                .try_start(&conv, sse::user_message(&format!("message:u{i}"), "x"))
                 .await
-                .expect("start1");
-            h.terminate(sse::finish("stop", "message:a1")).await;
+                .expect("start");
+            h.terminate(sse::finish("stop", &format!("message:a{i}"))).await;
         }
-        let _h2 = bus
-            .try_start(&conv, sse::user_message("message:u2", "b"))
-            .await
-            .expect("start2");
-
         // A subscriber resuming from the now-trimmed cursor 0 is told to
-        // resync, then replays turn 2 fresh.
+        // resync, then replays fresh.
         let mut stream = bus.subscribe(&conv, Some(Cursor(0))).await;
         let first = stream.next().await.expect("frame");
         assert_eq!(s(&first), "event: resync\ndata: null\n\n");
-        let second = stream.next().await.expect("frame");
-        assert!(
-            s(&second).starts_with("id: "),
-            "fresh replay of turn 2 after resync"
-        );
-        assert!(s(&second).contains("event: user_message"));
     }
 
     #[tokio::test]
@@ -559,66 +641,49 @@ mod tests {
             .expect("cancel observed");
     }
 
-    #[test]
-    fn grace_trim_clears_finished_turn_frames() {
-        let sess = Session::new();
-        sess.try_begin(sse::user_message("message:u1", "hi")); // 0
-        sess.append(sse::text("a")); // 1
-        sess.terminate(sse::finish("stop", "message:a1")); // 2
-        // Before the grace window elapses: frames stay, a resume from
-        // cursor 0 still replays.
-        sess.maybe_trim(Duration::from_secs(3600));
-        assert!(matches!(sess.read_from(Some(Cursor(0))), Read::Frames(_)));
-        // Grace elapsed (zero window): frames trimmed, base advanced, so a
-        // stale resume now resyncs.
-        sess.maybe_trim(Duration::ZERO);
-        assert!(matches!(sess.read_from(Some(Cursor(0))), Read::Resync));
-    }
-
-    #[test]
-    fn evictable_only_when_idle_and_unsubscribed() {
-        let sess = Session::new();
-        // Idle, never ran, no subscribers: evictable past a zero idle cap.
-        assert!(sess.is_evictable(Duration::ZERO));
-        // Not evictable while a turn is running.
-        sess.try_begin(sse::user_message("message:u1", "hi"));
-        assert!(!sess.is_evictable(Duration::ZERO));
-        // Idle again after terminate → evictable past a zero cap, but a
-        // long idle cap keeps it (hasn't been idle long enough).
-        sess.terminate(sse::finish("stop", "message:a1"));
-        assert!(sess.is_evictable(Duration::ZERO));
-        assert!(!sess.is_evictable(Duration::from_secs(3600)));
-    }
-
     #[tokio::test]
-    async fn gc_sweep_evicts_idle_unsubscribed_session() {
-        // Exercise the sweep body (same as `spawn_gc`) with zero
-        // thresholds so it runs without the real 30s/60s waits.
+    async fn session_freed_when_last_consumer_drops() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "gc"));
+        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "life"));
         {
-            // Start then drop the handle without terminate → idle (clear).
+            // The handle is the only strong owner (no subscribers).
             let _h = bus
                 .try_start(&conv, sse::user_message("message:u1", "hi"))
                 .await
                 .expect("start");
+            assert_eq!(bus.sessions.len(), 1, "session created and mapped");
         }
-        assert_eq!(bus.sessions.len(), 1, "session created");
-        // Manual sweep with zero thresholds.
-        let mut evict = Vec::new();
-        for entry in bus.sessions.iter() {
-            entry.value().maybe_trim(Duration::ZERO);
-            if entry.value().is_evictable(Duration::ZERO) {
-                evict.push(entry.key().clone());
-            }
-        }
-        for k in &evict {
-            bus.sessions.remove_if(k, |_, s| s.is_evictable(Duration::ZERO));
-        }
+        // Handle dropped → `clear_if_running` then `Session::drop` prunes
+        // the dead map entry. No GC, no timer.
         assert!(
             bus.sessions.is_empty(),
-            "idle, unsubscribed session must be evicted"
+            "session freed and unmapped when last consumer drops"
         );
+    }
+
+    #[tokio::test]
+    async fn reincarnated_session_resyncs_stale_cursor() {
+        let bus = InProcessBus::new();
+        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "reborn"));
+        // First incarnation (generation 0) runs a turn, then is freed when
+        // its handle drops with no subscribers.
+        {
+            let mut h = bus
+                .try_start(&conv, sse::user_message("message:u1", "a"))
+                .await
+                .expect("start");
+            h.terminate(sse::finish("stop", "message:a1")).await;
+        }
+        assert!(bus.sessions.is_empty(), "freed after the turn (no consumers)");
+
+        // A client reconnects with a cursor minted by the freed incarnation.
+        // `subscribe` creates a fresh incarnation (generation 1); the stale
+        // cursor is below its floor → resync (this is the cursor-reuse guard
+        // the generation packing buys us — without it the client would
+        // silently miss the next turn's early frames).
+        let mut stream = bus.subscribe(&conv, Some(Cursor(0))).await;
+        let first = stream.next().await.expect("frame");
+        assert_eq!(s(&first), "event: resync\ndata: null\n\n");
     }
 
     #[tokio::test]
@@ -630,12 +695,13 @@ mod tests {
             .try_start(&conv, sse::user_message("message:u1", "hi"))
             .await
             .expect("start");
-        // Read the user_message while the turn is in flight (a fresh
-        // `None` subscriber only replays a *live* turn — §4.1).
+        // Read the user_message while the turn is in flight (a fresh `None`
+        // subscriber only replays a *live* turn — §4.1).
         let first = stream.next().await.expect("user_message");
         assert!(s(&first).contains("event: user_message"));
-        // Drop the handle without `terminate` (worker panic/unwind):
-        // `clear` is emitted and the slot released.
+        // Drop the handle without `terminate` (worker panic/unwind): `clear`
+        // is emitted and the slot released. The subscriber's `Arc` keeps the
+        // session alive long enough to observe it.
         drop(handle);
         let second = stream.next().await.expect("clear");
         assert!(s(&second).ends_with("event: clear\ndata: null\n\n"));

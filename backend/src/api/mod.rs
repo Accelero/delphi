@@ -129,11 +129,10 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     // Metadata autofill seam: NoopExtractor ships today; the Phase-3
     // LlmExtractor drops in here when an LLM provider is configured.
     let metadata_extractor: Arc<dyn MetadataExtractor> = Arc::new(NoopExtractor);
-    // In-process turn transport (Phase 1). Held as the concrete type so
-    // the GC sweeper can iterate its sessions, then stored as
-    // `Arc<dyn TurnBus>`.
+    // In-process turn transport (Phase 1). Sessions are refcounted by their
+    // consumers (reader streams + the worker handle) and self-prune on drop
+    // — no GC sweeper to spawn.
     let turn_bus = Arc::new(InProcessBus::new());
-    InProcessBus::spawn_gc(turn_bus.clone());
     let state = AppState {
         llm,
         turn_bus,

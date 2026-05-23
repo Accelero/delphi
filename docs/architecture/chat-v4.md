@@ -7,6 +7,12 @@ below describe the shipped Phase-1 shape; the
 [Phase-1 implementation plan](#phase-1-implementation-plan) is retained as
 the build record (all steps landed).
 
+> **Phase 1.5 (planned):** [`chat-v4-lifetime.md`](./chat-v4-lifetime.md)
+> refines the buffer/cursor rules (§4.1) and GC (§9) — refcount-based
+> session lifetime (no sweeper/grace/idle timers) and a bounded two-turn
+> buffer keyed by a single cursor (no turn-boundary `resync`). Where it
+> disagrees with §4.1/§9, that doc wins once implemented.
+
 > **For an implementing agent:** the design sections (1–9) give the model
 > and the *why*; the **[Phase-1 implementation plan](#phase-1-implementation-plan)**
 > at the bottom is the ordered, file-by-file work. Read the model first,

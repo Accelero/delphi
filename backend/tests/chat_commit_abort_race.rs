@@ -13,6 +13,7 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -20,9 +21,9 @@ use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use surrealdb::RecordId;
+use tokio::sync::Notify;
 
 use common::{AuthRequestBuilder, TestApp};
-use delphi::chat::Cursor;
 
 fn auth_post(uri: &str, body: Value) -> Request<Body> {
     AuthRequestBuilder::default().apply(
@@ -60,6 +61,32 @@ async fn late_stop_after_commit_keeps_rows_and_shows_finish_not_clear() {
     let key = key_of(body["id"].as_str().expect("id"));
     let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
 
+    // Subscribe BEFORE the turn and drain concurrently. Under refcount an
+    // unsubscribed session is freed the instant the worker's handle drops
+    // at `terminate`, so a *post-hoc* resume from cursor 0 would resync, not
+    // replay the finish (§4.1). A live subscriber — exactly what an open tab
+    // is — both holds the session alive and observes the wire as it happens,
+    // which is where the clear-XOR-finish guarantee must hold.
+    let stream = app.turn_bus.subscribe(&conv_id, None).await;
+    let acc = Arc::new(Mutex::new(String::new()));
+    let finish_seen = Arc::new(Notify::new());
+    let drain = {
+        let acc = acc.clone();
+        let finish_seen = finish_seen.clone();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            while let Some(b) = stream.next().await {
+                let mut g = acc.lock().unwrap();
+                g.push_str(&String::from_utf8_lossy(&b));
+                let seen = g.contains("event: finish");
+                drop(g);
+                if seen {
+                    finish_seen.notify_one();
+                }
+            }
+        })
+    };
+
     let res = app
         .send(auth_post(
             &format!("/api/chat/conversations/{key}/messages"),
@@ -72,38 +99,21 @@ async fn late_stop_after_commit_keeps_rows_and_shows_finish_not_clear() {
         .await;
     assert_eq!(res.status, StatusCode::ACCEPTED);
 
-    // Poll until the turn has committed both rows.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let res = app
-            .send(auth_get(&format!("/api/chat/conversations/{key}")))
-            .await;
-        let body: Value = res.json();
-        let msgs = body["messages"].as_array().cloned().unwrap_or_default();
-        if msgs.len() == 2 {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("turn never committed: {body:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // The worker emits `finish` only after committing both rows, so seeing
+    // it on the wire means the turn is fully committed.
+    tokio::time::timeout(Duration::from_secs(3), finish_seen.notified())
+        .await
+        .expect("turn must finish (and commit) on the wire");
 
-    // Late stop: the turn is done (token already cleared at `terminate`),
-    // so `cancel` is a structural no-op. This is the situation a `/stop`
-    // arriving a few ms after commit creates.
+    // Late stop after commit: the token was cleared at `terminate`, so
+    // `cancel` is a structural no-op. This is the situation a `/stop`
+    // arriving a few ms after commit creates — it must not append `clear`.
     app.turn_bus.cancel(&conv_id).await;
+    // Give any (forbidden) `clear` a window to surface on the live stream.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drain.abort();
 
-    // Resume from the turn's start (cursor 0): the lingering log must end
-    // in `finish`, with no `clear` anywhere — clear XOR finish (§8).
-    let c0: Cursor = "0".parse().expect("cursor");
-    let mut stream = app.turn_bus.subscribe(&conv_id, Some(c0)).await;
-    let mut acc = String::new();
-    while let Ok(Some(b)) =
-        tokio::time::timeout(Duration::from_millis(200), stream.next()).await
-    {
-        acc.push_str(&String::from_utf8_lossy(&b));
-    }
+    let acc = acc.lock().unwrap().clone();
     assert!(
         acc.contains("event: finish"),
         "committed turn must end in finish; got: {acc:?}"

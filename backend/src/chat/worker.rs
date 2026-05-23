@@ -35,7 +35,6 @@
 use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::StreamExt;
 use tracing::{error, info, warn};
@@ -50,7 +49,7 @@ use crate::storage::{
     RequestDbPool, Storage,
 };
 
-use super::bus::{TaskId, TurnHandle};
+use super::bus::{TaskId, TurnBus, TurnHandle};
 
 const DEFAULT_TOP_K: usize = 5;
 const DEFAULT_NEIGHBOR_RADIUS: i64 = 1;
@@ -93,6 +92,10 @@ pub struct TurnRequest {
     pub llm: Arc<dyn LlmClient>,
     pub chunk_embedder: Option<Arc<dyn Embedder>>,
     pub pool: RequestDbPool,
+    /// The turn transport, so the detached auto-title task can push a
+    /// `title` frame to live subscribers after `finish` (off the turn's
+    /// critical path).
+    pub turn_bus: Arc<dyn TurnBus>,
 }
 
 /// Spawn the worker. The POST handler has already claimed the turn via
@@ -263,41 +266,52 @@ async fn drive_turn(
 
     let assistant_id_str = assistant_id.to_string();
 
-    // First-turn auto-title: generate + persist BEFORE `finish`, reusing
-    // this worker's DB handle. Ordering is load-bearing — the client
-    // refetches the conversation list on `finish` (its `onTurnEnd`), so
-    // the rename must already be durable by then or the sidebar shows a
-    // stale "Untitled" with nothing to trigger a later refresh. Bounded +
-    // best-effort: a slow or failed title call can't hold the turn open or
-    // fail it. Only the first turn of a conversation pays this, and the
-    // response text has already streamed — only the `finish` (status →
-    // ready) is deferred, by at most `TITLE_GEN_TIMEOUT`.
-    if !conversation_had_title && !assistant_buf.is_empty() {
-        let title_fut = generate_title(req.llm.as_ref(), &req.user_text, &assistant_buf);
-        match tokio::time::timeout(TITLE_GEN_TIMEOUT, title_fut).await {
-            Ok(Some(title)) => {
-                if let Err(e) = db.rename_conversation(&req.conversation_id, &title).await {
-                    warn!(error = %e, "auto-title rename failed");
-                }
-            }
-            Ok(None) => {} // title-gen produced nothing — leave untitled
-            Err(_) => warn!(conv = %req.conversation_id, "auto-title timed out; leaving untitled"),
-        }
-    }
-
-    // Now terminate with `finish` — the trailing frame the client turns
-    // into its history+list refetch, which now reflects the new title.
+    // Emit `finish` immediately so the UI unblocks — the turn is complete
+    // and durable. The first-turn auto-title runs off this critical path.
     handle
         .terminate(sse::finish(stop_reason.wire(), &assistant_id_str))
         .await;
 
+    // First-turn auto-title, detached so it never blocks `finish`:
+    // generate the title, persist it (`rename`), then push a `title` frame
+    // to the conversation's live subscribers via the bus so open tabs
+    // refresh the sidebar without a refetch. The rename is the durable
+    // source of truth (reload shows it regardless); the push is a
+    // best-effort, idempotent live update. Only a conversation's first
+    // turn pays this.
+    if !conversation_had_title && !assistant_buf.is_empty() {
+        let pool = req.pool.clone();
+        let bearer = req.bearer.clone();
+        let conv = req.conversation_id.clone();
+        let llm = req.llm.clone();
+        let bus = req.turn_bus.clone();
+        let user_msg = req.user_text.clone();
+        let assistant_msg = assistant_buf.clone();
+        tokio::spawn(async move {
+            let title = match generate_title(llm.as_ref(), &user_msg, &assistant_msg).await {
+                Some(t) => t,
+                None => return,
+            };
+            // Title task acquires its own AuthedDb; same JWT, same session
+            // contract. Best-effort — log on failure, no retry.
+            let db = match pool.acquire(&bearer).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(error = %e, "title task pool acquire failed");
+                    return;
+                }
+            };
+            if let Err(e) = db.rename_conversation(&conv, &title).await {
+                warn!(error = %e, "auto-title rename failed");
+                return;
+            }
+            // Push the new title to any connected tabs (no-op if none).
+            bus.emit(&conv, sse::title(&title)).await;
+        });
+    }
+
     Ok(())
 }
-
-/// Upper bound on the first-turn auto-title LLM call before we give up and
-/// emit `finish` untitled. Title generation is typically sub-second on a
-/// flash-class model; this only guards a pathological hang.
-const TITLE_GEN_TIMEOUT: Duration = Duration::from_secs(8);
 
 // ---------------------------------------------------------------------------
 // helpers — copied near-verbatim from the previous worker
@@ -534,5 +548,6 @@ pub fn turn_request(
         llm: app.llm.clone(),
         chunk_embedder: app.chunk_embedder.clone(),
         pool: app.request_db_pool.clone(),
+        turn_bus: app.turn_bus.clone(),
     }
 }

@@ -88,6 +88,18 @@ pub fn clear() -> Bytes {
     frame("clear", "null")
 }
 
+/// Title update (v4). Pushed to a conversation's live subscribers after a
+/// first-turn auto-title is generated and persisted, so open tabs refresh
+/// the sidebar without a refetch. Delivered **out of turn** (via
+/// `TurnBus::emit`, after the turn's `finish`), so it is not part of any
+/// turn's persisted messages. Idempotent on the client — a tab that
+/// already loaded the title from the DB just re-applies the same value.
+/// Payload is the JSON-encoded title string.
+pub fn title(t: &str) -> Bytes {
+    let body = serde_json::to_string(t).unwrap_or_else(|_| "\"\"".into());
+    frame("title", &body)
+}
+
 /// Resync control frame (v4). Tells a client whose cursor fell out of the
 /// in-memory window (a turn committed while it was disconnected) to
 /// re-read committed history from SurrealDB and keep streaming. The
@@ -166,6 +178,19 @@ mod tests {
     #[test]
     fn resync_snapshot() {
         assert_eq!(as_str(&resync()), "event: resync\ndata: null\n\n");
+    }
+
+    #[test]
+    fn title_snapshot() {
+        assert_eq!(
+            as_str(&title("Capital of France")),
+            "event: title\ndata: \"Capital of France\"\n\n"
+        );
+        // JSON-escaped so control chars / quotes round-trip via JSON.parse.
+        assert_eq!(
+            as_str(&title("a \"quoted\" title")),
+            "event: title\ndata: \"a \\\"quoted\\\" title\"\n\n"
+        );
     }
 
     #[test]

@@ -60,6 +60,10 @@ export type UseChatStreamOptions = {
    *  callback is expected to create a conversation, send the first
    *  message, and navigate to it. */
   onDraftSubmit?: (text: string) => void | Promise<void>;
+  /** Called when the server pushes a `title` frame (first-turn
+   *  auto-title, delivered out of turn after `finish`). Callers patch the
+   *  sidebar/conversation caches. Idempotent. */
+  onTitle?: (title: string) => void;
 };
 
 export type UseChatStreamReturn = {
@@ -90,7 +94,7 @@ export function useChatStream(
   conversationKey: string | undefined,
   opts: UseChatStreamOptions = {},
 ): UseChatStreamReturn {
-  const { initialMessages = [], onTurnEnd, onDraftSubmit } = opts;
+  const { initialMessages = [], onTurnEnd, onDraftSubmit, onTitle } = opts;
   const [messages, setMessages] = useState<LocalMessage[]>(initialMessages);
   const [status, setStatus] = useState<StreamStatus>("ready");
   const [citations, setCitations] = useState<CitationEntry[]>([]);
@@ -129,6 +133,11 @@ export function useChatStream(
   useEffect(() => {
     onDraftSubmitRef.current = onDraftSubmit;
   }, [onDraftSubmit]);
+
+  const onTitleRef = useRef(onTitle);
+  useEffect(() => {
+    onTitleRef.current = onTitle;
+  }, [onTitle]);
 
   const statusRef = useRef(status);
   useEffect(() => {
@@ -196,6 +205,20 @@ export function useChatStream(
       setMessages((prev) => prev.filter((m) => m.id !== STREAMING_ASSISTANT_ID));
       setStatus("ready");
       onTurnEndRef.current?.();
+    });
+
+    es.addEventListener("title", (ev: MessageEvent) => {
+      // Out-of-turn first-turn auto-title push. Idempotent: just hand the
+      // new title to the caller to patch its caches.
+      let title: unknown;
+      try {
+        title = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (typeof title === "string" && title.length > 0) {
+        onTitleRef.current?.(title);
+      }
     });
 
     es.addEventListener("user_message", (ev: MessageEvent) => {

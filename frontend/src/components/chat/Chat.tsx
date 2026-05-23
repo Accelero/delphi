@@ -38,6 +38,11 @@ import {
   useChatStream,
   type LocalMessage,
 } from "@/hooks/useChatStream";
+import {
+  conversationKey,
+  type Conversation,
+  type ConversationWithMessages,
+} from "@/lib/api";
 
 import {
   Message,
@@ -171,6 +176,29 @@ export function Chat({
     }
   }, [queryClient, sessionKey]);
 
+  // Out-of-turn `title` push (first-turn auto-title). Patch the sidebar
+  // list + per-conversation caches in place — snappier than a refetch,
+  // and idempotent (re-applying the same title is harmless). The push
+  // lands after the rename is durable, so it's the authoritative value.
+  const onTitle = useCallback(
+    (title: string) => {
+      if (!sessionKey) return;
+      queryClient.setQueryData<Conversation[]>(conversationsKey, (old) =>
+        old?.map((c) =>
+          conversationKey(c.id) === sessionKey ? { ...c, title } : c,
+        ),
+      );
+      queryClient.setQueryData<ConversationWithMessages>(
+        conversationKeyFor(sessionKey),
+        (old) =>
+          old
+            ? { ...old, conversation: { ...old.conversation, title } }
+            : old,
+      );
+    },
+    [queryClient, sessionKey],
+  );
+
   const seed: LocalMessage[] = useMemo(
     () =>
       (initialMessages ?? [])
@@ -197,6 +225,7 @@ export function Chat({
     initialMessages: seed,
     onTurnEnd,
     onDraftSubmit,
+    onTitle,
   });
 
   const status: ChatStatus =

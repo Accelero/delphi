@@ -286,6 +286,18 @@ describe("useChatStream", () => {
     });
   });
 
+  it("title event invokes onTitle with the pushed title", () => {
+    const onTitle = vi.fn();
+    renderHook(() => useChatStream("k", { onTitle }));
+    const es = lastEs();
+    act(() => es.emit("title", "Capital of France"));
+    expect(onTitle).toHaveBeenCalledWith("Capital of France");
+    // Empty/garbage titles are ignored.
+    onTitle.mockClear();
+    act(() => es.emit("title", ""));
+    expect(onTitle).not.toHaveBeenCalled();
+  });
+
   it("named error event sets status=error and error message", () => {
     const { result } = renderHook(() => useChatStream("k"));
     const es = lastEs();

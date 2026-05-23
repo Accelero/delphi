@@ -37,14 +37,33 @@ use super::inprocess::Session;
 /// decimal; under Redis (Phase 2) it becomes the stream entry id. Code
 /// outside the `chat` module treats it as opaque — parse from / format to
 /// the wire string, never interpret. The `u64` payload is `pub(crate)` so
-/// the in-process buffer can do the `c + 1 >= base` window arithmetic
+/// the in-process buffer can do the `c + 1 >= floor` window arithmetic
 /// (§4.1); a future multi-impl world would hide that behind the impl.
+///
+/// Internally the `u64` packs a **generation** (high bits) and a
+/// **sequence** (low bits). Each session *incarnation* owns a fresh
+/// generation minted by the bus; sequences run contiguously within it. A
+/// later incarnation has a higher generation, hence numerically higher
+/// cursors than any earlier one — so a stale `Last-Event-Id` from a
+/// freed-and-reincarnated session (refcount lifetime can free a session
+/// between a sole tab's blip and its reconnect) falls below the live
+/// buffer's floor and the ordinary `c + 1 >= floor` check resyncs it, with
+/// no generation-aware branching. This is what keeps "cursors never reset"
+/// true under refcount; under Redis the never-reused stream entry id plays
+/// the same role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Cursor(pub(crate) u64);
 
 impl Cursor {
-    /// The cursor a brand-new session starts at, before its first frame.
-    pub(crate) const ZERO: Cursor = Cursor(0);
+    /// Sequence bits (low); the generation occupies the high bits.
+    pub(crate) const SEQ_BITS: u32 = 32;
+
+    /// The first cursor (sequence 0) of generation `gen`. The bus seeds a
+    /// new session incarnation's cursor space with this; `next` walks the
+    /// sequence within the generation.
+    pub(crate) fn generation(gen: u64) -> Cursor {
+        Cursor(gen << Self::SEQ_BITS)
+    }
 
     pub(crate) fn get(self) -> u64 {
         self.0
@@ -102,6 +121,15 @@ pub trait TurnBus: Send + Sync {
     /// The worker (sole writer) turns the flipped token into a `clear`
     /// frame; `cancel` itself emits nothing.
     async fn cancel(&self, conv: &ConversationId);
+
+    /// Deliver a one-off frame to a conversation's *current* subscribers,
+    /// outside any turn — e.g. a late `title` update pushed after the
+    /// turn's `finish`. Live-only by design: durable state (the renamed
+    /// conversation) is the source of truth on reload, so this is a
+    /// best-effort push to connected tabs and a no-op when none are
+    /// subscribed. Clients handle it idempotently. Maps to a Redis `XADD`
+    /// in Phase 2 — same seam.
+    async fn emit(&self, conv: &ConversationId, frame: Bytes);
 }
 
 /// Handle to the single in-flight turn, held by the worker. The worker is
