@@ -111,6 +111,17 @@ services:
       DELPHI_EMBEDDER_DOCUMENT_ENABLED: ${DELPHI_EMBEDDER_DOCUMENT_ENABLED:-true}
       DELPHI_EMBEDDER_DOCUMENT_ENDPOINT: ${DELPHI_EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
       DELPHI_EMBEDDER_DOCUMENT_MODEL: ${DELPHI_EMBEDDER_DOCUMENT_MODEL:-specter2}
+      # First-turn chat-title generation. Unlike the chat provider above,
+      # this block ships working defaults pointing at the bundled `title-llm`
+      # sidecar (a local OpenAI-compatible llama.cpp server) — the title
+      # model has one correct default, so the feature is "default to the
+      # sidecar." Set DELPHI_TITLE_ENABLED=false to reuse the chat model
+      # instead (e.g. for a leaner dev loop). See docs/architecture/title-llm.md.
+      DELPHI_TITLE_ENABLED: ${DELPHI_TITLE_ENABLED:-true}
+      DELPHI_TITLE_PROVIDER: ${DELPHI_TITLE_PROVIDER:-openai}
+      DELPHI_TITLE_BASE_URL: ${DELPHI_TITLE_BASE_URL:-http://title-llm:80/v1}
+      DELPHI_TITLE_MODEL: ${DELPHI_TITLE_MODEL:-Qwen2.5-0.5B-Instruct}
+      DELPHI_TITLE_API_KEY: ${DELPHI_TITLE_API_KEY:-sk-noauth}
     ports:
       - "8081:8081"
     depends_on:
@@ -121,6 +132,8 @@ services:
       tei-chunk:
         condition: service_started
       tei-paper:
+        condition: service_started
+      title-llm:
         condition: service_started
 
   # MinIO: S3-compatible object store for direct-to-S3 ingestion uploads.
@@ -192,6 +205,31 @@ services:
     ports:
       - "8083:80"
 
+  # Title-generation sidecar: a small CPU LLM behind an OpenAI-compatible
+  # `/v1` API (llama.cpp server). `-hf` auto-downloads the GGUF on first
+  # boot into the model-cache volume — same shape as the TEI embedders.
+  # The backend titles chats against this instead of the chat model
+  # (data-locality + decoupling; see docs/architecture/title-llm.md).
+  title-llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: delphi-title-llm
+    command:
+      - "-hf"
+      - "Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "80"
+      - "--ctx-size"
+      - "4096"
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - title_llm_models:/models
+    ports:
+      # Tier 1 exposes the sidecar for curl debugging; tier 2 doesn't.
+      - "8084:80"
+
   # Vite dev server with HMR. Mounts ./frontend so edits are live.
   frontend:
     image: oven/bun:1.3
@@ -214,3 +252,4 @@ volumes:
   frontend_node_modules:
   tei_chunk_data:
   tei_paper_data:
+  title_llm_models:

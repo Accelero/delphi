@@ -25,6 +25,11 @@ use crate::text_extractor::TextExtractor;
 #[derive(Clone)]
 pub struct AppState {
     pub llm: Arc<dyn LlmClient>,
+    /// Cheap, usually-local client for first-turn title generation.
+    /// Defaults to the bundled title sidecar; equals `llm` when titles are
+    /// configured to reuse the chat model (`DELPHI_TITLE_ENABLED=false`).
+    /// See `docs/architecture/title-llm.md`.
+    pub title_llm: Arc<dyn LlmClient>,
     /// Per-conversation turn transport (v4). Owns the single-flight slot,
     /// the ordered SSE delta log (replay + live fan-out), and cancel
     /// delivery, behind one trait so the in-memory impl swaps for a

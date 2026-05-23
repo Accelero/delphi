@@ -90,6 +90,10 @@ pub struct TurnRequest {
     /// Caller identity, snapshotted from the request. Kept for tracing.
     pub auth: AuthContext,
     pub llm: Arc<dyn LlmClient>,
+    /// Cheap client for the detached first-turn auto-title. Defaults to the
+    /// title sidecar; equals `llm` when titles reuse the chat model. See
+    /// `docs/architecture/title-llm.md`.
+    pub title_llm: Arc<dyn LlmClient>,
     pub chunk_embedder: Option<Arc<dyn Embedder>>,
     pub pool: RequestDbPool,
     /// The turn transport, so the detached auto-title task can push a
@@ -283,7 +287,7 @@ async fn drive_turn(
         let pool = req.pool.clone();
         let bearer = req.bearer.clone();
         let conv = req.conversation_id.clone();
-        let llm = req.llm.clone();
+        let llm = req.title_llm.clone();
         let bus = req.turn_bus.clone();
         let user_msg = req.user_text.clone();
         let assistant_msg = assistant_buf.clone();
@@ -546,6 +550,7 @@ pub fn turn_request(
         bearer,
         auth,
         llm: app.llm.clone(),
+        title_llm: app.title_llm.clone(),
         chunk_embedder: app.chunk_embedder.clone(),
         pool: app.request_db_pool.clone(),
         turn_bus: app.turn_bus.clone(),

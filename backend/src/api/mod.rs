@@ -31,7 +31,7 @@ use crate::filter::{IngestFilter, NoopFilter};
 use crate::ingestion::{
     self, MetadataExtractor, NoopExtractor, UploadsConfig, DEFAULT_BROADCAST_CAPACITY,
 };
-use crate::llm::llm_from_env;
+use crate::llm::{llm_from_env, title_llm_from_env};
 use crate::object_store::{self, AccessMinter, ObjectStore};
 use crate::sources::{self, IngestApiClient};
 use crate::state::AppState;
@@ -66,6 +66,10 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         .context("defining JWT access on startup")?;
 
     let llm = llm_from_env().context("constructing llm client")?;
+    // First-turn title generation. Defaults to the bundled sidecar; with
+    // DELPHI_TITLE_ENABLED=false this returns `llm` so titling reuses the
+    // chat model. See docs/architecture/title-llm.md.
+    let title_llm = title_llm_from_env(&llm).context("constructing title llm client")?;
 
     // Resolve the default tenant once at startup so the per-request hot
     // path doesn't re-resolve it. Dev mode also seeds its tenant + user
@@ -135,6 +139,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     let turn_bus = Arc::new(InProcessBus::new());
     let state = AppState {
         llm,
+        title_llm,
         turn_bus,
         request_db_pool: request_pool.clone(),
         object_store: object_store.clone(),

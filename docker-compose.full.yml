@@ -170,6 +170,17 @@ services:
       DELPHI_EMBEDDER_DOCUMENT_ENABLED: ${DELPHI_EMBEDDER_DOCUMENT_ENABLED:-true}
       DELPHI_EMBEDDER_DOCUMENT_ENDPOINT: ${DELPHI_EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
       DELPHI_EMBEDDER_DOCUMENT_MODEL: ${DELPHI_EMBEDDER_DOCUMENT_MODEL:-specter2}
+      # First-turn chat-title generation. Defaults point at the bundled
+      # `title-llm` sidecar (local OpenAI-compatible llama.cpp server); the
+      # title model has one correct default, so this block ships working
+      # defaults rather than failing closed like the chat provider above.
+      # DELPHI_TITLE_ENABLED=false reuses the chat model. See
+      # docs/architecture/title-llm.md.
+      DELPHI_TITLE_ENABLED: ${DELPHI_TITLE_ENABLED:-true}
+      DELPHI_TITLE_PROVIDER: ${DELPHI_TITLE_PROVIDER:-openai}
+      DELPHI_TITLE_BASE_URL: ${DELPHI_TITLE_BASE_URL:-http://title-llm:80/v1}
+      DELPHI_TITLE_MODEL: ${DELPHI_TITLE_MODEL:-Qwen2.5-0.5B-Instruct}
+      DELPHI_TITLE_API_KEY: ${DELPHI_TITLE_API_KEY:-sk-noauth}
       # Direct-to-storage object access (ingestion v2 + download). Backend
       # → MinIO over the docker network (INTERNAL); presigned upload/download
       # URLs carry the browser-facing host (PUBLIC = MinIO's published
@@ -191,6 +202,8 @@ services:
       tei-chunk:
         condition: service_started
       tei-paper:
+        condition: service_started
+      title-llm:
         condition: service_started
 
   # MinIO: S3-compatible object store for direct-to-storage object access.
@@ -253,6 +266,26 @@ services:
     volumes:
       - tei_paper_data_full:/data
 
+  # Title-generation sidecar (see docs/architecture/title-llm.md). Same as
+  # Tier 1 but internal-only — no published port, matching how Tier 2 hides
+  # the TEI containers behind the docker network.
+  title-llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: delphi-full-title-llm
+    command:
+      - "-hf"
+      - "Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "80"
+      - "--ctx-size"
+      - "4096"
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - title_llm_models_full:/models
+
   # Prod-shape frontend: production bundle baked into a Caddy image,
   # not the Vite dev server. Tier-2 is meant to mirror prod end-to-end;
   # serving HMR'd dev sources here would defeat the purpose. Tier-1
@@ -273,3 +306,4 @@ volumes:
   minio_data_full:
   tei_chunk_data_full:
   tei_paper_data_full:
+  title_llm_models_full:
