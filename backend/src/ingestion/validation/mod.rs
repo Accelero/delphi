@@ -17,7 +17,7 @@ pub mod metadata;
 pub mod object;
 
 pub use metadata::{
-    validate_descriptive_metadata, validate_ingestion_metadata, CreateUploadRequest,
-    DescriptiveView, MetadataField, MetadataPolicy, MetadataReject,
+    sanitize_authors, sanitize_text, validate_descriptive_metadata, validate_ingestion_metadata,
+    CreateUploadRequest, DescriptiveView, MetadataField, MetadataPolicy, MetadataReject,
 };
 pub use object::{validate_uploaded_object, ObjectPolicy, ObjectReject, ValidatedAttrs};

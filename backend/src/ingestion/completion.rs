@@ -23,8 +23,8 @@ use super::autofill::{
 };
 use super::text_extract::extract_text;
 use super::validation::{
-    validate_descriptive_metadata, validate_uploaded_object, DescriptiveView, MetadataPolicy,
-    ObjectPolicy, ObjectReject, ValidatedAttrs,
+    sanitize_authors, sanitize_text, validate_descriptive_metadata, validate_uploaded_object,
+    DescriptiveView, MetadataPolicy, ObjectPolicy, ObjectReject, ValidatedAttrs,
 };
 
 /// Everything the ordered stages need. Carries **both** DB handles:
@@ -151,6 +151,13 @@ pub async fn run_completion(ctx: &CompletionCtx<'_>) -> Result<DocId, Completion
     // 8. Merge: prefill wins; unset optional fields stay unset.
     let merged = merge_metadata(ctx.prefill, &autofilled);
 
+    // 8b. Sanitize the descriptive strings **in place** before they're
+    //     persisted, logged, or rendered: strip C0/C1 control chars and
+    //     Unicode bidi overrides (Trojan Source), cap lengths + author
+    //     count. Sanitize-not-reject — a stray character must never fail a
+    //     good upload. XSS is handled at render time in the SPA, not here.
+    let merged = sanitize_merged(merged, ctx.policy);
+
     // 9. Final gate: app-required fields present + shape valid.
     {
         let view = DescriptiveView {
@@ -216,6 +223,26 @@ async fn commit(
         }
         Err(e) => Err(CompletionError::CommitFailed(e.to_string())),
     }
+}
+
+/// Clean the merged descriptive strings in place (strip control/bidi
+/// chars, cap lengths + author count). The `extra` blob is already
+/// depth/size-bounded by `validate_descriptive_metadata` and is left as-is.
+fn sanitize_merged(mut m: MergedMetadata, policy: &MetadataPolicy) -> MergedMetadata {
+    m.title = m
+        .title
+        .map(|t| sanitize_text(&t, policy.max_title_chars))
+        .filter(|t| !t.is_empty());
+    m.summary = m
+        .summary
+        .map(|s| sanitize_text(&s, policy.max_summary_chars))
+        .filter(|s| !s.is_empty());
+    m.language = m
+        .language
+        .map(|l| sanitize_text(&l, 32))
+        .filter(|l| !l.is_empty());
+    m.authors = sanitize_authors(&m.authors, policy.max_authors, policy.max_author_chars);
+    m
 }
 
 /// Surreal's `metadata` column is `FLEXIBLE TYPE object`; coerce non-object

@@ -105,7 +105,6 @@ async fn create_upload_403_when_role_missing() {
 
 
 #[tokio::test]
-#[ignore = "TEMP: metadata validator bypassed for plumbing test; re-enable with the validator"]
 async fn create_upload_400_when_forbidden_field_present() {
     let app = TestApp::build_with_mem().await;
     // tenant_id from the client must be rejected.
@@ -449,7 +448,6 @@ async fn manual_upload_to_commit(app: &TestApp, body: &str) -> String {
 }
 
 #[tokio::test]
-#[ignore = "TEMP: object validator bypassed → no type sniff → text extraction empty; re-enable with the validator"]
 async fn manual_upload_without_canonical_id_commits() {
     // The B1/B2 landmine: a manual upload sends no canonical_id, so the
     // document row is written with canonical_id = NONE.
@@ -503,5 +501,151 @@ async fn get_status_returns_ready_after_commit() {
     assert_eq!(
         body["doc_id"].as_str().unwrap(),
         format!("document:{doc_id}")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Validator coverage (security-critical) — every check in
+// `validate_ingestion_metadata`, exercised through the real create endpoint
+// so the handler→validator→status-code wiring is verified, not just the pure
+// function (which `validation::metadata::tests` covers directly).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn validator_rejects_malformed_metadata_matrix() {
+    let app = TestApp::build().await;
+
+    // Pre-built dynamic payloads.
+    let oversize = 200u64 * 1024 * 1024 + 1; // > max_size_bytes (200 MiB)
+    let long_title = "x".repeat(1025); // > max_title_chars (1024)
+    let huge_blob = "x".repeat(100 * 1024); // > max_metadata_bytes (64 KiB)
+    let mut deep = json!("leaf"); // > max_metadata_depth (8)
+    for _ in 0..20 {
+        deep = json!({ "n": deep });
+    }
+
+    // (description, request body, expected status)
+    let cases: Vec<(&str, Value, StatusCode)> = vec![
+        // ---- forbidden server-derived fields → 400 ----
+        ("forbidden tenant_id", json!({ "size": 1024, "tenant_id": "evil" }), StatusCode::BAD_REQUEST),
+        ("forbidden user_id", json!({ "size": 1024, "user_id": "evil" }), StatusCode::BAD_REQUEST),
+        ("forbidden storage_uri", json!({ "size": 1024, "storage_uri": "s3://evil/k" }), StatusCode::BAD_REQUEST),
+        ("forbidden key", json!({ "size": 1024, "key": "tenants/evil/k" }), StatusCode::BAD_REQUEST),
+        ("forbidden upload_id", json!({ "size": 1024, "upload_id": "mpu-evil" }), StatusCode::BAD_REQUEST),
+        // ---- shape → 400 ----
+        ("empty source_type", json!({ "size": 1024, "source_type": "" }), StatusCode::BAD_REQUEST),
+        ("bad canonical_id pattern", json!({ "size": 1024, "canonical_id": "no-colon-form" }), StatusCode::BAD_REQUEST),
+        ("empty canonical_id", json!({ "size": 1024, "canonical_id": "" }), StatusCode::BAD_REQUEST),
+        ("javascript: source_uri", json!({ "size": 1024, "source_uri": "javascript:alert(1)" }), StatusCode::BAD_REQUEST),
+        ("data: source_uri", json!({ "size": 1024, "source_uri": "data:text/html,<script>" }), StatusCode::BAD_REQUEST),
+        ("relative source_uri", json!({ "size": 1024, "source_uri": "/etc/passwd" }), StatusCode::BAD_REQUEST),
+        ("title too long", json!({ "size": 1024, "title": long_title }), StatusCode::BAD_REQUEST),
+        // ---- resource / size limits → 413 ----
+        ("zero size", json!({ "size": 0 }), StatusCode::PAYLOAD_TOO_LARGE),
+        ("oversize file", json!({ "size": oversize }), StatusCode::PAYLOAD_TOO_LARGE),
+        ("metadata too deep", json!({ "size": 1024, "metadata": deep }), StatusCode::PAYLOAD_TOO_LARGE),
+        ("metadata too large", json!({ "size": 1024, "metadata": { "blob": huge_blob } }), StatusCode::PAYLOAD_TOO_LARGE),
+    ];
+
+    for (desc, body, expected) in cases {
+        let req = auth_post(
+            "/api/ingestion/uploads",
+            Body::from(body.to_string()),
+            "ingester",
+        );
+        let res = app.send(req).await;
+        assert_eq!(
+            res.status, expected,
+            "case '{desc}': expected {expected}, got {} — body {:?}",
+            res.status,
+            res.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn validator_accepts_good_samples() {
+    let app = TestApp::build().await;
+
+    // Minimal manual upload (the shape the SPA sends): content_type + size.
+    let minimal = json!({ "content_type": "application/pdf", "size": 4096 });
+    // Fully-specified natural-source write: valid canonical_id + http source.
+    let full = json!({
+        "canonical_id": "arxiv:2501.00001",
+        "source_type": "arxiv",
+        "source_uri": "https://arxiv.org/abs/2501.00001",
+        "title": "A perfectly valid title",
+        "size": 8192,
+        "metadata": { "venue": "NeurIPS" }
+    });
+
+    for (desc, body) in [("minimal manual", minimal), ("full valid", full)] {
+        let req = auth_post(
+            "/api/ingestion/uploads",
+            Body::from(body.to_string()),
+            "ingester",
+        );
+        let res = app.send(req).await;
+        assert_eq!(
+            res.status,
+            StatusCode::OK,
+            "good sample '{desc}' should pass — body {:?}",
+            res.text()
+        );
+    }
+}
+
+#[tokio::test]
+async fn commit_sanitizes_control_and_bidi_in_title() {
+    // A title with a NUL + a bidi-override is within the length cap, so it
+    // passes the create gate (length-only) and must be cleaned in place at
+    // /complete — not rejected — before it's persisted (Trojan Source guard).
+    let app = TestApp::build_with_mem().await;
+    let body = "document body text";
+    let create = json!({
+        "content_type": "text/plain",
+        "size": body.len(),
+        "title": "Clean\u{0000}\u{202E}Title"
+    });
+    let res = app
+        .send(auth_post(
+            "/api/ingestion/uploads",
+            Body::from(create.to_string()),
+            "ingester",
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "create: {:?}", res.text());
+    let created: Value = res.json();
+    let doc_id = created["doc_id"].as_str().unwrap().to_string();
+    let upload_id = created["upload_id"].as_str().unwrap().to_string();
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let etag = app
+        .object_store
+        .upload_part_direct(&key, &upload_id, 1, bytes::Bytes::copy_from_slice(body.as_bytes()))
+        .await
+        .unwrap();
+    let complete = Body::from(json!({ "parts": [{ "part_number": 1, "etag": etag }] }).to_string());
+    let res = app
+        .send(auth_post(
+            &format!("/api/ingestion/uploads/{doc_id}/complete"),
+            complete,
+            "ingester",
+        ))
+        .await;
+    assert_eq!(res.status, StatusCode::OK, "complete: {:?}", res.text());
+
+    let storage = app.system.storage_for(app.default_tenant_id.clone());
+    use delphi::storage::Storage as _;
+    let rid = surrealdb::RecordId::from(("document", doc_id.as_str()));
+    let doc = storage
+        .get_document(&rid)
+        .await
+        .unwrap()
+        .expect("document committed");
+    assert_eq!(
+        doc.title.as_deref(),
+        Some("CleanTitle"),
+        "NUL + bidi-override must be stripped from the persisted title"
     );
 }

@@ -33,7 +33,8 @@ use crate::storage::{AuthedDb, CreateUploadSessionParams, IngestionRejection, St
 use super::autofill::DocumentPrefill;
 use super::completion::{run_completion, CompletionCtx, CompletionError};
 use super::validation::{
-    CreateUploadRequest, MetadataField, MetadataPolicy, ObjectPolicy, ObjectReject,
+    validate_ingestion_metadata, CreateUploadRequest, MetadataField, MetadataPolicy,
+    MetadataReject, ObjectPolicy, ObjectReject,
 };
 
 /// Per-process ingestion-v2 runtime config. Constructed once at boot,
@@ -238,6 +239,17 @@ fn key_for(tenant_slug: &str, doc_id: &str) -> String {
 // 1. POST /api/ingestion/uploads
 // ============================================================================
 
+/// Map a metadata rejection to an HTTP status: resource/size limits → 413,
+/// everything else (shape, forbidden fields) → 400.
+fn metadata_reject_status(rej: &MetadataReject) -> StatusCode {
+    match rej {
+        MetadataReject::SizeExceedsLimit
+        | MetadataReject::MetadataTooLarge
+        | MetadataReject::MetadataTooDeep => StatusCode::PAYLOAD_TOO_LARGE,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
 pub async fn create_upload(
     State(state): State<AppState>,
     Extension(db): Extension<Arc<AuthedDb>>,
@@ -247,12 +259,15 @@ pub async fn create_upload(
     if let Some(resp) = require_ingester(&auth) {
         return resp;
     }
-    // TEMP (plumbing test): metadata validator bypassed — default pass.
-    // Re-enable by restoring:
-    //   if let Err(rej) = validate_ingestion_metadata(&req, &state.uploads_config.metadata_policy) {
-    //       let code = metadata_reject_status(&rej);
-    //       return (code, Json(serde_json::json!({ "error": format!("{rej:?}") }))).into_response();
-    //   }
+    // Layer-1 request gate: forbidden server-derived fields, file size,
+    // canonical_id / source_uri shape, and the M8 metadata depth/size caps.
+    // Pure + property-tested (validation::metadata). Descriptive text
+    // (title/authors/summary) is sanitized in place later at /complete, not
+    // rejected here.
+    if let Err(rej) = validate_ingestion_metadata(&req, &state.uploads_config.metadata_policy) {
+        let code = metadata_reject_status(&rej);
+        return (code, Json(serde_json::json!({ "error": format!("{rej:?}") }))).into_response();
+    }
 
     let tenant_slug = match db.resolve_tenant_slug().await {
         Ok(s) => s,

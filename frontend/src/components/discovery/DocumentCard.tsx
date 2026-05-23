@@ -8,7 +8,7 @@
  */
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
+import { cn, safeHref } from "@/lib/utils";
 import type { FeedDocument } from "@/lib/api";
 
 type Props = {
@@ -28,6 +28,8 @@ type Props = {
 
 export function DocumentCard({ item, isNew, onClearNew, onOpen }: Props) {
   const canOpen = !!onOpen && !!item.storage_uri;
+  // Scheme-allowlist the source URL before it becomes an href (audit M9).
+  const href = safeHref(item.source_uri);
   return (
     <Card
       onMouseEnter={isNew ? onClearNew : undefined}
@@ -48,15 +50,18 @@ export function DocumentCard({ item, isNew, onClearNew, onOpen }: Props) {
               >
                 {item.title ?? item.canonical_id}
               </button>
-            ) : (
+            ) : href ? (
               <a
-                href={item.source_uri}
+                href={href}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hover:underline"
               >
                 {item.title ?? item.canonical_id}
               </a>
+            ) : (
+              // Non-http(s) / missing source_uri: render as text, never a link.
+              <span>{item.title ?? item.canonical_id}</span>
             )}
           </CardTitle>
           {isNew && (

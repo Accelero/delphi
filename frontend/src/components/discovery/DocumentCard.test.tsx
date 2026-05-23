@@ -50,4 +50,29 @@ describe("DocumentCard", () => {
     await userEvent.hover(screen.getByText("Hello world"));
     expect(onClearNew).not.toHaveBeenCalled();
   });
+
+  it("links the title to an http(s) source_uri", () => {
+    render(
+      <DocumentCard
+        item={doc({ source_uri: "https://example.test/p/1" })}
+        isNew={false}
+        onClearNew={() => {}}
+      />,
+    );
+    const link = screen.getByRole("link", { name: "Hello world" });
+    expect(link).toHaveAttribute("href", "https://example.test/p/1");
+  });
+
+  it("renders title as plain text (no link) for a non-http(s) source_uri", () => {
+    // A javascript: URL must never become a clickable href (audit M9).
+    render(
+      <DocumentCard
+        item={doc({ source_uri: "javascript:alert(1)" })}
+        isNew={false}
+        onClearNew={() => {}}
+      />,
+    );
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(screen.getByText("Hello world")).toBeInTheDocument();
+  });
 });

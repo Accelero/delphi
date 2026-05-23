@@ -89,6 +89,13 @@ pub struct MetadataPolicy {
     pub allowed_content_types: HashSet<String>,
     pub max_size_bytes: u64,
     pub max_title_chars: usize,
+    /// Cap on the descriptive `summary` after sanitization (abstracts can
+    /// be long, so this is generous).
+    pub max_summary_chars: usize,
+    /// Cap on the number of authors kept (extras are dropped).
+    pub max_authors: usize,
+    /// Cap on each author string after sanitization.
+    pub max_author_chars: usize,
     pub max_metadata_depth: usize,
     pub max_metadata_bytes: usize,
     pub canonical_id_pattern: Regex,
@@ -108,6 +115,9 @@ impl Default for MetadataPolicy {
                 .collect(),
             max_size_bytes: 200 * 1024 * 1024, // 200 MiB
             max_title_chars: 1024,
+            max_summary_chars: 8192,
+            max_authors: 64,
+            max_author_chars: 256,
             max_metadata_depth: 8,
             max_metadata_bytes: 64 * 1024,
             canonical_id_pattern: Regex::new(r"^[a-z][a-z0-9_-]*:[A-Za-z0-9._:-]{1,256}$")
@@ -324,6 +334,40 @@ fn is_plausible_uri(s: &str) -> bool {
     }
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Sanitize a free-text descriptive string **in place** (we clean rather
+/// than reject so one stray character never fails an otherwise-good
+/// upload). Removes:
+/// - C0/C1 control characters except `\t` / `\n` / `\r` — these forge log
+///   lines, drive terminal escape sequences, and embed NUL.
+/// - Unicode bidirectional override / isolate codepoints (U+202A–202E,
+///   U+2066–2069) — the "Trojan Source" class (CVE-2021-42574) that can
+///   spoof how a title renders.
+///
+/// Then trims and truncates to `max_chars` (counted in `char`s, matching
+/// the length checks elsewhere). XSS is **not** handled here — that's a
+/// render-time (DOM) concern defended in the SPA; this only governs what
+/// we store and log.
+pub fn sanitize_text(s: &str, max_chars: usize) -> String {
+    let cleaned: String = s.chars().filter(|&c| !is_disallowed_char(c)).collect();
+    cleaned.trim().chars().take(max_chars).collect()
+}
+
+fn is_disallowed_char(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+        || (c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+}
+
+/// Sanitize an author list: clean each name, drop any that empty out, and
+/// cap the count at `max_authors`.
+pub fn sanitize_authors(authors: &[String], max_authors: usize, max_author_chars: usize) -> Vec<String> {
+    authors
+        .iter()
+        .map(|a| sanitize_text(a, max_author_chars))
+        .filter(|a| !a.is_empty())
+        .take(max_authors)
+        .collect()
 }
 
 fn json_depth(v: &serde_json::Value, current: usize) -> usize {
@@ -585,6 +629,36 @@ mod tests {
     // input space (forbidden-fields enabled, random sizes, deep nesting,
     // odd canonical ids) and assert the function returns rather than
     // panicking and that the decision matches each rule.
+
+    #[test]
+    fn sanitize_strips_control_and_bidi_chars() {
+        // NUL + a C0 control + a bidi override embedded in a title.
+        let dirty = "Hello\u{0000}\u{0007}\u{202E}World";
+        assert_eq!(sanitize_text(dirty, 1024), "HelloWorld");
+        // Tab/newline are preserved (then trimmed at the ends).
+        assert_eq!(sanitize_text("  a\tb\nc  ", 1024), "a\tb\nc");
+    }
+
+    #[test]
+    fn sanitize_truncates_to_char_cap() {
+        let s = "x".repeat(100);
+        assert_eq!(sanitize_text(&s, 10).chars().count(), 10);
+        // Truncation is by char, not byte (multi-byte safe).
+        let multi = "é".repeat(20);
+        assert_eq!(sanitize_text(&multi, 5).chars().count(), 5);
+    }
+
+    #[test]
+    fn sanitize_authors_cleans_drops_empty_and_caps() {
+        let authors = vec![
+            "Alice".to_string(),
+            "\u{202E}\u{0000}".to_string(), // sanitizes to empty → dropped
+            "Bob".to_string(),
+            "Carol".to_string(),
+        ];
+        let got = sanitize_authors(&authors, 2, 256);
+        assert_eq!(got, vec!["Alice".to_string(), "Bob".to_string()]); // empty dropped, capped at 2
+    }
 
     #[test]
     fn property_random_inputs_never_panic() {
