@@ -70,8 +70,13 @@ type InitialMessage = {
 export type ChatProps = {
   /** Conversation record key (no `conversation:` prefix). The chat
    *  surface uses it to open the GET stream, POST submissions, and
-   *  POST stops. */
-  sessionKey: string;
+   *  POST stops. **Omit for draft mode** — no session yet; the first
+   *  submit goes through `onDraftSubmit`. */
+  sessionKey?: string;
+  /** Draft mode handler: invoked on submit when there's no `sessionKey`.
+   *  Expected to create a conversation, send the message, and navigate
+   *  to it. */
+  onDraftSubmit?: (text: string) => void | Promise<void>;
   emptyTitle?: string;
   emptyDescription?: string;
   placeholder?: string;
@@ -144,6 +149,7 @@ function groupTurns(messages: ChatMessage[]): Turn[] {
 
 export function Chat({
   sessionKey,
+  onDraftSubmit,
   emptyTitle = "No messages yet",
   emptyDescription = "Send a message to start the conversation.",
   placeholder = "Type a message…",
@@ -152,15 +158,17 @@ export function Chat({
 }: ChatProps) {
   const queryClient = useQueryClient();
 
-  // After a turn ends (we saw a `d:` frame), invalidate the
+  // After a turn ends (we saw a `finish` frame), invalidate the
   // conversation caches so the sidebar reflects any auto-generated
   // title and the per-conversation cache picks up the just-persisted
-  // assistant message.
+  // assistant message. (No-op in draft mode — no session, no turns.)
   const onTurnEnd = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: conversationsKey });
-    queryClient.invalidateQueries({
-      queryKey: conversationKeyFor(sessionKey),
-    });
+    if (sessionKey) {
+      queryClient.invalidateQueries({
+        queryKey: conversationKeyFor(sessionKey),
+      });
+    }
   }, [queryClient, sessionKey]);
 
   const seed: LocalMessage[] = useMemo(
@@ -188,6 +196,7 @@ export function Chat({
   } = useChatStream(sessionKey, {
     initialMessages: seed,
     onTurnEnd,
+    onDraftSubmit,
   });
 
   const status: ChatStatus =

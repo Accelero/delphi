@@ -307,6 +307,27 @@ describe("useChatStream", () => {
     expect(onTurnEnd).toHaveBeenCalledTimes(1);
   });
 
+  it("draft mode: no EventSource, and submit delegates to onDraftSubmit", async () => {
+    const onDraftSubmit = vi.fn();
+    const { result } = renderHook(() =>
+      useChatStream(undefined, { onDraftSubmit }),
+    );
+    // No session ⇒ no stream opened.
+    expect(FakeEventSource.instances).toHaveLength(0);
+    expect(result.current.messages).toEqual([]);
+    // Submit hands off to the creator instead of POSTing nowhere.
+    await act(async () => {
+      await result.current.submit("hello there");
+    });
+    expect(onDraftSubmit).toHaveBeenCalledWith("hello there");
+    // Blank input is ignored, even in draft mode.
+    onDraftSubmit.mockClear();
+    await act(async () => {
+      await result.current.submit("   ");
+    });
+    expect(onDraftSubmit).not.toHaveBeenCalled();
+  });
+
   it("refetches only on the first connect, not on reopen (v4)", () => {
     // v4: cursor resume (`Last-Event-Id`) + `resync` cover reconnects, so
     // a transient-blip reopen must NOT refetch (v3 did, double-counting).

@@ -55,6 +55,11 @@ export type UseChatStreamOptions = {
    *  the first EventSource connect, and on `resync`. Callers use it to
    *  invalidate the conversation query so committed history is refetched. */
   onTurnEnd?: () => void;
+  /** Draft mode: when `conversationKey` is absent there is no session to
+   *  stream or POST to, so `submit(text)` delegates here instead. The
+   *  callback is expected to create a conversation, send the first
+   *  message, and navigate to it. */
+  onDraftSubmit?: (text: string) => void | Promise<void>;
 };
 
 export type UseChatStreamReturn = {
@@ -82,10 +87,10 @@ function seedKey(messages: LocalMessage[]): string {
 const STREAMING_ASSISTANT_ID = "__streaming-assistant__";
 
 export function useChatStream(
-  conversationKey: string,
+  conversationKey: string | undefined,
   opts: UseChatStreamOptions = {},
 ): UseChatStreamReturn {
-  const { initialMessages = [], onTurnEnd } = opts;
+  const { initialMessages = [], onTurnEnd, onDraftSubmit } = opts;
   const [messages, setMessages] = useState<LocalMessage[]>(initialMessages);
   const [status, setStatus] = useState<StreamStatus>("ready");
   const [citations, setCitations] = useState<CitationEntry[]>([]);
@@ -120,6 +125,11 @@ export function useChatStream(
     onTurnEndRef.current = onTurnEnd;
   }, [onTurnEnd]);
 
+  const onDraftSubmitRef = useRef(onDraftSubmit);
+  useEffect(() => {
+    onDraftSubmitRef.current = onDraftSubmit;
+  }, [onDraftSubmit]);
+
   const statusRef = useRef(status);
   useEffect(() => {
     statusRef.current = status;
@@ -144,6 +154,9 @@ export function useChatStream(
   // Long-lived SSE subscription.
   // -----------------------------------------------------------------
   useEffect(() => {
+    // Draft mode (no session yet): nothing to stream. `submit` delegates
+    // to `onDraftSubmit`, which creates the conversation and navigates.
+    if (!conversationKey) return;
     const url = `/api/chat/conversations/${encodeURIComponent(conversationKey)}/stream`;
     hasConnectedRef.current = false;
     const es = new EventSource(url);
@@ -335,6 +348,11 @@ export function useChatStream(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
+      // Draft mode: no session to POST to — hand off to the creator.
+      if (!conversationKey) {
+        await onDraftSubmitRef.current?.(trimmed);
+        return;
+      }
       const id = ulid();
       setError(null);
       setStatus("submitted");
@@ -362,6 +380,7 @@ export function useChatStream(
   );
 
   const stop = useCallback(async () => {
+    if (!conversationKey) return;
     try {
       await api.chat.stopChat(conversationKey);
     } catch {

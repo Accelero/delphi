@@ -49,8 +49,21 @@ export function ConversationSidebar({ activeKey }: Props) {
     try {
       await remove.mutateAsync({ key });
       if (key === activeKey) {
-        // Land back on /corpus, which redirects to most-recent-or-new.
-        navigate({ to: "/corpus" });
+        // Decide the landing spot deterministically from the known list
+        // (most-recent-first) rather than bouncing through /corpus and
+        // racing a stale cache. Most-recent remaining, or the draft chat
+        // when none are left.
+        const remaining = (list.data ?? []).filter(
+          (c) => conversationKey(c.id) !== key,
+        );
+        if (remaining.length > 0) {
+          navigate({
+            to: "/corpus/$sessionId",
+            params: { sessionId: conversationKey(remaining[0].id) },
+          });
+        } else {
+          navigate({ to: "/corpus" });
+        }
       }
     } catch {
       // Same as create — silent here; cache invalidation reflects state.
