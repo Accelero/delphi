@@ -156,7 +156,7 @@ impl LlmClient for OpenAiLlm {
 /// MiniMax exposes an OpenAI-compatible Chat Completions endpoint at
 /// `https://api.minimax.io/v1`. We build a [`CompletionsClient`] (legacy
 /// chat-completions flavor) with that base URL plus the user's MiniMax
-/// API key. Default model is `MiniMax-M2.7` (their featured coding model).
+/// API key. The model id comes from `LLM_MODEL` (e.g. `MiniMax-M2.7`).
 struct MinimaxLlm {
     agent: Agent<OpenAiChatCompletionModel>,
 }
@@ -206,9 +206,8 @@ impl LlmClient for MinimaxLlm {
 /// Google Gemini via the Generative Language API. `rig`'s
 /// [`gemini::Client::from_env`] reads `GEMINI_API_KEY`; we check it
 /// ourselves first so a missing key is a clean [`Error::EnvMissing`]
-/// rather than the panic `from_env` would otherwise raise. Default model
-/// is `gemini-2.5-flash` (fast + cheap); override with `LLM_MODEL`
-/// (e.g. `gemini-2.5-pro`).
+/// rather than the panic `from_env` would otherwise raise. The model id
+/// comes from `LLM_MODEL` (e.g. `gemini-2.5-flash`, `gemini-2.5-pro`).
 struct GeminiLlm {
     agent: Agent<gemini::completion::CompletionModel>,
 }
@@ -254,15 +253,20 @@ impl LlmClient for GeminiLlm {
 // ---------------------------------------------------------------------------
 
 pub fn llm_from_env() -> Result<Arc<dyn LlmClient>> {
+    // No hardcoded provider/model fallbacks: both are deployment
+    // configuration, not code defaults. A missing or blank value is a
+    // misconfiguration we surface at startup rather than papering over
+    // with a guessed provider or model.
     let provider = std::env::var("LLM_PROVIDER")
-        .unwrap_or_else(|_| "anthropic".into())
-        .to_lowercase();
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| match provider.as_str() {
-        "openai" => "gpt-4o-mini".into(),
-        "minimax" => "MiniMax-M2.7".into(),
-        "gemini" | "google" => "gemini-2.5-flash".into(),
-        _ => "claude-sonnet-4-5".into(),
-    });
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::EnvMissing("LLM_PROVIDER".into()))?;
+    let model = std::env::var("LLM_MODEL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::EnvMissing("LLM_MODEL".into()))?;
 
     match provider.as_str() {
         "anthropic" => Ok(Arc::new(AnthropicLlm::from_env(&model)?)),

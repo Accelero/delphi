@@ -77,8 +77,8 @@ services:
       DEV_USER_EMAIL: ${DEV_USER_EMAIL:-dev@delphi.local}
       DEV_USER_NAME: ${DEV_USER_NAME:-Dev User}
       # LLM (read at startup by rig via env)
-      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
-      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-5}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_MODEL: ${LLM_MODEL:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
