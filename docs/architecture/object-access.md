@@ -124,8 +124,8 @@ only forward-investment.
   that made MinIO read `s3` as the bucket → `InvalidBucketName`.)
 - `docker-compose.full.yml`: publish MinIO directly —
   `ports: ["9000:9000", "9001:9001"]` — and set
-  `INGEST_S3_ENDPOINT_PUBLIC=http://localhost:9000` (was
-  `http://localhost/s3`). `INGEST_S3_ENDPOINT_INTERNAL=http://minio:9000`
+  `DELPHI_INGEST_S3_ENDPOINT_PUBLIC=http://localhost:9000` (was
+  `http://localhost/s3`). `DELPHI_INGEST_S3_ENDPOINT_INTERNAL=http://minio:9000`
   unchanged.
 - Tier-1 already exposes `:9000` and presigns against `localhost:9000` —
   unchanged. Both tiers now identical in shape: browser → MinIO directly.
@@ -138,7 +138,7 @@ only forward-investment.
 
 | Var | Default | Notes |
 |---|---|---|
-| `INGEST_S3_ENDPOINT_PUBLIC` | `http://localhost:9000` (both tiers) | embedded in minted URLs |
+| `DELPHI_INGEST_S3_ENDPOINT_PUBLIC` | `http://localhost:9000` (both tiers) | embedded in minted URLs |
 | `INGEST_UPLOAD_PART_URL_TTL_SECS` | 900 | existing |
 | `INGEST_DOWNLOAD_URL_TTL_SECS` | **120** (new) | download is confidentiality-sensitive → short |
 
@@ -174,7 +174,7 @@ only forward-investment.
 ## Implementation order
 
 1. **Infra:** drop the `/s3` Traefik router + `minio` service; expose
-   MinIO `:9000` in `full.yml`; set `INGEST_S3_ENDPOINT_PUBLIC`. (Fixes
+   MinIO `:9000` in `full.yml`; set `DELPHI_INGEST_S3_ENDPOINT_PUBLIC`. (Fixes
    t2 immediately.)
 2. **Seam:** add `AccessMinter` + `AccessGrant` + `S3PresignAccess`;
    inject into `AppState`.

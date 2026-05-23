@@ -3,11 +3,11 @@
 //! 1. (compile-time) the `dev-auth` cargo feature flag — gating
 //!    `AuthMode::Dev` itself. Lives in `auth/config.rs`.
 //! 2. (runtime) [`enforce_production_guard`] — refuses to start when
-//!    `RUST_ENV=production` is paired with any of:
-//!      - `AUTH_MODE=dev` (dev-auth bypass)
-//!      - `SURREAL_SERVICE_USER` unset / equal to `root` (default
+//!    `DELPHI_ENV=production` is paired with any of:
+//!      - `DELPHI_AUTH_MODE=dev` (dev-auth bypass)
+//!      - `DELPHI_DB_USER` unset / equal to `root` (default
 //!        credential leak)
-//!      - `SURREAL_SERVICE_PASS` unset / equal to `root`
+//!      - `DELPHI_DB_PASSWORD` unset / equal to `root`
 //! 3. (UX) [`print_banner`] — loud yellow banner on stderr in dev mode.
 //!
 //! Closes audit findings C3 (in part) and C4.
@@ -17,7 +17,7 @@ use anyhow::Result;
 use super::config::AuthMode;
 
 pub fn enforce_production_guard(mode: &AuthMode) -> Result<()> {
-    let prod_marker = std::env::var("RUST_ENV").as_deref() == Ok("production");
+    let prod_marker = std::env::var("DELPHI_ENV").as_deref() == Ok("production");
     if !prod_marker {
         // Dev / staging: nothing to enforce.
         let _ = mode;
@@ -28,25 +28,25 @@ pub fn enforce_production_guard(mode: &AuthMode) -> Result<()> {
     #[cfg(feature = "dev-auth")]
     if matches!(mode, AuthMode::Dev(_)) {
         anyhow::bail!(
-            "REFUSING TO START: AUTH_MODE=dev with RUST_ENV=production. \
+            "REFUSING TO START: DELPHI_AUTH_MODE=dev with DELPHI_ENV=production. \
              This is a fatal misconfiguration."
         );
     }
 
     // Production: refuse default Surreal credentials.
-    let service_user = std::env::var("SURREAL_SERVICE_USER").unwrap_or_default();
-    let service_pass = std::env::var("SURREAL_SERVICE_PASS").unwrap_or_default();
+    let service_user = std::env::var("DELPHI_DB_USER").unwrap_or_default();
+    let service_pass = std::env::var("DELPHI_DB_PASSWORD").unwrap_or_default();
     if service_user.is_empty() || service_user == "root" {
         anyhow::bail!(
-            "REFUSING TO START: SURREAL_SERVICE_USER is unset or equals the default \
-             'root' under RUST_ENV=production. Provision a dedicated DB EDITOR-role \
-             user and set SURREAL_SERVICE_USER / SURREAL_SERVICE_PASS to its credentials."
+            "REFUSING TO START: DELPHI_DB_USER is unset or equals the default \
+             'root' under DELPHI_ENV=production. Provision a dedicated DB EDITOR-role \
+             user and set DELPHI_DB_USER / DELPHI_DB_PASSWORD to its credentials."
         );
     }
     if service_pass.is_empty() || service_pass == "root" {
         anyhow::bail!(
-            "REFUSING TO START: SURREAL_SERVICE_PASS is unset or equals the default \
-             'root' under RUST_ENV=production. Set a real password."
+            "REFUSING TO START: DELPHI_DB_PASSWORD is unset or equals the default \
+             'root' under DELPHI_ENV=production. Set a real password."
         );
     }
 

@@ -33,7 +33,7 @@ enum Cmd {
 #[derive(clap::Args)]
 struct ServeArgs {
     /// Address to bind, e.g. 0.0.0.0:8081
-    #[arg(long, env = "BIND_ADDR", default_value = "0.0.0.0:8081")]
+    #[arg(long, env = "DELPHI_SERVER_BIND_ADDR", default_value = "0.0.0.0:8081")]
     bind: String,
 
     /// Path to the built frontend (Vite `dist/`). Optional in dev.

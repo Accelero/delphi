@@ -49,7 +49,7 @@ pub struct UploadsConfig {
     pub session_ttl: Duration,
     pub metadata_policy: MetadataPolicy,
     pub object_policy: ObjectPolicy,
-    /// `INGEST_S3_BUCKET`. Used to render the canonical `storage_uri`.
+    /// `DELPHI_INGEST_S3_BUCKET`. Used to render the canonical `storage_uri`.
     pub bucket: String,
 }
 
@@ -62,15 +62,15 @@ impl UploadsConfig {
             Duration::from_secs(parse_env_u64("INGEST_DOWNLOAD_URL_TTL_SECS", 120));
         let session_ttl =
             Duration::from_secs(parse_env_u64("INGEST_UPLOAD_SESSION_TTL_SECS", 3600));
-        let bucket = std::env::var("INGEST_S3_BUCKET").unwrap_or_else(|_| "delphi".into());
+        let bucket = std::env::var("DELPHI_INGEST_S3_BUCKET").unwrap_or_else(|_| "delphi".into());
 
         let mut metadata_policy = MetadataPolicy::default();
-        if let Ok(max) = std::env::var("INGEST_UPLOAD_MAX_FILE_SIZE_BYTES") {
+        if let Ok(max) = std::env::var("DELPHI_INGEST_UPLOAD_MAX_FILE_SIZE_BYTES") {
             if let Ok(v) = max.parse::<u64>() {
                 metadata_policy.max_size_bytes = v;
             }
         }
-        if let Ok(types) = std::env::var("INGEST_ALLOWED_CONTENT_TYPES") {
+        if let Ok(types) = std::env::var("DELPHI_INGEST_ALLOWED_CONTENT_TYPES") {
             metadata_policy.allowed_content_types = types
                 .split(',')
                 .map(str::trim)
@@ -81,7 +81,7 @@ impl UploadsConfig {
         // App-required descriptive fields after merge. Defaults empty
         // (autofill is a noop today). Comma-separated: title,authors,
         // summary,language.
-        if let Ok(fields) = std::env::var("INGEST_REQUIRED_METADATA_FIELDS") {
+        if let Ok(fields) = std::env::var("DELPHI_INGEST_REQUIRED_METADATA_FIELDS") {
             metadata_policy.required_fields = fields
                 .split(',')
                 .map(str::trim)
@@ -99,27 +99,27 @@ impl UploadsConfig {
             allowed_content_types: metadata_policy.allowed_content_types.clone(),
             ..ObjectPolicy::default()
         };
-        if let Ok(v) = std::env::var("INGEST_VALIDATOR_SNIFF_WINDOW_BYTES") {
+        if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_SNIFF_WINDOW_BYTES") {
             if let Ok(n) = v.parse::<usize>() {
                 object_policy.sniff_window_bytes = n;
             }
         }
-        if let Ok(v) = std::env::var("INGEST_VALIDATOR_PDF_MAX_INPUT_BYTES") {
+        if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_PDF_MAX_INPUT_BYTES") {
             if let Ok(n) = v.parse::<u64>() {
                 object_policy.pdf_max_input_bytes = n;
             }
         }
-        if let Ok(v) = std::env::var("INGEST_VALIDATOR_PDF_MAX_PAGES") {
+        if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_PDF_MAX_PAGES") {
             if let Ok(n) = v.parse::<usize>() {
                 object_policy.pdf_max_pages = n;
             }
         }
-        if let Ok(v) = std::env::var("INGEST_VALIDATOR_PDF_TIMEOUT_SECS") {
+        if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_PDF_TIMEOUT_SECS") {
             if let Ok(n) = v.parse::<u64>() {
                 object_policy.pdf_parse_timeout = Duration::from_secs(n);
             }
         }
-        if let Ok(v) = std::env::var("INGEST_VALIDATOR_REJECT_POLYGLOTS") {
+        if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_REJECT_POLYGLOTS") {
             object_policy.reject_polyglots = matches!(v.as_str(), "true" | "1" | "yes");
         }
 

@@ -50,25 +50,25 @@ pub struct EmbedderLoad {
 ///
 /// | Var | Default | Effect |
 /// |---|---|---|
-/// | `EMBEDDER_CHUNK_ENDPOINT`     | `http://tei-chunk:80`   | TEI URL for BGE-small. |
-/// | `EMBEDDER_CHUNK_ENABLED`      | `true`                  | Master switch. |
-/// | `EMBEDDER_CHUNK_MODEL_NAME`   | `bge-small-en-v1.5`     | Passed to TEI; also written to `chunk.embedding_model`. |
-/// | `EMBEDDER_DOCUMENT_ENDPOINT`  | `http://tei-paper:80`   | TEI URL for SPECTER2. |
-/// | `EMBEDDER_DOCUMENT_ENABLED`   | `true`                  | Master switch. |
-/// | `EMBEDDER_DOCUMENT_MODEL_NAME`| `specter2`              | Passed to TEI; also written to `document.paper_embedding_model`. |
+/// | `DELPHI_EMBEDDER_CHUNK_ENDPOINT`     | `http://tei-chunk:80`   | TEI URL for BGE-small. |
+/// | `DELPHI_EMBEDDER_CHUNK_ENABLED`      | `true`                  | Master switch. |
+/// | `DELPHI_EMBEDDER_CHUNK_MODEL`   | `bge-small-en-v1.5`     | Passed to TEI; also written to `chunk.embedding_model`. |
+/// | `DELPHI_EMBEDDER_DOCUMENT_ENDPOINT`  | `http://tei-paper:80`   | TEI URL for SPECTER2. |
+/// | `DELPHI_EMBEDDER_DOCUMENT_ENABLED`   | `true`                  | Master switch. |
+/// | `DELPHI_EMBEDDER_DOCUMENT_MODEL`| `specter2`              | Passed to TEI; also written to `document.paper_embedding_model`. |
 pub fn embedder_from_env() -> Result<EmbedderLoad> {
     let chunk_cfg = EmbedderConfig {
-        enabled: env_bool("EMBEDDER_CHUNK_ENABLED", true),
-        endpoint: std::env::var("EMBEDDER_CHUNK_ENDPOINT")
+        enabled: env_bool("DELPHI_EMBEDDER_CHUNK_ENABLED", true),
+        endpoint: std::env::var("DELPHI_EMBEDDER_CHUNK_ENDPOINT")
             .unwrap_or_else(|_| "http://tei-chunk:80".into()),
-        model_name: std::env::var("EMBEDDER_CHUNK_MODEL_NAME")
+        model_name: std::env::var("DELPHI_EMBEDDER_CHUNK_MODEL")
             .unwrap_or_else(|_| "bge-small-en-v1.5".into()),
     };
     let doc_cfg = EmbedderConfig {
-        enabled: env_bool("EMBEDDER_DOCUMENT_ENABLED", true),
-        endpoint: std::env::var("EMBEDDER_DOCUMENT_ENDPOINT")
+        enabled: env_bool("DELPHI_EMBEDDER_DOCUMENT_ENABLED", true),
+        endpoint: std::env::var("DELPHI_EMBEDDER_DOCUMENT_ENDPOINT")
             .unwrap_or_else(|_| "http://tei-paper:80".into()),
-        model_name: std::env::var("EMBEDDER_DOCUMENT_MODEL_NAME")
+        model_name: std::env::var("DELPHI_EMBEDDER_DOCUMENT_MODEL")
             .unwrap_or_else(|_| "specter2".into()),
     };
     let chunk: Option<Arc<dyn Embedder>> = if chunk_cfg.enabled {

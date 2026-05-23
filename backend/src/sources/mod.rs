@@ -14,7 +14,7 @@
 //! tenant is stamped server-side by the `/api/ingestion/documents`
 //! handler from the service-identity JWT's `tenant_id` claim. v1 mints
 //! a single service identity per scheduler, pinning it to
-//! `SOURCES_DEFAULT_TENANT_SLUG`. SaaS will mint one identity per
+//! `DELPHI_SOURCES_DEFAULT_TENANT`. SaaS will mint one identity per
 //! tenant.
 //!
 //! ## Installing adapters

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use rig::agent::{Agent, MultiTurnStreamItem};
-use rig::client::{CompletionClient, ProviderClient};
+use rig::client::CompletionClient;
 use rig::completion::Message;
 use rig::providers::openai::completion::CompletionModel as OpenAiChatCompletionModel;
 use rig::providers::openai::responses_api::ResponsesCompletionModel;
@@ -91,7 +91,8 @@ struct AnthropicLlm {
 
 impl AnthropicLlm {
     fn from_env(model: &str) -> Result<Self> {
-        let client = anthropic::Client::from_env();
+        let client = anthropic::Client::new(&require_env("DELPHI_PROVIDER_ANTHROPIC_API_KEY")?)
+            .map_err(|e| Error::InvalidConfig(format!("anthropic client: {e}")))?;
         let agent = client
             .agent(model)
             .preamble("You are delphi, a research assistant.")
@@ -125,7 +126,8 @@ struct OpenAiLlm {
 
 impl OpenAiLlm {
     fn from_env(model: &str) -> Result<Self> {
-        let client = openai::Client::from_env();
+        let client = openai::Client::new(&require_env("DELPHI_PROVIDER_OPENAI_API_KEY")?)
+            .map_err(|e| Error::InvalidConfig(format!("openai client: {e}")))?;
         let agent = client
             .agent(model)
             .preamble("You are delphi, a research assistant.")
@@ -156,16 +158,16 @@ impl LlmClient for OpenAiLlm {
 /// MiniMax exposes an OpenAI-compatible Chat Completions endpoint at
 /// `https://api.minimax.io/v1`. We build a [`CompletionsClient`] (legacy
 /// chat-completions flavor) with that base URL plus the user's MiniMax
-/// API key. The model id comes from `LLM_MODEL` (e.g. `MiniMax-M2.7`).
+/// API key. The model id comes from `DELPHI_PROVIDER_MODEL` (e.g. `MiniMax-M2.7`).
 struct MinimaxLlm {
     agent: Agent<OpenAiChatCompletionModel>,
 }
 
 impl MinimaxLlm {
     fn from_env(model: &str) -> Result<Self> {
-        let api_key = std::env::var("MINIMAX_API_KEY")
-            .map_err(|_| Error::EnvMissing("MINIMAX_API_KEY".into()))?;
-        let base_url = std::env::var("MINIMAX_BASE_URL")
+        let api_key = std::env::var("DELPHI_PROVIDER_MINIMAX_API_KEY")
+            .map_err(|_| Error::EnvMissing("DELPHI_PROVIDER_MINIMAX_API_KEY".into()))?;
+        let base_url = std::env::var("DELPHI_PROVIDER_MINIMAX_BASE_URL")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "https://api.minimax.io/v1".into());
@@ -203,24 +205,19 @@ impl LlmClient for MinimaxLlm {
     }
 }
 
-/// Google Gemini via the Generative Language API. `rig`'s
-/// [`gemini::Client::from_env`] reads `GEMINI_API_KEY`; we check it
-/// ourselves first so a missing key is a clean [`Error::EnvMissing`]
-/// rather than the panic `from_env` would otherwise raise. The model id
-/// comes from `LLM_MODEL` (e.g. `gemini-2.5-flash`, `gemini-2.5-pro`).
+/// Google Gemini via the Generative Language API. The API key comes from
+/// `DELPHI_PROVIDER_GOOGLE_API_KEY`, read explicitly and passed to
+/// `Client::new` rather than via `rig`'s `from_env` (which would read the
+/// library's own `DELPHI_PROVIDER_GOOGLE_API_KEY`). The model id comes from
+/// `DELPHI_PROVIDER_MODEL` (e.g. `gemini-3.5-flash`, `gemini-2.5-pro`).
 struct GeminiLlm {
     agent: Agent<gemini::completion::CompletionModel>,
 }
 
 impl GeminiLlm {
     fn from_env(model: &str) -> Result<Self> {
-        if std::env::var("GEMINI_API_KEY")
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true)
-        {
-            return Err(Error::EnvMissing("GEMINI_API_KEY".into()));
-        }
-        let client = gemini::Client::from_env();
+        let client = gemini::Client::new(&require_env("DELPHI_PROVIDER_GOOGLE_API_KEY")?)
+            .map_err(|e| Error::InvalidConfig(format!("gemini client: {e}")))?;
         let agent = client
             .agent(model)
             .preamble("You are delphi, a research assistant.")
@@ -252,27 +249,31 @@ impl LlmClient for GeminiLlm {
 // Factory
 // ---------------------------------------------------------------------------
 
+/// Read a required, non-blank environment variable, or fail with a clean
+/// [`Error::EnvMissing`] so the misconfiguration surfaces at startup
+/// rather than as a guessed default or a downstream runtime error.
+fn require_env(key: &str) -> Result<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| Error::EnvMissing(key.into()))
+}
+
 pub fn llm_from_env() -> Result<Arc<dyn LlmClient>> {
     // No hardcoded provider/model fallbacks: both are deployment
     // configuration, not code defaults. A missing or blank value is a
     // misconfiguration we surface at startup rather than papering over
-    // with a guessed provider or model.
-    let provider = std::env::var("LLM_PROVIDER")
-        .ok()
-        .map(|v| v.trim().to_lowercase())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::EnvMissing("LLM_PROVIDER".into()))?;
-    let model = std::env::var("LLM_MODEL")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| Error::EnvMissing("LLM_MODEL".into()))?;
+    // with a guessed provider or model. Per-provider API keys are read
+    // inside each provider's `from_env` (see `require_env` calls there).
+    let provider = require_env("DELPHI_PROVIDER")?.to_lowercase();
+    let model = require_env("DELPHI_PROVIDER_MODEL")?;
 
     match provider.as_str() {
         "anthropic" => Ok(Arc::new(AnthropicLlm::from_env(&model)?)),
         "openai" => Ok(Arc::new(OpenAiLlm::from_env(&model)?)),
         "minimax" => Ok(Arc::new(MinimaxLlm::from_env(&model)?)),
         "gemini" | "google" => Ok(Arc::new(GeminiLlm::from_env(&model)?)),
-        other => Err(Error::UnknownBackend(format!("LLM_PROVIDER={other}"))),
+        other => Err(Error::UnknownBackend(format!("DELPHI_PROVIDER={other}"))),
     }
 }

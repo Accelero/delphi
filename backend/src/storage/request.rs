@@ -37,7 +37,7 @@ use super::{
     IngestionRejection, MessageId, Storage, UploadSession,
 };
 
-/// Default pool size when `REQUEST_DB_POOL_SIZE` is unset. Sized to
+/// Default pool size when `DELPHI_DB_POOL_SIZE` is unset. Sized to
 /// cover typical inbound concurrency without holding many idle
 /// WebSocket sessions against SurrealDB. Override via env for
 /// deployments that need more (or fewer) physical connections.
@@ -81,14 +81,14 @@ impl RequestDbPool {
     /// then transitions the session into a RECORD scope.
     ///
     /// The service-user credential is loaded from the same env vars
-    /// `SystemDb` uses (`SURREAL_SERVICE_USER` / `SURREAL_SERVICE_PASS`)
+    /// `SystemDb` uses (`DELPHI_DB_USER` / `DELPHI_DB_PASSWORD`)
     /// so we don't introduce a second credential surface.
     pub async fn from_env(size: usize) -> Result<Self> {
-        let url = env_or("SURREAL_URL", "ws://surrealdb:8000/rpc");
-        let user = env_required("SURREAL_SERVICE_USER")?;
-        let password = env_required("SURREAL_SERVICE_PASS")?;
-        let namespace = env_or("SURREAL_NS", "delphi");
-        let database = env_or("SURREAL_DB", "main");
+        let url = env_or("DELPHI_DB_URL", "ws://surrealdb:8000/rpc");
+        let user = env_required("DELPHI_DB_USER")?;
+        let password = env_required("DELPHI_DB_PASSWORD")?;
+        let namespace = env_or("DELPHI_DB_NAMESPACE", "delphi");
+        let database = env_or("DELPHI_DB_NAME", "main");
 
         let (tx, rx) = mpsc::channel(size);
         for _ in 0..size {
@@ -114,20 +114,20 @@ impl RequestDbPool {
         })
     }
 
-    /// Pool size taken from `REQUEST_DB_POOL_SIZE` (default
+    /// Pool size taken from `DELPHI_DB_POOL_SIZE` (default
     /// [`DEFAULT_POOL_SIZE`]). Most callers want this.
     pub async fn from_env_default() -> Result<Self> {
-        let size = match std::env::var("REQUEST_DB_POOL_SIZE") {
+        let size = match std::env::var("DELPHI_DB_POOL_SIZE") {
             Ok(s) => s.parse::<usize>().map_err(|_| {
                 Error::InvalidConfig(format!(
-                    "REQUEST_DB_POOL_SIZE must be a positive integer; got {s:?}"
+                    "DELPHI_DB_POOL_SIZE must be a positive integer; got {s:?}"
                 ))
             })?,
             Err(_) => DEFAULT_POOL_SIZE,
         };
         if size == 0 {
             return Err(Error::InvalidConfig(
-                "REQUEST_DB_POOL_SIZE must be > 0".into(),
+                "DELPHI_DB_POOL_SIZE must be > 0".into(),
             ));
         }
         Self::from_env(size).await

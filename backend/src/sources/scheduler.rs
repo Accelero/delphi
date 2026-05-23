@@ -41,7 +41,7 @@ impl SchedulerHandle {
 /// persistence (the `source_state` row that records "where this adapter
 /// got to"). It must match the tenant the service identity carries so
 /// cursor reads and ingest writes land together; in `api::serve` both
-/// derive from the same `SOURCES_DEFAULT_TENANT_SLUG`.
+/// derive from the same `DELPHI_SOURCES_DEFAULT_TENANT`.
 ///
 /// Tasks wait one full `poll_interval` before their first tick: the
 /// scheduler is spawned from `api::serve` before the HTTP listener

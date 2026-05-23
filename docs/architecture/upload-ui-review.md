@@ -275,10 +275,10 @@ Define the `Field` enum and where `MetadataPolicy.required_fields` is wired
 (`UploadsConfig::from_env`, `uploads.rs:55-115`, plus `test_default`). Don't
 claim it's "the same validator"; it shares helpers, not the entry point.
 
-### B8. `from_url` made required + `OBJECT_STORE_URL` only-`s3://`, but the S3 store needs `INGEST_S3_ENDPOINT_*` that `from_url` never sees
+### B8. `from_url` made required + `DELPHI_INGEST_OBJECT_STORE_URL` only-`s3://`, but the S3 store needs `INGEST_S3_ENDPOINT_*` that `from_url` never sees
 
-§Phase 0 makes `OBJECT_STORE_URL` required and `s3://`-only, and §1.5/§1.6 add
-`INGEST_S3_ENDPOINT_INTERNAL` / `INGEST_S3_ENDPOINT_PUBLIC`. But `from_url`
+§Phase 0 makes `DELPHI_INGEST_OBJECT_STORE_URL` required and `s3://`-only, and §1.5/§1.6 add
+`DELPHI_INGEST_S3_ENDPOINT_INTERNAL` / `DELPHI_INGEST_S3_ENDPOINT_PUBLIC`. But `from_url`
 (`src/object_store/url.rs:18`) takes only the URL string; the S3 client needs
 endpoint/region/keys/path-style. Today those come from `S3Config::from_env`
 (`s3.rs:51-74`) which reads the single `INGEST_S3_ENDPOINT` — the plan renames
@@ -290,7 +290,7 @@ the internal one" (§1.5) without specifying that `S3ObjectStore` holds two
 configured clients/endpoints, or how `from_url` is rewired to build it.
 
 **Fix:** Specify that `S3ObjectStore::from_env` (not `from_url`) reads
-`INGEST_S3_ENDPOINT_INTERNAL` + `INGEST_S3_ENDPOINT_PUBLIC` and builds either
+`DELPHI_INGEST_S3_ENDPOINT_INTERNAL` + `DELPHI_INGEST_S3_ENDPOINT_PUBLIC` and builds either
 two `aws_sdk_s3::Client`s (one per endpoint) or one client plus a
 presign-only config pointed at the public endpoint. State how `from_url`
 dispatches `s3://` to this constructor (it currently calls

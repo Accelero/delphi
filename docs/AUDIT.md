@@ -51,15 +51,15 @@ Mark items as `[x]` once a fix has been merged and verified.
   signature-validation in `JwtClaimsExtractor` is the small defence-in-depth
   drop-in for when we want two-of-two safety._
 
-- [x] **C4.** `docker-compose.full.yml` ships `RUST_ENV=production` together
+- [x] **C4.** `docker-compose.full.yml` ships `DELPHI_ENV=production` together
   with `SURREAL_USER=root / SURREAL_PASS=root`. `.env.example` documents
-  the same defaults. Refuse to start when `RUST_ENV=production` and
+  the same defaults. Refuse to start when `DELPHI_ENV=production` and
   Surreal credentials match the documented defaults; or move credentials
   to required-env (no defaults) for the prod compose.
 
-  _Resolved: Phase 1 split creds into `SURREAL_SERVICE_USER` /
-  `SURREAL_SERVICE_PASS`. `enforce_production_guard` refuses to start
-  under `RUST_ENV=production` when either is unset or equals `root`._
+  _Resolved: Phase 1 split creds into `DELPHI_DB_USER` /
+  `DELPHI_DB_PASSWORD`. `enforce_production_guard` refuses to start
+  under `DELPHI_ENV=production` when either is unset or equals `root`._
 
 ---
 
@@ -278,15 +278,15 @@ Mark items as `[x]` once a fix has been merged and verified.
   oauth2-proxy header injection so Traefik can see the identity).
   Single-user / private deployments skip._
 
-- [ ] **L3.** `.env` (gitignored) contains a real `MINIMAX_API_KEY` on
+- [ ] **L3.** `.env` (gitignored) contains a real `DELPHI_PROVIDER_MINIMAX_API_KEY` on
   disk. Not in git history. Rotate and treat like any other credential.
 
-- [ ] **L4.** `BIND_ADDR` defaults to `0.0.0.0:8081`. Right call inside
+- [ ] **L4.** `DELPHI_SERVER_BIND_ADDR` defaults to `0.0.0.0:8081`. Right call inside
   docker, wrong call when running `cargo run` locally. Default to
   `127.0.0.1:8081`; require explicit override for `0.0.0.0`.
 
 - [ ] **L6.** `enforce_production_guard` only fires on
-  `RUST_ENV=production`. `RUST_ENV=staging` with `AUTH_MODE=dev` boots
+  `DELPHI_ENV=production`. `DELPHI_ENV=staging` with `DELPHI_AUTH_MODE=dev` boots
   silently. Use an allowlist of non-prod environments instead.
 
 - [ ] **L7.** `tenant.slug` schema ASSERT enforces lowercase, but the
@@ -364,7 +364,7 @@ Mark items as `[x]` once a fix has been merged and verified.
   with the same claim shape (`sub` / `iss` / `email` /
   `preferred_username` / `tenant_id` / `roles` / `ac` / `ns` / `db` /
   `iat` / `exp`) the production IdP would emit, signed with
-  `SURREAL_JWT_SECRET` so SurrealDB's `app_session` access method
+  `DELPHI_DB_JWT_SECRET` so SurrealDB's `app_session` access method
   validates it engine-side. The equivalence test in `auth/dev.rs`
   round-trips the dev JWT through `JwtClaimsExtractor` to enforce
   "dev mode is a strict subset of prod" at compile time. Tier-1
@@ -450,7 +450,7 @@ Mark items as `[x]` once a fix has been merged and verified.
      the scope guard is the API.
 
   2. **Configurable pool size.** `RequestDbPool::from_env_default`
-     reads `REQUEST_DB_POOL_SIZE` (default `8`, was a hard-coded
+     reads `DELPHI_DB_POOL_SIZE` (default `8`, was a hard-coded
      `16`). Validates `> 0`. Documented in `.env.example`.
 
   3. **Documented future upgrade path.** Doc-comment on

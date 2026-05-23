@@ -50,67 +50,67 @@ services:
     command: ["serve"]
     environment:
       STORAGE_BACKEND: surreal
-      SURREAL_URL: ws://surrealdb:8000/rpc
+      DELPHI_DB_URL: ws://surrealdb:8000/rpc
       # Service-account credentials for the backend's privileged DB
       # connection (boot, admin, scheduler). Production guard refuses to
-      # start with these defaults when RUST_ENV=production.
-      SURREAL_SERVICE_USER: ${SURREAL_SERVICE_USER:-root}
-      SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:-root}
-      SURREAL_NS: delphi
-      SURREAL_DB: main
+      # start with these defaults when DELPHI_ENV=production.
+      DELPHI_DB_USER: ${DELPHI_DB_USER:-root}
+      DELPHI_DB_PASSWORD: ${DELPHI_DB_PASSWORD:-root}
+      DELPHI_DB_NAMESPACE: delphi
+      DELPHI_DB_NAME: main
       # Tier 1: SurrealDB validates the dev JWT with an HS512 shared
       # secret. The (currently-broken, audit finding N1) dev injector
       # will sign with the same secret once it is restored.
-      SURREAL_JWT_MODE: hs512
-      SURREAL_JWT_SECRET: ${SURREAL_JWT_SECRET:-tier1-dev-jwt-secret-not-for-production}
+      DELPHI_DB_JWT_MODE: hs512
+      DELPHI_DB_JWT_SECRET: ${DELPHI_DB_JWT_SECRET:-tier1-dev-jwt-secret-not-for-production}
       # Tenant the scheduler-driven adapters write to (single-tenant v1).
-      SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-dev}
-      BIND_ADDR: 0.0.0.0:8081
+      DELPHI_SOURCES_DEFAULT_TENANT: ${DELPHI_SOURCES_DEFAULT_TENANT:-dev}
+      DELPHI_SERVER_BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
       # Auth — `dev` injects `X-Auth-*` headers internally; `header` requires
       # an upstream proxy (use docker-compose.full.yml for that).
-      AUTH_MODE: ${AUTH_MODE:-dev}
-      RUST_ENV: ${RUST_ENV:-development}
-      DEFAULT_TENANT_SLUG: ${DEFAULT_TENANT_SLUG:-dev}
+      DELPHI_AUTH_MODE: ${DELPHI_AUTH_MODE:-dev}
+      DELPHI_ENV: ${DELPHI_ENV:-development}
+      DELPHI_AUTH_DEFAULT_TENANT: ${DELPHI_AUTH_DEFAULT_TENANT:-dev}
       # Dev — only honored if compiled with the `dev-auth` cargo feature
-      DEV_TENANT_SLUG: ${DEV_TENANT_SLUG:-dev}
-      DEV_USER_EMAIL: ${DEV_USER_EMAIL:-dev@delphi.local}
-      DEV_USER_NAME: ${DEV_USER_NAME:-Dev User}
+      DELPHI_AUTH_DEV_TENANT: ${DELPHI_AUTH_DEV_TENANT:-dev}
+      DELPHI_AUTH_DEV_USER_EMAIL: ${DELPHI_AUTH_DEV_USER_EMAIL:-dev@delphi.local}
+      DELPHI_AUTH_DEV_USER_NAME: ${DELPHI_AUTH_DEV_USER_NAME:-Dev User}
       # LLM (read at startup by rig via env)
-      LLM_PROVIDER: ${LLM_PROVIDER:-}
-      LLM_MODEL: ${LLM_MODEL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
-      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      # Source adapters (Discovery pillar). All optional; SOURCES_ENABLED
+      DELPHI_PROVIDER: ${DELPHI_PROVIDER:-}
+      DELPHI_PROVIDER_MODEL: ${DELPHI_PROVIDER_MODEL:-}
+      DELPHI_PROVIDER_ANTHROPIC_API_KEY: ${DELPHI_PROVIDER_ANTHROPIC_API_KEY:-}
+      DELPHI_PROVIDER_OPENAI_API_KEY: ${DELPHI_PROVIDER_OPENAI_API_KEY:-}
+      DELPHI_PROVIDER_MINIMAX_API_KEY: ${DELPHI_PROVIDER_MINIMAX_API_KEY:-}
+      DELPHI_PROVIDER_MINIMAX_BASE_URL: ${DELPHI_PROVIDER_MINIMAX_BASE_URL:-}
+      DELPHI_PROVIDER_GOOGLE_API_KEY: ${DELPHI_PROVIDER_GOOGLE_API_KEY:-}
+      # Source adapters (Discovery pillar). All optional; DELPHI_SOURCES_ENABLED
       # gates the scheduler entirely. No in-tree adapters today.
-      SOURCES_ENABLED: ${SOURCES_ENABLED:-false}
+      DELPHI_SOURCES_ENABLED: ${DELPHI_SOURCES_ENABLED:-false}
       # Object storage for original artefacts (PDFs etc.). Direct-to-S3
       # via MinIO (ingestion v2). The bucket from the URL is informational;
       # the connection knobs come from INGEST_S3_* below.
-      OBJECT_STORE_URL: ${OBJECT_STORE_URL:-s3://delphi/}
+      DELPHI_INGEST_OBJECT_STORE_URL: ${DELPHI_INGEST_OBJECT_STORE_URL:-s3://delphi/}
       # Backend → MinIO (internal docker network host).
-      INGEST_S3_ENDPOINT_INTERNAL: ${INGEST_S3_ENDPOINT_INTERNAL:-http://minio:9000}
+      DELPHI_INGEST_S3_ENDPOINT_INTERNAL: ${DELPHI_INGEST_S3_ENDPOINT_INTERNAL:-http://minio:9000}
       # Embedded in presigned URLs the browser PUTs to directly. Tier-1
       # exposes MinIO on :9000 to the host, same origin policy permitting
       # via CORS (allows the Vite :5173 origin).
-      INGEST_S3_ENDPOINT_PUBLIC: ${INGEST_S3_ENDPOINT_PUBLIC:-http://localhost:9000}
-      INGEST_S3_REGION: ${INGEST_S3_REGION:-us-east-1}
-      INGEST_S3_BUCKET: ${INGEST_S3_BUCKET:-delphi}
-      INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-delphi}
-      INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
-      INGEST_S3_FORCE_PATH_STYLE: ${INGEST_S3_FORCE_PATH_STYLE:-true}
+      DELPHI_INGEST_S3_ENDPOINT_PUBLIC: ${DELPHI_INGEST_S3_ENDPOINT_PUBLIC:-http://localhost:9000}
+      DELPHI_INGEST_S3_REGION: ${DELPHI_INGEST_S3_REGION:-us-east-1}
+      DELPHI_INGEST_S3_BUCKET: ${DELPHI_INGEST_S3_BUCKET:-delphi}
+      DELPHI_INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-delphi}
+      DELPHI_INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+      DELPHI_INGEST_S3_FORCE_PATH_STYLE: ${DELPHI_INGEST_S3_FORCE_PATH_STYLE:-true}
       # RAG v1: embedder sidecars (tei-chunk + tei-paper). The backend
       # tolerates absent / disabled embedders — RAG is a pillar, not a
       # boot-critical dep — but the defaults wire it up.
-      EMBEDDER_CHUNK_ENABLED: ${EMBEDDER_CHUNK_ENABLED:-true}
-      EMBEDDER_CHUNK_ENDPOINT: ${EMBEDDER_CHUNK_ENDPOINT:-http://tei-chunk:80}
-      EMBEDDER_CHUNK_MODEL_NAME: ${EMBEDDER_CHUNK_MODEL_NAME:-bge-small-en-v1.5}
-      EMBEDDER_DOCUMENT_ENABLED: ${EMBEDDER_DOCUMENT_ENABLED:-true}
-      EMBEDDER_DOCUMENT_ENDPOINT: ${EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
-      EMBEDDER_DOCUMENT_MODEL_NAME: ${EMBEDDER_DOCUMENT_MODEL_NAME:-specter2}
+      DELPHI_EMBEDDER_CHUNK_ENABLED: ${DELPHI_EMBEDDER_CHUNK_ENABLED:-true}
+      DELPHI_EMBEDDER_CHUNK_ENDPOINT: ${DELPHI_EMBEDDER_CHUNK_ENDPOINT:-http://tei-chunk:80}
+      DELPHI_EMBEDDER_CHUNK_MODEL: ${DELPHI_EMBEDDER_CHUNK_MODEL:-bge-small-en-v1.5}
+      DELPHI_EMBEDDER_DOCUMENT_ENABLED: ${DELPHI_EMBEDDER_DOCUMENT_ENABLED:-true}
+      DELPHI_EMBEDDER_DOCUMENT_ENDPOINT: ${DELPHI_EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
+      DELPHI_EMBEDDER_DOCUMENT_MODEL: ${DELPHI_EMBEDDER_DOCUMENT_MODEL:-specter2}
     ports:
       - "8081:8081"
     depends_on:

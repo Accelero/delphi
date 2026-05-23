@@ -12,7 +12,7 @@
  *      unit test (`PdfViewer.test.tsx`) and verify here that the
  *      query-param plumbing reaches the viewer.
  *
- *   2. **LLM round-trip (`test.skip` unless `ANTHROPIC_API_KEY` is
+ *   2. **LLM round-trip (`test.skip` unless `DELPHI_PROVIDER_ANTHROPIC_API_KEY` is
  *      set).** POST `/api/chat` directly with a synthetic question,
  *      assert the response opens with a `2:` citations data block
  *      and contains at least one `[N]` marker.
@@ -77,7 +77,7 @@ test("deep link `/feed?doc=&chunk=` opens the PDF viewer at the target doc", asy
 });
 
 const LLM_ROUNDTRIP =
-  process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY
+  process.env.DELPHI_PROVIDER_ANTHROPIC_API_KEY || process.env.DELPHI_PROVIDER_OPENAI_API_KEY
     ? test
     : test.skip;
 

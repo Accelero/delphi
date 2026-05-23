@@ -1,6 +1,6 @@
 //! S3-compatible `ObjectStore` backed by `aws-sdk-s3`.
 //!
-//! Configured by `OBJECT_STORE_URL=s3://<bucket>/...` (the URL only
+//! Configured by `DELPHI_INGEST_OBJECT_STORE_URL=s3://<bucket>/...` (the URL only
 //! selects the scheme; the bucket and connection knobs come from
 //! `INGEST_S3_*` env vars) via [`S3ObjectStore::from_env`]. Same impl
 //! serves MinIO, Hetzner, R2, B2, AWS — only the endpoints and the
@@ -9,10 +9,10 @@
 //! ## Dual endpoint (the subtle part)
 //!
 //! The backend talks to S3 over an **internal** host
-//! (`INGEST_S3_ENDPOINT_INTERNAL`, e.g. `http://minio:9000`) for HEAD /
+//! (`DELPHI_INGEST_S3_ENDPOINT_INTERNAL`, e.g. `http://minio:9000`) for HEAD /
 //! GET / complete / abort / listing, but **presigned** part-upload URLs
 //! must carry the **browser-facing** host
-//! (`INGEST_S3_ENDPOINT_PUBLIC`, e.g. `http://localhost:9000` in tier-1
+//! (`DELPHI_INGEST_S3_ENDPOINT_PUBLIC`, e.g. `http://localhost:9000` in tier-1
 //! or `http://localhost/s3` in tier-2). SigV4 signs the host header and
 //! the full path (including any `/s3` prefix when path-style is on), so
 //! the presigned URL must be generated against the public endpoint or
@@ -61,21 +61,21 @@ pub struct S3Config {
 
 impl S3Config {
     pub fn from_env() -> std::result::Result<Self, Error> {
-        let endpoint_internal = std::env::var("INGEST_S3_ENDPOINT_INTERNAL")
-            .map_err(|_| Error::EnvMissing("INGEST_S3_ENDPOINT_INTERNAL".into()))?;
+        let endpoint_internal = std::env::var("DELPHI_INGEST_S3_ENDPOINT_INTERNAL")
+            .map_err(|_| Error::EnvMissing("DELPHI_INGEST_S3_ENDPOINT_INTERNAL".into()))?;
         // Default the public endpoint to the internal one so a single-host
         // deployment (browser and backend share the endpoint) needs only
         // one var.
-        let endpoint_public = std::env::var("INGEST_S3_ENDPOINT_PUBLIC")
+        let endpoint_public = std::env::var("DELPHI_INGEST_S3_ENDPOINT_PUBLIC")
             .unwrap_or_else(|_| endpoint_internal.clone());
-        let region = std::env::var("INGEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
-        let bucket = std::env::var("INGEST_S3_BUCKET")
-            .map_err(|_| Error::EnvMissing("INGEST_S3_BUCKET".into()))?;
-        let access_key_id = std::env::var("INGEST_S3_ACCESS_KEY_ID")
-            .map_err(|_| Error::EnvMissing("INGEST_S3_ACCESS_KEY_ID".into()))?;
-        let secret_access_key = std::env::var("INGEST_S3_SECRET_ACCESS_KEY")
-            .map_err(|_| Error::EnvMissing("INGEST_S3_SECRET_ACCESS_KEY".into()))?;
-        let force_path_style = std::env::var("INGEST_S3_FORCE_PATH_STYLE")
+        let region = std::env::var("DELPHI_INGEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into());
+        let bucket = std::env::var("DELPHI_INGEST_S3_BUCKET")
+            .map_err(|_| Error::EnvMissing("DELPHI_INGEST_S3_BUCKET".into()))?;
+        let access_key_id = std::env::var("DELPHI_INGEST_S3_ACCESS_KEY_ID")
+            .map_err(|_| Error::EnvMissing("DELPHI_INGEST_S3_ACCESS_KEY_ID".into()))?;
+        let secret_access_key = std::env::var("DELPHI_INGEST_S3_SECRET_ACCESS_KEY")
+            .map_err(|_| Error::EnvMissing("DELPHI_INGEST_S3_SECRET_ACCESS_KEY".into()))?;
+        let force_path_style = std::env::var("DELPHI_INGEST_S3_FORCE_PATH_STYLE")
             .map(|s| matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(true);
         Ok(Self {
@@ -597,7 +597,7 @@ mod tests {
     #[test]
     fn public_endpoint_defaults_to_internal() {
         // Documented behaviour: a single-host deployment can omit
-        // INGEST_S3_ENDPOINT_PUBLIC and the public client points at the
+        // DELPHI_INGEST_S3_ENDPOINT_PUBLIC and the public client points at the
         // internal endpoint. (We only check the parsing convention here;
         // exercising `from_env` would pollute the process env.)
         let internal = "http://minio:9000".to_string();

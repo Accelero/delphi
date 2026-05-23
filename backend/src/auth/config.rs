@@ -50,7 +50,7 @@ pub struct DevConfig {
     /// Shared HS512 secret. The dev injector signs with this and
     /// SurrealDB's `app_session` access method validates against it
     /// (registered at startup via `SystemDb::define_jwt_access`).
-    /// Loaded from `SURREAL_JWT_SECRET` so dev and storage stay in
+    /// Loaded from `DELPHI_DB_JWT_SECRET` so dev and storage stay in
     /// sync on a single knob.
     pub jwt_secret: String,
     /// `ns` / `db` claims SurrealDB requires for routing. Default to
@@ -66,11 +66,11 @@ pub struct AuthConfig {
 
 impl AuthConfig {
     pub fn from_env() -> Result<Self> {
-        let mode_raw = std::env::var("AUTH_MODE").unwrap_or_else(|_| "header".into());
+        let mode_raw = std::env::var("DELPHI_AUTH_MODE").unwrap_or_else(|_| "header".into());
         let mode = match mode_raw.as_str() {
             "header" => AuthMode::Header(load_header()),
             "dev" => load_dev_or_bail()?,
-            other => bail!("invalid AUTH_MODE: {other:?}; expected 'header' or 'dev'"),
+            other => bail!("invalid DELPHI_AUTH_MODE: {other:?}; expected 'header' or 'dev'"),
         };
         Ok(Self { mode })
     }
@@ -89,27 +89,27 @@ impl AuthConfig {
 
 fn load_header() -> HeaderConfig {
     HeaderConfig {
-        default_tenant_slug: std::env::var("DEFAULT_TENANT_SLUG")
+        default_tenant_slug: std::env::var("DELPHI_AUTH_DEFAULT_TENANT")
             .unwrap_or_else(|_| "default".into()),
     }
 }
 
 #[cfg(feature = "dev-auth")]
 fn load_dev_or_bail() -> Result<AuthMode> {
-    let tenant_slug = std::env::var("DEV_TENANT_SLUG").unwrap_or_else(|_| "dev".into());
-    let user_email = std::env::var("DEV_USER_EMAIL").unwrap_or_else(|_| "dev@delphi.local".into());
-    let user_name = std::env::var("DEV_USER_NAME").unwrap_or_else(|_| "Dev User".into());
+    let tenant_slug = std::env::var("DELPHI_AUTH_DEV_TENANT").unwrap_or_else(|_| "dev".into());
+    let user_email = std::env::var("DELPHI_AUTH_DEV_USER_EMAIL").unwrap_or_else(|_| "dev@delphi.local".into());
+    let user_name = std::env::var("DELPHI_AUTH_DEV_USER_NAME").unwrap_or_else(|_| "Dev User".into());
     // Same env var the storage layer reads — keeps the dev injector and
     // SurrealDB's `app_session` access method on a single knob.
-    let jwt_secret = std::env::var("SURREAL_JWT_SECRET").map_err(|_| {
+    let jwt_secret = std::env::var("DELPHI_DB_JWT_SECRET").map_err(|_| {
         anyhow::anyhow!(
-            "AUTH_MODE=dev requires SURREAL_JWT_SECRET (the dev injector signs \
+            "DELPHI_AUTH_MODE=dev requires DELPHI_DB_JWT_SECRET (the dev injector signs \
              with this; SurrealDB's app_session access method validates with \
              the same secret)."
         )
     })?;
-    let surreal_ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "delphi".into());
-    let surreal_db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "main".into());
+    let surreal_ns = std::env::var("DELPHI_DB_NAMESPACE").unwrap_or_else(|_| "delphi".into());
+    let surreal_db = std::env::var("DELPHI_DB_NAME").unwrap_or_else(|_| "main".into());
     Ok(AuthMode::Dev(DevConfig {
         tenant_slug,
         user_email,
@@ -123,7 +123,7 @@ fn load_dev_or_bail() -> Result<AuthMode> {
 #[cfg(not(feature = "dev-auth"))]
 fn load_dev_or_bail() -> Result<AuthMode> {
     bail!(
-        "AUTH_MODE=dev requires the 'dev-auth' cargo feature. \
-         Rebuild with `--features dev-auth` (development only) or set AUTH_MODE=header."
+        "DELPHI_AUTH_MODE=dev requires the 'dev-auth' cargo feature. \
+         Rebuild with `--features dev-auth` (development only) or set DELPHI_AUTH_MODE=header."
     )
 }

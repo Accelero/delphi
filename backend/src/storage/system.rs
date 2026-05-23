@@ -101,14 +101,14 @@ pub struct SystemDb {
 impl SystemDb {
     /// Construct from environment.
     ///
-    /// Required env vars: `SURREAL_URL`, `SURREAL_SERVICE_USER`,
-    /// `SURREAL_SERVICE_PASS`, `SURREAL_NS`, `SURREAL_DB`.
+    /// Required env vars: `DELPHI_DB_URL`, `DELPHI_DB_USER`,
+    /// `DELPHI_DB_PASSWORD`, `DELPHI_DB_NAMESPACE`, `DELPHI_DB_NAME`.
     pub async fn from_env() -> Result<Self> {
-        let url = env_or("SURREAL_URL", "ws://surrealdb:8000/rpc");
-        let user = env_required("SURREAL_SERVICE_USER")?;
-        let password = env_required("SURREAL_SERVICE_PASS")?;
-        let namespace = env_or("SURREAL_NS", "delphi");
-        let database = env_or("SURREAL_DB", "main");
+        let url = env_or("DELPHI_DB_URL", "ws://surrealdb:8000/rpc");
+        let user = env_required("DELPHI_DB_USER")?;
+        let password = env_required("DELPHI_DB_PASSWORD")?;
+        let namespace = env_or("DELPHI_DB_NAMESPACE", "delphi");
+        let database = env_or("DELPHI_DB_NAME", "main");
         Self::connect(&url, &user, &password, &namespace, &database).await
     }
 

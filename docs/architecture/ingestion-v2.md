@@ -575,20 +575,20 @@ All env, all defaulted, all documented in `.env.example`:
 | Variable | Default | Notes |
 |---|---|---|
 | `INGEST_S3_ENDPOINT` | (none) | e.g. `https://nbg1.your-objectstorage.com` for Hetzner; unset for AWS. |
-| `INGEST_S3_REGION` | `us-east-1` | Required by SDK; ignored by some providers. |
-| `INGEST_S3_BUCKET` | (required) | One bucket; tenant scoping by prefix. |
-| `INGEST_S3_ACCESS_KEY_ID` / `INGEST_S3_SECRET_ACCESS_KEY` | (required) | Service credential. |
-| `INGEST_S3_FORCE_PATH_STYLE` | `true` | True for MinIO/Hetzner/B2; false for AWS / R2. |
+| `DELPHI_INGEST_S3_REGION` | `us-east-1` | Required by SDK; ignored by some providers. |
+| `DELPHI_INGEST_S3_BUCKET` | (required) | One bucket; tenant scoping by prefix. |
+| `DELPHI_INGEST_S3_ACCESS_KEY_ID` / `DELPHI_INGEST_S3_SECRET_ACCESS_KEY` | (required) | Service credential. |
+| `DELPHI_INGEST_S3_FORCE_PATH_STYLE` | `true` | True for MinIO/Hetzner/B2; false for AWS / R2. |
 | `INGEST_UPLOAD_PART_SIZE_BYTES` | `8388608` (8 MB) | Returned in `create`; Uppy uses for chunking. S3 minimum 5 MB except last part. |
 | `INGEST_UPLOAD_PART_URL_TTL_SECS` | `900` (15 min) | Per-part presigned URL lifetime. |
 | `INGEST_UPLOAD_SESSION_TTL_SECS` | `3600` (1 h) | Session bounded lifetime. `sign-part` rejects older. |
-| `INGEST_UPLOAD_MAX_FILE_SIZE_BYTES` | `209715200` (200 MB) | Layer-1 cap. |
-| `INGEST_ALLOWED_CONTENT_TYPES` | `application/pdf,text/plain,text/markdown` | Comma-separated allowlist. |
-| `INGEST_VALIDATOR_SNIFF_WINDOW_BYTES` | `4096` | Ranged GET size for magic-byte check. |
-| `INGEST_VALIDATOR_PDF_MAX_INPUT_BYTES` | `52428800` (50 MB) | Hard cap on bytes piped into the PDF parser. |
-| `INGEST_VALIDATOR_PDF_MAX_PAGES` | `2000` | Page-count cap. |
-| `INGEST_VALIDATOR_PDF_TIMEOUT_SECS` | `30` | Wall-clock timeout on PDF parse. |
-| `INGEST_VALIDATOR_REJECT_POLYGLOTS` | `true` | Reject files matching >1 allowed type. |
+| `DELPHI_INGEST_UPLOAD_MAX_FILE_SIZE_BYTES` | `209715200` (200 MB) | Layer-1 cap. |
+| `DELPHI_INGEST_ALLOWED_CONTENT_TYPES` | `application/pdf,text/plain,text/markdown` | Comma-separated allowlist. |
+| `DELPHI_INGEST_VALIDATOR_SNIFF_WINDOW_BYTES` | `4096` | Ranged GET size for magic-byte check. |
+| `DELPHI_INGEST_VALIDATOR_PDF_MAX_INPUT_BYTES` | `52428800` (50 MB) | Hard cap on bytes piped into the PDF parser. |
+| `DELPHI_INGEST_VALIDATOR_PDF_MAX_PAGES` | `2000` | Page-count cap. |
+| `DELPHI_INGEST_VALIDATOR_PDF_TIMEOUT_SECS` | `30` | Wall-clock timeout on PDF parse. |
+| `DELPHI_INGEST_VALIDATOR_REJECT_POLYGLOTS` | `true` | Reject files matching >1 allowed type. |
 | `INGEST_REJECTION_TTL_SECS` | `3600` (1 h) | How long `ingestion_rejection` rows are kept for status polling. |
 | `INGEST_CLEANUP_MIN_AGE_HOURS` | `4` | Cleaner ignores anything younger. Asserted at startup to be `> 2 × INGEST_UPLOAD_SESSION_TTL_SECS`. |
 | `INGEST_CLEANUP_CRON` | `0 3 * * *` | Nightly. See "Cleaner cadence" below. |

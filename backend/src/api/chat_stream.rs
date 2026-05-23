@@ -15,7 +15,7 @@
 //! The identity middleware attaches an `Arc<AuthedDb>` extension that
 //! lives for the entire request. For a long-lived SSE response, that
 //! would mean one pool slot held per open tab — with default
-//! `REQUEST_DB_POOL_SIZE=8`, the pool deadlocks after ~9 tabs.
+//! `DELPHI_DB_POOL_SIZE=8`, the pool deadlocks after ~9 tabs.
 //!
 //! The fix is structural: perform the `get_conversation` permission
 //! check up front while we still hold the handle, then **explicitly

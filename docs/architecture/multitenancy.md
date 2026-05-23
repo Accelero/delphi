@@ -204,14 +204,14 @@ let app = build_router(AppState { db: request_pool, ... }, ...);
 
 New env vars:
 
-- `SURREAL_SERVICE_USER` / `SURREAL_SERVICE_PASS` — DB-level user with
+- `DELPHI_DB_USER` / `DELPHI_DB_PASSWORD` — DB-level user with
   `EDITOR` role. Replaces today's `SURREAL_USER` / `SURREAL_PASS`.
 
-`enforce_production_guard` extended: when `RUST_ENV=production`, refuse
+`enforce_production_guard` extended: when `DELPHI_ENV=production`, refuse
 to start if any of:
 
-- `SURREAL_SERVICE_USER` unset or equals `root`
-- `SURREAL_SERVICE_PASS` unset or equals `root`
+- `DELPHI_DB_USER` unset or equals `root`
+- `DELPHI_DB_PASSWORD` unset or equals `root`
 
 (JWT-related guards land in Phase 2.)
 
@@ -323,7 +323,7 @@ Per ARCH.md's existing aspiration:
 - `JwtClaimsExtractor` — production. Validates JWT signature in-process
   before even hitting the DB.
 
-Selected at startup based on `AUTH_MODE`:
+Selected at startup based on `DELPHI_AUTH_MODE`:
 - `header` — current behaviour
 - `jwt` — new path; required for any deployment exposed beyond
   localhost
@@ -365,7 +365,7 @@ New integration test file:
   per checkout
 - `backend/src/api/mod.rs` — pick extractor by mode
 - `backend/src/auth/guard.rs` — production guard refuses
-  `AUTH_MODE=header` when `RUST_ENV=production`
+  `DELPHI_AUTH_MODE=header` when `DELPHI_ENV=production`
 - `ops/oauth2-proxy/oauth2-proxy.cfg` — pass authorization header
 - `ops/traefik/dynamic/routes.yml` — forward `Authorization` header
 - `docker-compose.full.yml` — env vars for JWKS URL, issuer, audience
@@ -376,10 +376,10 @@ New integration test file:
 
 Production guard adds:
 
-- `IDP_JWKS_URL` must be set when `AUTH_MODE=jwt`
-- `IDP_ISSUER` must be set when `AUTH_MODE=jwt`
-- `IDP_AUDIENCE` must be set when `AUTH_MODE=jwt`
-- `AUTH_MODE` cannot be `header` when `RUST_ENV=production`
+- `IDP_JWKS_URL` must be set when `DELPHI_AUTH_MODE=jwt`
+- `IDP_ISSUER` must be set when `DELPHI_AUTH_MODE=jwt`
+- `IDP_AUDIENCE` must be set when `DELPHI_AUTH_MODE=jwt`
+- `DELPHI_AUTH_MODE` cannot be `header` when `DELPHI_ENV=production`
 
 Closes finding **C3** in full.
 
@@ -449,7 +449,7 @@ Closes finding **C3** in full.
    hardening).
 
 5. **Scheduler tenant assignment (single-tenant v1):** new env var
-   `SOURCES_DEFAULT_TENANT_SLUG`. Scheduler resolves the slug to a
+   `DELPHI_SOURCES_DEFAULT_TENANT`. Scheduler resolves the slug to a
    `RecordId` once at startup and threads it through every
    `IngestRequest`. v2 multi-tenant scheduler ingest is a separate
    change.

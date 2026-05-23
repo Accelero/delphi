@@ -1,4 +1,4 @@
-//! `OBJECT_STORE_URL` → impl dispatch. S3-only after the LocalFs removal.
+//! `DELPHI_INGEST_OBJECT_STORE_URL` → impl dispatch. S3-only after the LocalFs removal.
 
 use delphi::error::Error;
 use delphi::object_store::from_url;

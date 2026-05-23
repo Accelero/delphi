@@ -138,7 +138,7 @@ subscribers.is_empty() && idle_for > 1h` is tracked as a
 
 The identity middleware attaches `Arc<AuthedDb>` to every protected
 request. For a long-lived SSE response this would mean one pool slot
-held per open tab — the pool deadlocks at `REQUEST_DB_POOL_SIZE + 1`
+held per open tab — the pool deadlocks at `DELPHI_DB_POOL_SIZE + 1`
 tabs.
 
 Fix: the SSE handler in `backend/src/api/chat_stream.rs` pulls

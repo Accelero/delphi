@@ -16,39 +16,39 @@ pub async fn system_db_from_env() -> Result<Arc<SystemDb>> {
 
 /// Load the runtime config for the `app_session` JWT access method.
 ///
-/// `SURREAL_JWT_MODE=jwks` — production. Requires `SURREAL_JWT_JWKS_URL`
+/// `DELPHI_DB_JWT_MODE=jwks` — production. Requires `DELPHI_DB_JWT_JWKS_URL`
 /// pointing at the IdP's JWKS endpoint (e.g.
 /// `http://keycloak:8080/realms/delphi/protocol/openid-connect/certs`).
 /// SurrealDB fetches public keys from that URL on first auth and
 /// caches them.
 ///
-/// `SURREAL_JWT_MODE=hs512` — tier-1 dev and tests. Requires
-/// `SURREAL_JWT_SECRET`. The dev-injector middleware (or the test
+/// `DELPHI_DB_JWT_MODE=hs512` — tier-1 dev and tests. Requires
+/// `DELPHI_DB_JWT_SECRET`. The dev-injector middleware (or the test
 /// harness) mints JWTs signed with the same secret.
 ///
-/// `SURREAL_JWT_EXPECTED_ISSUER` / `SURREAL_JWT_EXPECTED_AUDIENCE` —
+/// `DELPHI_DB_JWT_ISSUER` / `DELPHI_DB_JWT_AUDIENCE` —
 /// optional. When set, the AUTHENTICATE clause throws on mismatching
 /// `iss` / `aud`.
 pub fn jwt_access_from_env() -> Result<JwtAccessConfig> {
-    let mode = std::env::var("SURREAL_JWT_MODE").unwrap_or_else(|_| "hs512".into());
+    let mode = std::env::var("DELPHI_DB_JWT_MODE").unwrap_or_else(|_| "hs512".into());
     let kind = match mode.as_str() {
         "jwks" => JwtAccessKind::Jwks {
-            url: env_required("SURREAL_JWT_JWKS_URL")?,
+            url: env_required("DELPHI_DB_JWT_JWKS_URL")?,
         },
         "hs512" => JwtAccessKind::Hs512 {
-            secret: env_required("SURREAL_JWT_SECRET")?,
+            secret: env_required("DELPHI_DB_JWT_SECRET")?,
         },
         other => {
             return Err(Error::InvalidConfig(format!(
-                "SURREAL_JWT_MODE={other:?}; expected 'jwks' or 'hs512'"
+                "DELPHI_DB_JWT_MODE={other:?}; expected 'jwks' or 'hs512'"
             )))
         }
     };
     Ok(JwtAccessConfig {
         kind,
-        expected_issuer: std::env::var("SURREAL_JWT_EXPECTED_ISSUER").ok(),
-        expected_audience: std::env::var("SURREAL_JWT_EXPECTED_AUDIENCE").ok(),
-        session_duration_secs: std::env::var("SURREAL_JWT_SESSION_SECS")
+        expected_issuer: std::env::var("DELPHI_DB_JWT_ISSUER").ok(),
+        expected_audience: std::env::var("DELPHI_DB_JWT_AUDIENCE").ok(),
+        session_duration_secs: std::env::var("DELPHI_DB_JWT_SESSION_SECS")
             .ok()
             .and_then(|s| s.parse().ok()),
     })

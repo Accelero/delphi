@@ -6,7 +6,7 @@
 //! re-extraction or "show original" surfaces.
 //!
 //! Backend choice is **inferred from a URL** — single env var
-//! `OBJECT_STORE_URL` carries it. Production is always S3-compatible
+//! `DELPHI_INGEST_OBJECT_STORE_URL` carries it. Production is always S3-compatible
 //! (`s3://<bucket>/...`); MinIO in dev, any S3 provider in prod. See
 //! [`from_url`].
 //!

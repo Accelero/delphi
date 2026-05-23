@@ -9,13 +9,13 @@
 //! varies is the JWT *source*:
 //!
 //! - tier-1 / tests: [`Hs512ServiceIdentity`] mints HS512 locally with
-//!   the same `SURREAL_JWT_SECRET` the engine validates against.
+//!   the same `DELPHI_DB_JWT_SECRET` the engine validates against.
 //! - tier-2 / prod: [`OAuthClientCredsIdentity`] does an OAuth2
 //!   `client_credentials` exchange against the IdP (Keycloak), caches
 //!   the access token, and refreshes before expiry.
 //!
 //! The factory [`service_identity_from_env`] picks one based on
-//! `AUTH_MODE`, mirroring [`super::AuthConfig::from_env`].
+//! `DELPHI_AUTH_MODE`, mirroring [`super::AuthConfig::from_env`].
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -222,24 +222,24 @@ impl ServiceIdentity for OAuthClientCredsIdentity {
 
 // ─── factory ──────────────────────────────────────────────────────────────
 
-/// Build the service identity matching the current `AUTH_MODE`. The
+/// Build the service identity matching the current `DELPHI_AUTH_MODE`. The
 /// factory takes a `name` so different adapters can mint identities
 /// with distinct `sub` values (and, in tier-2, distinct OAuth clients
 /// — set via `${NAME}_OAUTH_*` env vars on the prefix-uppercased name).
 ///
 /// Example: a caller named `sources` reads `SOURCES_OAUTH_*`.
 pub fn service_identity_from_env(name: &str) -> Result<Arc<dyn ServiceIdentity>> {
-    let mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "header".into());
+    let mode = std::env::var("DELPHI_AUTH_MODE").unwrap_or_else(|_| "header".into());
     match mode.as_str() {
         "dev" => {
-            let secret = std::env::var("SURREAL_JWT_SECRET").context(
-                "AUTH_MODE=dev: SURREAL_JWT_SECRET required for service identity \
+            let secret = std::env::var("DELPHI_DB_JWT_SECRET").context(
+                "DELPHI_AUTH_MODE=dev: DELPHI_DB_JWT_SECRET required for service identity \
                  (mints HS512 with the same key SurrealDB validates against)",
             )?;
-            let tenant = std::env::var("SOURCES_DEFAULT_TENANT_SLUG")
+            let tenant = std::env::var("DELPHI_SOURCES_DEFAULT_TENANT")
                 .unwrap_or_else(|_| "default".into());
-            let ns = std::env::var("SURREAL_NS").unwrap_or_else(|_| "delphi".into());
-            let db = std::env::var("SURREAL_DB").unwrap_or_else(|_| "main".into());
+            let ns = std::env::var("DELPHI_DB_NAMESPACE").unwrap_or_else(|_| "delphi".into());
+            let db = std::env::var("DELPHI_DB_NAME").unwrap_or_else(|_| "main".into());
             Ok(Arc::new(Hs512ServiceIdentity::new(name, secret, tenant, ns, db)))
         }
         "header" => {
@@ -253,14 +253,14 @@ pub fn service_identity_from_env(name: &str) -> Result<Arc<dyn ServiceIdentity>>
                 client_secret,
             )?))
         }
-        other => Err(anyhow!("invalid AUTH_MODE for service identity: {other:?}")),
+        other => Err(anyhow!("invalid DELPHI_AUTH_MODE for service identity: {other:?}")),
     }
 }
 
 fn required_env(name: &str) -> Result<String> {
     std::env::var(name).map_err(|_| {
         anyhow!(
-            "AUTH_MODE=header: {name} required for service identity \
+            "DELPHI_AUTH_MODE=header: {name} required for service identity \
              (OAuth2 client_credentials against the IdP)"
         )
     })

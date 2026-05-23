@@ -150,7 +150,7 @@ Pre-requisite. Single `ObjectStore` impl for the rest of the work.
   storage_uri synthesis); the `bucket` field stops needing a `"local"`
   sentinel.
 - `backend/src/api/mod.rs` — drop the
-  `file:///var/lib/delphi/originals` default for `OBJECT_STORE_URL`;
+  `file:///var/lib/delphi/originals` default for `DELPHI_INGEST_OBJECT_STORE_URL`;
   make it required (boot fails with a clear error if unset).
 - `backend/tests/common/mod.rs` — `TestApp::build_with_local_fs()`
   becomes `build_with_mem()` (or similar). See the test-backend note
@@ -514,8 +514,8 @@ browser-facing host.
 
 | Var | Tier-1 | Tier-2 |
 |---|---|---|
-| `INGEST_S3_ENDPOINT_INTERNAL` | `http://minio:9000` | `http://minio:9000` |
-| `INGEST_S3_ENDPOINT_PUBLIC` | `http://localhost:9000` | `http://localhost/s3` |
+| `DELPHI_INGEST_S3_ENDPOINT_INTERNAL` | `http://minio:9000` | `http://minio:9000` |
+| `DELPHI_INGEST_S3_ENDPOINT_PUBLIC` | `http://localhost:9000` | `http://localhost/s3` |
 
 **SigV4 + path-style + the `/s3` prefix (decided: forward unstripped).**
 With `force_path_style=true` the signed URL is
@@ -544,7 +544,7 @@ behavior-version-latest). The dual endpoint is the subtle part:
   one.
 - **`from_url` rewiring** (`object_store/url.rs:18`): the `s3://` branch
   (today `s3::not_yet_supported`, `url.rs:24`) calls
-  `S3ObjectStore::from_env()`. `OBJECT_STORE_URL` supplies the bucket;
+  `S3ObjectStore::from_env()`. `DELPHI_INGEST_OBJECT_STORE_URL` supplies the bucket;
   the endpoints/creds come from `INGEST_S3_*`, not the URL.
 
 Implement the 11 trait methods; the four multipart ones
@@ -557,13 +557,13 @@ against a MinIO testcontainer (gated by `MINIO_TEST_ENDPOINT`).
 
 | Var | Tier-1 | Tier-2 | Notes |
 |---|---|---|---|
-| `OBJECT_STORE_URL` | `s3://delphi/` | `s3://delphi/` | Required. |
-| `INGEST_S3_ENDPOINT_INTERNAL` | `http://minio:9000` | `http://minio:9000` | Backend → S3. |
-| `INGEST_S3_ENDPOINT_PUBLIC` | `http://localhost:9000` | `http://localhost/s3` | In presigned URLs. |
-| `INGEST_S3_REGION` | `us-east-1` | `us-east-1` | MinIO ignores. |
-| `INGEST_S3_BUCKET` | `delphi` | `delphi` | One bucket. |
-| `INGEST_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | `${MINIO_ROOT_*}` | same | Pass-through. |
-| `INGEST_S3_FORCE_PATH_STYLE` | `true` | `true` | Required for MinIO. |
+| `DELPHI_INGEST_OBJECT_STORE_URL` | `s3://delphi/` | `s3://delphi/` | Required. |
+| `DELPHI_INGEST_S3_ENDPOINT_INTERNAL` | `http://minio:9000` | `http://minio:9000` | Backend → S3. |
+| `DELPHI_INGEST_S3_ENDPOINT_PUBLIC` | `http://localhost:9000` | `http://localhost/s3` | In presigned URLs. |
+| `DELPHI_INGEST_S3_REGION` | `us-east-1` | `us-east-1` | MinIO ignores. |
+| `DELPHI_INGEST_S3_BUCKET` | `delphi` | `delphi` | One bucket. |
+| `DELPHI_INGEST_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` | `${MINIO_ROOT_*}` | same | Pass-through. |
+| `DELPHI_INGEST_S3_FORCE_PATH_STYLE` | `true` | `true` | Required for MinIO. |
 
 ## Phase 2 — Frontend: upload tab + global task tracker
 

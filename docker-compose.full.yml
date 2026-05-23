@@ -133,56 +133,56 @@ services:
     command: ["serve"]
     environment:
       STORAGE_BACKEND: surreal
-      SURREAL_URL: ws://surrealdb:8000/rpc
+      DELPHI_DB_URL: ws://surrealdb:8000/rpc
       # Service-account credentials. Defaults are 'root' for the dev
       # bring-up; production guard refuses these defaults when
-      # RUST_ENV=production, so a real prod deployment must override.
-      SURREAL_SERVICE_USER: ${SURREAL_SERVICE_USER:-root}
-      SURREAL_SERVICE_PASS: ${SURREAL_SERVICE_PASS:-root}
-      SURREAL_NS: delphi
-      SURREAL_DB: main
+      # DELPHI_ENV=production, so a real prod deployment must override.
+      DELPHI_DB_USER: ${DELPHI_DB_USER:-root}
+      DELPHI_DB_PASSWORD: ${DELPHI_DB_PASSWORD:-root}
+      DELPHI_DB_NAMESPACE: delphi
+      DELPHI_DB_NAME: main
       # Per-request SurrealDB authentication: the IdP JWT (forwarded
       # by oauth2-proxy as `Authorization: Bearer …`) is validated
       # engine-side against Keycloak's JWKS, then PERMISSIONS clauses
       # on every domain table enforce tenant isolation.
-      SURREAL_JWT_MODE: jwks
-      SURREAL_JWT_JWKS_URL: ${SURREAL_JWT_JWKS_URL:-http://keycloak:8080/realms/delphi/protocol/openid-connect/certs}
-      SOURCES_DEFAULT_TENANT_SLUG: ${SOURCES_DEFAULT_TENANT_SLUG:-tenant-a}
-      BIND_ADDR: 0.0.0.0:8081
+      DELPHI_DB_JWT_MODE: jwks
+      DELPHI_DB_JWT_JWKS_URL: ${DELPHI_DB_JWT_JWKS_URL:-http://keycloak:8080/realms/delphi/protocol/openid-connect/certs}
+      DELPHI_SOURCES_DEFAULT_TENANT: ${DELPHI_SOURCES_DEFAULT_TENANT:-tenant-a}
+      DELPHI_SERVER_BIND_ADDR: 0.0.0.0:8081
       RUST_LOG: info,delphi=debug
-      AUTH_MODE: header
-      # Default to development for tier-2 dev. Set RUST_ENV=production
+      DELPHI_AUTH_MODE: header
+      # Default to development for tier-2 dev. Set DELPHI_ENV=production
       # for a real deployment — the runtime guard then refuses to
       # start with default Surreal credentials.
-      RUST_ENV: ${RUST_ENV:-development}
-      DEFAULT_TENANT_SLUG: ${DEFAULT_TENANT_SLUG:-tenant-a}
-      LLM_PROVIDER: ${LLM_PROVIDER:-}
-      LLM_MODEL: ${LLM_MODEL:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
-      MINIMAX_BASE_URL: ${MINIMAX_BASE_URL:-}
+      DELPHI_ENV: ${DELPHI_ENV:-development}
+      DELPHI_AUTH_DEFAULT_TENANT: ${DELPHI_AUTH_DEFAULT_TENANT:-tenant-a}
+      DELPHI_PROVIDER: ${DELPHI_PROVIDER:-}
+      DELPHI_PROVIDER_MODEL: ${DELPHI_PROVIDER_MODEL:-}
+      DELPHI_PROVIDER_ANTHROPIC_API_KEY: ${DELPHI_PROVIDER_ANTHROPIC_API_KEY:-}
+      DELPHI_PROVIDER_OPENAI_API_KEY: ${DELPHI_PROVIDER_OPENAI_API_KEY:-}
+      DELPHI_PROVIDER_GOOGLE_API_KEY: ${DELPHI_PROVIDER_GOOGLE_API_KEY:-}
+      DELPHI_PROVIDER_MINIMAX_API_KEY: ${DELPHI_PROVIDER_MINIMAX_API_KEY:-}
+      DELPHI_PROVIDER_MINIMAX_BASE_URL: ${DELPHI_PROVIDER_MINIMAX_BASE_URL:-}
       # RAG v1: embedder sidecars.
-      EMBEDDER_CHUNK_ENABLED: ${EMBEDDER_CHUNK_ENABLED:-true}
-      EMBEDDER_CHUNK_ENDPOINT: ${EMBEDDER_CHUNK_ENDPOINT:-http://tei-chunk:80}
-      EMBEDDER_CHUNK_MODEL_NAME: ${EMBEDDER_CHUNK_MODEL_NAME:-bge-small-en-v1.5}
-      EMBEDDER_DOCUMENT_ENABLED: ${EMBEDDER_DOCUMENT_ENABLED:-true}
-      EMBEDDER_DOCUMENT_ENDPOINT: ${EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
-      EMBEDDER_DOCUMENT_MODEL_NAME: ${EMBEDDER_DOCUMENT_MODEL_NAME:-specter2}
+      DELPHI_EMBEDDER_CHUNK_ENABLED: ${DELPHI_EMBEDDER_CHUNK_ENABLED:-true}
+      DELPHI_EMBEDDER_CHUNK_ENDPOINT: ${DELPHI_EMBEDDER_CHUNK_ENDPOINT:-http://tei-chunk:80}
+      DELPHI_EMBEDDER_CHUNK_MODEL: ${DELPHI_EMBEDDER_CHUNK_MODEL:-bge-small-en-v1.5}
+      DELPHI_EMBEDDER_DOCUMENT_ENABLED: ${DELPHI_EMBEDDER_DOCUMENT_ENABLED:-true}
+      DELPHI_EMBEDDER_DOCUMENT_ENDPOINT: ${DELPHI_EMBEDDER_DOCUMENT_ENDPOINT:-http://tei-paper:80}
+      DELPHI_EMBEDDER_DOCUMENT_MODEL: ${DELPHI_EMBEDDER_DOCUMENT_MODEL:-specter2}
       # Direct-to-storage object access (ingestion v2 + download). Backend
       # → MinIO over the docker network (INTERNAL); presigned upload/download
       # URLs carry the browser-facing host (PUBLIC = MinIO's published
       # :9000 port). The browser hits MinIO directly — Traefik is no longer
       # in the byte path. See docs/architecture/object-access.md.
-      OBJECT_STORE_URL: ${OBJECT_STORE_URL:-s3://delphi/}
-      INGEST_S3_ENDPOINT_INTERNAL: ${INGEST_S3_ENDPOINT_INTERNAL:-http://minio:9000}
-      INGEST_S3_ENDPOINT_PUBLIC: ${INGEST_S3_ENDPOINT_PUBLIC:-http://localhost:9000}
-      INGEST_S3_REGION: ${INGEST_S3_REGION:-us-east-1}
-      INGEST_S3_BUCKET: ${INGEST_S3_BUCKET:-delphi}
-      INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-delphi}
-      INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
-      INGEST_S3_FORCE_PATH_STYLE: ${INGEST_S3_FORCE_PATH_STYLE:-true}
+      DELPHI_INGEST_OBJECT_STORE_URL: ${DELPHI_INGEST_OBJECT_STORE_URL:-s3://delphi/}
+      DELPHI_INGEST_S3_ENDPOINT_INTERNAL: ${DELPHI_INGEST_S3_ENDPOINT_INTERNAL:-http://minio:9000}
+      DELPHI_INGEST_S3_ENDPOINT_PUBLIC: ${DELPHI_INGEST_S3_ENDPOINT_PUBLIC:-http://localhost:9000}
+      DELPHI_INGEST_S3_REGION: ${DELPHI_INGEST_S3_REGION:-us-east-1}
+      DELPHI_INGEST_S3_BUCKET: ${DELPHI_INGEST_S3_BUCKET:-delphi}
+      DELPHI_INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-delphi}
+      DELPHI_INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-delphi-minio-dev-secret-please-change}
+      DELPHI_INGEST_S3_FORCE_PATH_STYLE: ${DELPHI_INGEST_S3_FORCE_PATH_STYLE:-true}
     depends_on:
       surrealdb:
         condition: service_healthy

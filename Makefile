@@ -75,10 +75,10 @@ backend-test: ## cargo test
 	cd backend && cargo test
 
 backend-run: ## cargo run delphi serve (header mode; needs an upstream proxy injecting X-Auth-*)
-	cd backend && SURREAL_URL=ws://localhost:8000/rpc AUTH_MODE=header cargo run --release -- serve
+	cd backend && DELPHI_DB_URL=ws://localhost:8000/rpc DELPHI_AUTH_MODE=header cargo run --release -- serve
 
 backend-run-dev: ## cargo run with dev-auth feature (auto-injected identity)
-	cd backend && SURREAL_URL=ws://localhost:8000/rpc AUTH_MODE=dev \
+	cd backend && DELPHI_DB_URL=ws://localhost:8000/rpc DELPHI_AUTH_MODE=dev \
 	  cargo run --features dev-auth -- serve
 
 # ----- local frontend (no docker) ------------------------------------------

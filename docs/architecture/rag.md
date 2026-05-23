@@ -210,12 +210,12 @@ All env-var (consistent with existing patterns).
 | `RAG_CHUNK_OVERLAP_TOKENS` | `50` | Overlap between adjacent chunks. |
 | `RAG_RETRIEVAL_TOP_K` | `5` | KNN page size. |
 | `RAG_RETRIEVAL_NEIGHBOR_RADIUS` | `1` | 0 = chunk only, 1 = ±1 neighbor, … |
-| `EMBEDDER_CHUNK_ENDPOINT` | `http://tei-chunk:80` | TEI URL for BGE-small. |
-| `EMBEDDER_CHUNK_ENABLED` | `true` | Master switch (off ⇒ ingest skips chunking + embedding entirely). |
-| `EMBEDDER_CHUNK_MODEL_NAME` | `bge-small-en-v1.5` | Passed to TEI; also written to `chunk.embedding_model`. |
-| `EMBEDDER_DOCUMENT_ENDPOINT` | `http://tei-paper:80` | TEI URL for SPECTER2. |
-| `EMBEDDER_DOCUMENT_ENABLED` | `true` | Master switch. |
-| `EMBEDDER_DOCUMENT_MODEL_NAME` | `specter2` | Passed to TEI; also written to `document.paper_embedding_model`. |
+| `DELPHI_EMBEDDER_CHUNK_ENDPOINT` | `http://tei-chunk:80` | TEI URL for BGE-small. |
+| `DELPHI_EMBEDDER_CHUNK_ENABLED` | `true` | Master switch (off ⇒ ingest skips chunking + embedding entirely). |
+| `DELPHI_EMBEDDER_CHUNK_MODEL` | `bge-small-en-v1.5` | Passed to TEI; also written to `chunk.embedding_model`. |
+| `DELPHI_EMBEDDER_DOCUMENT_ENDPOINT` | `http://tei-paper:80` | TEI URL for SPECTER2. |
+| `DELPHI_EMBEDDER_DOCUMENT_ENABLED` | `true` | Master switch. |
+| `DELPHI_EMBEDDER_DOCUMENT_MODEL` | `specter2` | Passed to TEI; also written to `document.paper_embedding_model`. |
 
 Tokeniser for chunk-size accounting: a cheap approximation (split on
 whitespace and punctuation) is fine for v1 — chunks are paragraph-
@@ -415,8 +415,8 @@ Follows `docs/architecture/testing.md`'s placement rules.
   'what does this paper say?'}]` — assert the streamed protocol
   includes a `citations` block and the text contains at least one
   `[1]`-style marker. (Uses a fake LLM in CI: tier-1 backend can be
-  wired to `MINIMAX_BASE_URL` pointing at a small local stub, OR
-  this test runs only when `ANTHROPIC_API_KEY` is set — guard
+  wired to `DELPHI_PROVIDER_MINIMAX_BASE_URL` pointing at a small local stub, OR
+  this test runs only when `DELPHI_PROVIDER_ANTHROPIC_API_KEY` is set — guard
   with `test.skip` accordingly. Mark non-blocking.)
 - Open `/feed?doc=<id>&chunk=<id>` directly; assert the viewer mounts,
   scrolls to the right page, and at least one

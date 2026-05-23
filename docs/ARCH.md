@@ -79,7 +79,7 @@ Optional headers:
 
 - `X-Auth-Name` — preferred display name (`preferred_username` / `name`).
 - `X-Auth-Tenant-Id` — tenant the request belongs to. Absent or unknown
-  → falls back to the configured `DEFAULT_TENANT_SLUG`.
+  → falls back to the configured `DELPHI_AUTH_DEFAULT_TENANT`.
 - `X-Auth-Roles` — comma-separated role list. Parsed into
   `AuthContext.roles` for future per-action authorisation; no
   endpoint consults it today.

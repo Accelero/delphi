@@ -102,12 +102,12 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
     let (events_tx, _) = tokio::sync::broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
 
-    let object_store_url = std::env::var("OBJECT_STORE_URL")
-        .context("OBJECT_STORE_URL is required (e.g. s3://delphi/); LocalFs is removed")?;
+    let object_store_url = std::env::var("DELPHI_INGEST_OBJECT_STORE_URL")
+        .context("DELPHI_INGEST_OBJECT_STORE_URL is required (e.g. s3://delphi/); LocalFs is removed")?;
     let object_store: Arc<dyn ObjectStore> =
         object_store::from_url(&object_store_url).context("constructing object store")?;
     // Client-facing minter for direct-to-storage upload/download URLs.
-    // Same `OBJECT_STORE_URL` selects it; today always `S3PresignAccess`.
+    // Same `DELPHI_INGEST_OBJECT_STORE_URL` selects it; today always `S3PresignAccess`.
     let access: Arc<dyn AccessMinter> = object_store::access_minter_from_url(&object_store_url)
         .context("constructing access minter")?;
 
@@ -156,15 +156,15 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     // Cursor persistence is the only system-path piece left: the
     // scheduler holds an `Arc<SystemDb>` and writes `source_state` rows
     // tagged with the same tenant the service identity carries (both
-    // derive from `SOURCES_DEFAULT_TENANT_SLUG`).
-    let sources_enabled = std::env::var("SOURCES_ENABLED").as_deref() == Ok("true");
+    // derive from `DELPHI_SOURCES_DEFAULT_TENANT`).
+    let sources_enabled = std::env::var("DELPHI_SOURCES_ENABLED").as_deref() == Ok("true");
     let scheduler = if sources_enabled {
         let registry = sources::default_registry(object_store.clone());
         if registry.is_empty() {
-            info!("SOURCES_ENABLED=true but no adapters configured; scheduler idle");
+            info!("DELPHI_SOURCES_ENABLED=true but no adapters configured; scheduler idle");
             None
         } else {
-            let scheduler_tenant_slug = std::env::var("SOURCES_DEFAULT_TENANT_SLUG")
+            let scheduler_tenant_slug = std::env::var("DELPHI_SOURCES_DEFAULT_TENANT")
                 .unwrap_or_else(|_| auth_cfg.default_tenant_slug().to_string());
             let scheduler_tenant_id =
                 auth::resolve_default_tenant(&system, &scheduler_tenant_slug)
@@ -173,7 +173,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
 
             let identity = service_identity_from_env("sources")
                 .context("loading sources service identity")?;
-            let ingest_url = std::env::var("INGEST_API_URL")
+            let ingest_url = std::env::var("DELPHI_INGEST_API_URL")
                 .unwrap_or_else(|_| default_loopback_url(&bind));
             info!(
                 tenant = %scheduler_tenant_slug,
@@ -190,7 +190,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
             ))
         }
     } else {
-        info!("SOURCES_ENABLED is not 'true'; source-adapter scheduler disabled");
+        info!("DELPHI_SOURCES_ENABLED is not 'true'; source-adapter scheduler disabled");
         None
     };
 
@@ -327,7 +327,7 @@ pub fn build_router(
 }
 
 /// Construct the loopback URL the scheduler POSTs to when
-/// `INGEST_API_URL` is not set. Reads the port from `BIND_ADDR`
+/// `DELPHI_INGEST_API_URL` is not set. Reads the port from `DELPHI_SERVER_BIND_ADDR`
 /// (the same value the HTTP server listens on) and pins the host to
 /// `127.0.0.1` so the call never leaves the loopback interface.
 fn default_loopback_url(bind: &str) -> String {

@@ -39,10 +39,10 @@ row's identity (belt-and-suspenders).
 A single `ObjectStore` trait (`object_store/mod.rs`) with the production
 impl `S3ObjectStore` (`aws-sdk-s3`, `object_store/s3.rs`). It serves
 MinIO / Hetzner / R2 / B2 / AWS through one client; selected at runtime
-from `OBJECT_STORE_URL=s3://<bucket>/`.
+from `DELPHI_INGEST_OBJECT_STORE_URL=s3://<bucket>/`.
 
-- **Dual endpoint.** `INGEST_S3_ENDPOINT_INTERNAL` is used for backend→S3
-  calls (HEAD/GET/complete/abort); `INGEST_S3_ENDPOINT_PUBLIC` is baked
+- **Dual endpoint.** `DELPHI_INGEST_S3_ENDPOINT_INTERNAL` is used for backend→S3
+  calls (HEAD/GET/complete/abort); `DELPHI_INGEST_S3_ENDPOINT_PUBLIC` is baked
   into the presigned upload/download URLs the browser hits directly. Both
   tiers now publish MinIO on `:9000` and the browser reaches it
   directly — Traefik is no longer in the byte path. See
@@ -210,9 +210,9 @@ Both compose tiers run MinIO + a `minio-init` one-shot (bucket create +
 lock anonymous access off). Both tiers expose MinIO on `:9000` for the
 browser; Traefik is not in the object byte path in either tier (matching
 prod, where a managed store is reached directly). Backend env:
-`OBJECT_STORE_URL`,
-`INGEST_S3_ENDPOINT_INTERNAL/PUBLIC`, `INGEST_S3_BUCKET`,
-`INGEST_S3_ACCESS_KEY_ID/SECRET_ACCESS_KEY`, `INGEST_S3_FORCE_PATH_STYLE`
+`DELPHI_INGEST_OBJECT_STORE_URL`,
+`DELPHI_INGEST_S3_ENDPOINT_INTERNAL/PUBLIC`, `DELPHI_INGEST_S3_BUCKET`,
+`DELPHI_INGEST_S3_ACCESS_KEY_ID/SECRET_ACCESS_KEY`, `DELPHI_INGEST_S3_FORCE_PATH_STYLE`
 (all in `.env.example`). The backend image builds on `rust:1.95`
 (`aws-sdk-s3` requires ≥ 1.91.1).
 
