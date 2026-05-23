@@ -181,14 +181,16 @@ impl TestApp {
         let (events_tx, _) = tokio::sync::broadcast::channel(64);
         let turn_bus: Arc<dyn TurnBus> = Arc::new(InProcessBus::new());
         let uploads_config = Arc::new(delphi::ingestion::UploadsConfig::test_default());
-        // One fake drives both chat and titles in tests — the title client
-        // is the same injected `llm` so a scripted reply also exercises the
-        // detached auto-title path.
+        // One fake drives chat, titles, and metadata extraction in tests —
+        // the title and metadata clients are the same injected `llm`, so a
+        // scripted reply also exercises the detached auto-title path and the
+        // LlmExtractor.
         let llm: Arc<dyn delphi::llm::LlmClient> =
             llm.unwrap_or_else(|| Arc::new(FakeLlmClient::default()));
         let state = AppState {
             llm: llm.clone(),
             title_llm: llm.clone(),
+            metadata_llm: llm.clone(),
             turn_bus: turn_bus.clone(),
             request_db_pool: request_pool.clone(),
             object_store: object_store.clone(),

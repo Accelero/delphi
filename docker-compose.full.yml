@@ -181,6 +181,16 @@ services:
       DELPHI_TITLE_BASE_URL: ${DELPHI_TITLE_BASE_URL:-http://title-llm:80/v1}
       DELPHI_TITLE_MODEL: ${DELPHI_TITLE_MODEL:-Qwen2.5-0.5B-Instruct}
       DELPHI_TITLE_API_KEY: ${DELPHI_TITLE_API_KEY:-sk-noauth}
+      # Metadata autofill (ingestion LlmExtractor). Defaults to the chat
+      # model; DELPHI_EXTRACT_BASE_URL redirects to an OpenAI-compatible
+      # extraction endpoint, DELPHI_EXTRACT_ENABLED=false disables autofill.
+      # See docs/architecture/metadata-extractor.md.
+      DELPHI_EXTRACT_ENABLED: ${DELPHI_EXTRACT_ENABLED:-true}
+      DELPHI_EXTRACT_BASE_URL: ${DELPHI_EXTRACT_BASE_URL:-}
+      DELPHI_EXTRACT_MODEL: ${DELPHI_EXTRACT_MODEL:-}
+      DELPHI_EXTRACT_API_KEY: ${DELPHI_EXTRACT_API_KEY:-}
+      DELPHI_EXTRACT_MAX_INPUT_CHARS: ${DELPHI_EXTRACT_MAX_INPUT_CHARS:-12000}
+      DELPHI_EXTRACT_TIMEOUT_SECS: ${DELPHI_EXTRACT_TIMEOUT_SECS:-30}
       # Direct-to-storage object access (ingestion v2 + download). Backend
       # → MinIO over the docker network (INTERNAL); presigned upload/download
       # URLs carry the browser-facing host (PUBLIC = MinIO's published

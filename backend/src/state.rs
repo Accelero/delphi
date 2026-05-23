@@ -78,7 +78,13 @@ pub struct AppState {
     /// once at boot from env; handlers read this for per-request
     /// decisions without re-parsing env on every call.
     pub uploads_config: Arc<crate::ingestion::UploadsConfig>,
-    /// Metadata autofill seam. Ships as `NoopExtractor` today; the
-    /// Phase-3 `LlmExtractor` swaps in here without touching callers.
+    /// Metadata autofill seam — `LlmExtractor` when `DELPHI_EXTRACT_ENABLED`
+    /// (the default), else `NoopExtractor`. The `/complete` pipeline reads
+    /// this at stage 6. See `docs/architecture/metadata-extractor.md`.
     pub metadata_extractor: Arc<dyn MetadataExtractor>,
+    /// Client backing the metadata `LlmExtractor`. Chat model by default;
+    /// `DELPHI_EXTRACT_BASE_URL` redirects it to an OpenAI-compatible
+    /// extraction endpoint (cloud or local sidecar) independent of the chat
+    /// provider. Equals `llm` when no override is set.
+    pub metadata_llm: Arc<dyn LlmClient>,
 }

@@ -17,7 +17,7 @@ use futures::Stream;
 
 use crate::error::Result;
 
-pub use rig_impl::{llm_from_env, title_llm_from_env};
+pub use rig_impl::{extractor_llm_from_env, llm_from_env, title_llm_from_env};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {

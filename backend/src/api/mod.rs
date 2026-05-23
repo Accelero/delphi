@@ -29,9 +29,9 @@ use crate::config::{jwt_access_from_env, system_db_from_env};
 use crate::embedder::embedder_from_env;
 use crate::filter::{IngestFilter, NoopFilter};
 use crate::ingestion::{
-    self, MetadataExtractor, NoopExtractor, UploadsConfig, DEFAULT_BROADCAST_CAPACITY,
+    self, LlmExtractor, MetadataExtractor, NoopExtractor, UploadsConfig, DEFAULT_BROADCAST_CAPACITY,
 };
-use crate::llm::{llm_from_env, title_llm_from_env};
+use crate::llm::{extractor_llm_from_env, llm_from_env, title_llm_from_env};
 use crate::object_store::{self, AccessMinter, ObjectStore};
 use crate::sources::{self, IngestApiClient};
 use crate::state::AppState;
@@ -130,9 +130,19 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
     };
 
     let uploads_config = Arc::new(UploadsConfig::from_env());
-    // Metadata autofill seam: NoopExtractor ships today; the Phase-3
-    // LlmExtractor drops in here when an LLM provider is configured.
-    let metadata_extractor: Arc<dyn MetadataExtractor> = Arc::new(NoopExtractor);
+    // Metadata autofill seam. The LLM extractor backs it by default (chat
+    // model, or a DELPHI_EXTRACT_BASE_URL override); DELPHI_EXTRACT_ENABLED=false
+    // falls back to NoopExtractor (prefill-only). The client is also kept on
+    // AppState as `metadata_llm`. See docs/architecture/metadata-extractor.md.
+    let metadata_llm = extractor_llm_from_env(&llm).context("constructing metadata extractor llm")?;
+    let extract_enabled = std::env::var("DELPHI_EXTRACT_ENABLED")
+        .map(|v| v.trim().to_lowercase() != "false")
+        .unwrap_or(true);
+    let metadata_extractor: Arc<dyn MetadataExtractor> = if extract_enabled {
+        Arc::new(LlmExtractor::from_env(metadata_llm.clone()))
+    } else {
+        Arc::new(NoopExtractor)
+    };
     // In-process turn transport (Phase 1). Sessions are refcounted by their
     // consumers (reader streams + the worker handle) and self-prune on drop
     // — no GC sweeper to spawn.
@@ -151,6 +161,7 @@ pub async fn serve(bind: String, static_dir: Option<PathBuf>) -> Result<()> {
         system_db: system.clone(),
         uploads_config,
         metadata_extractor,
+        metadata_llm,
     };
 
     // Source-adapter scheduler runs alongside the HTTP server. It POSTs

@@ -330,6 +330,26 @@ pub fn title_llm_from_env(chat_llm: &Arc<dyn LlmClient>) -> Result<Arc<dyn LlmCl
     }
 }
 
+/// Build the metadata-autofill client (ingestion `LlmExtractor`). Defaults
+/// to the chat client; an explicit `DELPHI_EXTRACT_BASE_URL` redirects to
+/// any OpenAI-compatible endpoint (a different cloud model or a local
+/// extraction sidecar) without disturbing the chat provider. See
+/// docs/architecture/metadata-extractor.md §3.
+pub fn extractor_llm_from_env(chat_llm: &Arc<dyn LlmClient>) -> Result<Arc<dyn LlmClient>> {
+    match std::env::var("DELPHI_EXTRACT_BASE_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(base_url) => {
+            let model = require_env("DELPHI_EXTRACT_MODEL")?;
+            let api_key = env_or("DELPHI_EXTRACT_API_KEY", "sk-noauth");
+            Ok(Arc::new(OpenAiCompatLlm::new(&model, api_key, base_url)?))
+        }
+        None => Ok(chat_llm.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

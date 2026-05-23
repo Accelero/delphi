@@ -18,6 +18,7 @@
 mod autofill;
 mod completion;
 mod http;
+mod llm_extractor;
 mod notifier;
 mod pipeline;
 mod rag;
@@ -31,6 +32,7 @@ pub use autofill::{
 };
 pub use completion::{run_completion, CompletionCtx, CompletionError};
 pub use http::{ingest_documents, IngestRequestBody};
+pub use llm_extractor::LlmExtractor;
 pub use notifier::{FeedItemEvent, NotifyingSink, DEFAULT_BROADCAST_CAPACITY};
 pub use pipeline::{IngestOutcome, IngestRequest, IngestSink, Pipeline};
 pub use rag::RagSink;
