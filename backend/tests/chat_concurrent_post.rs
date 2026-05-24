@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{json, Value};
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use bytes::Bytes;
 
@@ -85,7 +85,7 @@ async fn second_post_while_in_flight_returns_409() {
     // HTTP handler maps to 409 `{"reason":"in_flight"}` without spawning a
     // second worker. Frame content is opaque (the claim is rejected before
     // it's buffered).
-    let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
+    let conv_id: RecordId = RecordId::new("conversation", key.as_str());
     let dummy_frame = Bytes::from_static(b"event: user_message\ndata: {}\n\n");
     let second = app.turn_bus.try_start(&conv_id, dummy_frame).await;
     assert!(

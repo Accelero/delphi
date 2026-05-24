@@ -476,7 +476,7 @@ mod tests {
     /// buffer/cursor tests that don't exercise the bus or lifetime.
     fn detached() -> Session {
         Session::new(
-            surrealdb::RecordId::from(("conversation", "test")),
+            surrealdb::types::RecordId::new("conversation", "test"),
             Weak::new(),
             0,
         )
@@ -567,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn reader_replays_then_streams_live() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "abc"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "abc");
         let mut handle = bus
             .try_start(&conv, sse::user_message("message:u1", "hi"))
             .await
@@ -595,7 +595,7 @@ mod tests {
     #[tokio::test]
     async fn reader_emits_resync_for_stale_cursor() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "stale"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "stale");
         // Hold a subscriber so the session (one incarnation) survives across
         // turns and cursors keep advancing within the same generation.
         let _keepalive = bus.subscribe(&conv, None).await;
@@ -617,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn idle_fresh_subscriber_gets_no_replay() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "idle"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "idle");
         // Never started a turn: a fresh subscriber must block (no frame),
         // relying on history. Assert nothing is immediately available.
         let mut stream = bus.subscribe(&conv, None).await;
@@ -629,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_flips_token_observed_by_handle() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "cancel"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "cancel");
         let handle = bus
             .try_start(&conv, sse::user_message("message:u1", "hi"))
             .await
@@ -644,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn session_freed_when_last_consumer_drops() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "life"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "life");
         {
             // The handle is the only strong owner (no subscribers).
             let _h = bus
@@ -664,7 +664,7 @@ mod tests {
     #[tokio::test]
     async fn reincarnated_session_resyncs_stale_cursor() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "reborn"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "reborn");
         // First incarnation (generation 0) runs a turn, then is freed when
         // its handle drops with no subscribers.
         {
@@ -689,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_handle_without_terminate_emits_clear() {
         let bus = InProcessBus::new();
-        let conv: ConversationId = surrealdb::RecordId::from(("conversation", "panic"));
+        let conv: ConversationId = surrealdb::types::RecordId::new("conversation", "panic");
         let mut stream = bus.subscribe(&conv, None).await;
         let handle = bus
             .try_start(&conv, sse::user_message("message:u1", "hi"))

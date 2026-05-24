@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use delphi::error::Result;
 use delphi::ingestion::{IngestOutcome, IngestRequest, IngestSink};
@@ -37,7 +37,7 @@ impl IngestSink for CountingSink {
             .unwrap()
             .push(req.canonical_id.clone());
         // Synthetic id — tests don't dereference it.
-        let id = RecordId::from(("document", req.canonical_id.as_str()));
+        let id = RecordId::new("document", req.canonical_id.as_str());
         Ok(IngestOutcome::Created { id, version: 1 })
     }
 }

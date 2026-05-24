@@ -16,7 +16,7 @@ name: delphi
 
 services:
   surrealdb:
-    image: surrealdb/surrealdb:v2.1.4
+    image: surrealdb/surrealdb:v3.0.5
     container_name: delphi-surrealdb
     user: "0:0"
     command:

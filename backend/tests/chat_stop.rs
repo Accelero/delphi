@@ -27,7 +27,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use serde_json::{json, Value};
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use common::{AuthRequestBuilder, TestApp};
 use delphi::error::Result;
@@ -124,7 +124,7 @@ async fn stop_is_404_for_unknown_conversation() {
 async fn stop_during_in_flight_turn_broadcasts_clear_and_persists_nothing() {
     let app = TestApp::build_with_llm(Arc::new(OneShotThenPark)).await;
     let key = create_conversation(&app).await;
-    let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
+    let conv_id: RecordId = RecordId::new("conversation", key.as_str());
 
     // Fire the turn.
     let res = app

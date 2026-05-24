@@ -25,7 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::Deserialize;
-use surrealdb::RecordId;
+use surrealdb::types::{RecordId, ToSql};
 use tracing::{error, info};
 
 use crate::api::sse;
@@ -53,7 +53,7 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     if k.is_empty() || k.contains(':') || k.len() != key.len() {
         return Err((StatusCode::BAD_REQUEST, "invalid conversation key").into_response());
     }
-    Ok(RecordId::from(("conversation", k)))
+    Ok(RecordId::new("conversation", k))
 }
 
 /// Cheap syntactic check on the user-supplied ULID.
@@ -74,7 +74,7 @@ fn parse_parent_id(s: &str) -> Result<MessageId, Response> {
     if table != "message" || key.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "parent_id must be 'message:<key>'").into_response());
     }
-    Ok(RecordId::from(("message", key)))
+    Ok(RecordId::new("message", key))
 }
 
 fn bearer_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -174,8 +174,8 @@ pub async fn post_message(
     spawn_worker(handle, task_id, turn);
 
     info!(
-        user_id = %auth.user_id,
-        conversation = %conv_id,
+        user_id = %auth.user_id.to_sql(),
+        conversation = %conv_id.to_sql(),
         task = %task_id,
         "turn submitted"
     );
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn parse_parent_id_round_trips() {
         let id = parse_parent_id("message:abc123").expect("ok");
-        assert_eq!(id.to_string(), "message:abc123");
+        assert_eq!(id.to_sql(), "message:abc123");
     }
 
     #[test]

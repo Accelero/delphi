@@ -458,7 +458,7 @@ async fn manual_upload_without_canonical_id_commits() {
     // Document row exists with NONE canonical_id and a text body.
     let storage = app.system.storage_for(app.default_tenant_id.clone());
     use delphi::storage::Storage as _;
-    let rid = surrealdb::RecordId::from(("document", doc_id.as_str()));
+    let rid = surrealdb::types::RecordId::new("document", doc_id.as_str());
     let doc = storage.get_document(&rid).await.unwrap();
     let doc = doc.expect("document must exist at document:<doc_id>");
     assert!(doc.canonical_id.is_none(), "manual upload has no canonical_id");
@@ -638,7 +638,7 @@ async fn commit_sanitizes_control_and_bidi_in_title() {
 
     let storage = app.system.storage_for(app.default_tenant_id.clone());
     use delphi::storage::Storage as _;
-    let rid = surrealdb::RecordId::from(("document", doc_id.as_str()));
+    let rid = surrealdb::types::RecordId::new("document", doc_id.as_str());
     let doc = storage
         .get_document(&rid)
         .await

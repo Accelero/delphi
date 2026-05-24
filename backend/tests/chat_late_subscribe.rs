@@ -23,7 +23,7 @@ use axum::http::{Request, StatusCode};
 use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use common::{AuthRequestBuilder, TestApp};
 use delphi::error::Result;
@@ -73,7 +73,7 @@ async fn late_subscriber_replays_buffered_frames() {
     assert_eq!(res.status, StatusCode::CREATED);
     let body: Value = res.json();
     let key = key_of(body["id"].as_str().expect("id"));
-    let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
+    let conv_id: RecordId = RecordId::new("conversation", key.as_str());
 
     let user_id = "01HXY0000000000000000000AB";
     let res = app
@@ -137,7 +137,7 @@ async fn late_subscriber_replays_buffered_frames_over_http() {
         .await
         .expect("conv json");
     let key = key_of(created["id"].as_str().expect("id"));
-    let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
+    let conv_id: RecordId = RecordId::new("conversation", key.as_str());
 
     // Simulate an in-flight turn with buffered frames — no worker, so the
     // single pool slot stays free for the GET /stream handler. The handle

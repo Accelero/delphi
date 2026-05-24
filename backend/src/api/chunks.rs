@@ -16,7 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::Serialize;
-use surrealdb::RecordId;
+use surrealdb::types::{RecordId, ToSql};
 
 use crate::storage::{AuthedDb, Bbox, Storage};
 
@@ -36,7 +36,7 @@ pub async fn get_chunk(
     Extension(db): Extension<Arc<AuthedDb>>,
     Path(key): Path<String>,
 ) -> Response {
-    let id = RecordId::from(("chunk", key.as_str()));
+    let id = RecordId::new("chunk", key.as_str());
     let chunk = match db.get_chunk(&id).await {
         Ok(Some(c)) => c,
         Ok(None) => return (StatusCode::NOT_FOUND, "chunk not found").into_response(),
@@ -52,9 +52,9 @@ pub async fn get_chunk(
     let body = ChunkResponse {
         id: chunk
             .id
-            .map(|r| r.to_string())
+            .map(|r| r.to_sql())
             .unwrap_or_else(|| format!("chunk:{key}")),
-        doc_id: doc.to_string(),
+        doc_id: doc.to_sql(),
         ordinal: chunk.ordinal,
         text: chunk.text,
         bboxes: chunk.bboxes,

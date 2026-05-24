@@ -25,6 +25,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
+use surrealdb::types::ToSql;
 
 use crate::auth::AuthContext;
 use crate::state::AppState;
@@ -406,9 +407,10 @@ pub async fn sign_upload_part(
             .into_response();
     }
 
-    // Session TTL gate.
+    // Session TTL gate. `started_at` is a `surrealdb::types::Datetime`;
+    // unwrap to `chrono::DateTime<Utc>` for the age arithmetic.
     if let Some(started_at) = session.started_at {
-        let age = chrono::Utc::now() - started_at;
+        let age = chrono::Utc::now() - started_at.into_inner();
         if age
             > chrono::Duration::from_std(state.uploads_config.session_ttl)
                 .unwrap_or(chrono::Duration::MAX)
@@ -552,7 +554,7 @@ pub async fn complete_upload(
         Ok(doc_record) => (
             StatusCode::OK,
             Json(CompleteResponse::Ready {
-                doc_id: doc_record.to_string(),
+                doc_id: doc_record.to_sql(),
             }),
         )
             .into_response(),
@@ -702,12 +704,12 @@ pub async fn get_upload_status(
     //    row is gone on commit we can resolve `ready` by a direct
     //    record-id lookup. Engine PERMISSIONS scope by tenant; this is
     //    what the SPA's recovery poll relies on (§2.3 / B5).
-    let rid = surrealdb::RecordId::from(("document", doc_id.as_str()));
+    let rid = surrealdb::types::RecordId::new("document", doc_id.as_str());
     if let Ok(Some(_doc)) = db.get_document(&rid).await {
         return (
             StatusCode::OK,
             Json(StatusResponse::Ready {
-                doc_id: rid.to_string(),
+                doc_id: rid.to_sql(),
             }),
         )
             .into_response();
@@ -752,8 +754,8 @@ mod tests {
 
     fn stub_auth() -> AuthContext {
         AuthContext {
-            user_id: surrealdb::RecordId::from(("app_user", "u")),
-            tenant_id: surrealdb::RecordId::from(("tenant", "t")),
+            user_id: surrealdb::types::RecordId::new("app_user", "u"),
+            tenant_id: surrealdb::types::RecordId::new("tenant", "t"),
             email: "u@t".into(),
             display_name: None,
             iss: "x".into(),

@@ -20,20 +20,24 @@
 //! path can't touch them because the user record may not exist yet.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
-use surrealdb::RecordId;
+use surrealdb::types::{RecordId, SurrealValue};
 
 /// Returns true if `err`'s source chain contains a SurrealDB
 /// `IndexExists` failure — i.e. another concurrent writer beat us to the
 /// CREATE on a UNIQUE-indexed table (`app_user(iss,sub)`,
 /// `membership(user,tenant_id)`). The upsert SELECT-then-CREATE pattern
 /// has a TOCTOU window; this is how we detect that we lost the race.
+///
+/// surrealdb 3 collapsed the old `Error::Db(Db::IndexExists { .. })`
+/// enum into a single wire-friendly `Error` struct, so the typed variant
+/// is gone. The engine's message is stable — `Database index `…` already
+/// contains …` — so we match on that substring while walking the source
+/// chain (consistent with how `surreal.rs::is_transient_conflict` detects
+/// write-write conflicts).
 fn is_index_exists(err: &anyhow::Error) -> bool {
     let mut e: Option<&dyn std::error::Error> = Some(err.as_ref());
     while let Some(cur) = e {
-        if let Some(surrealdb::Error::Db(surrealdb::error::Db::IndexExists { .. })) =
-            cur.downcast_ref::<surrealdb::Error>()
-        {
+        if cur.to_string().to_ascii_lowercase().contains("already contains") {
             return true;
         }
         e = cur.source();
@@ -73,19 +77,21 @@ async fn ensure_root_session(system: &SystemDb) {
     let _ = system.raw().invalidate().await;
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct IdRow {
     id: RecordId,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct UserRow {
     id: RecordId,
-    #[serde(rename = "iss")]
+    #[surreal(rename = "iss")]
     _iss: String,
-    #[serde(rename = "sub")]
+    #[surreal(rename = "sub")]
     _sub: String,
+    #[surreal(default)]
     email: String,
+    #[surreal(default)]
     display_name: Option<String>,
 }
 

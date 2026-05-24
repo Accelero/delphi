@@ -9,13 +9,13 @@
 mod common;
 
 use jsonwebtoken::{encode, EncodingKey, Header};
-use surrealdb::RecordId;
+use surrealdb::types::{RecordId, SurrealValue};
 
 use delphi::storage::{JwtAccessConfig, JwtAccessKind, SystemDb};
 
 const TEST_SECRET: &str = "test-only-secret-do-not-use-anywhere-real-please";
 
-#[derive(serde::Deserialize)]
+#[derive(SurrealValue)]
 struct IdRow {
     id: RecordId,
 }

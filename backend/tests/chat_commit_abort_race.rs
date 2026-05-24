@@ -20,7 +20,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures::StreamExt;
 use serde_json::{json, Value};
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 use tokio::sync::Notify;
 
 use common::{AuthRequestBuilder, TestApp};
@@ -59,7 +59,7 @@ async fn late_stop_after_commit_keeps_rows_and_shows_finish_not_clear() {
     assert_eq!(res.status, StatusCode::CREATED);
     let body: Value = res.json();
     let key = key_of(body["id"].as_str().expect("id"));
-    let conv_id: RecordId = RecordId::from(("conversation", key.as_str()));
+    let conv_id: RecordId = RecordId::new("conversation", key.as_str());
 
     // Subscribe BEFORE the turn and drain concurrently. Under refcount an
     // unsubscribed session is freed the instant the worker's handle drops

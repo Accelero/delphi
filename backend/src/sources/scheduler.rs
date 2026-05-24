@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::interval_at;

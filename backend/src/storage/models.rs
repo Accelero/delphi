@@ -1,6 +1,32 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use surrealdb::RecordId;
+use surrealdb::types::{Datetime, Object, RecordId, SurrealValue, ToSql, Value};
+
+/// Render a write payload as a `Value::Object` with every `NONE` entry
+/// dropped.
+///
+/// surrealdb 3's `SurrealValue` derive emits *every* field (it has no
+/// `skip_serializing_if` equivalent), so an `Option::None` serialises as
+/// `NONE`. On `CREATE` the engine tolerates that (a `DEFAULT`/optional
+/// column absorbs it), but `UPDATE … MERGE` is unforgiving: writing `NONE`
+/// into a required column (e.g. `document.ingested_at`, `TYPE datetime
+/// DEFAULT time::now()`) fails coercion, and writing it into an optional
+/// column *clobbers* the stored value. Stripping `NONE` restores the
+/// serde `skip_serializing_if = "Option::is_none"` behaviour the storage
+/// layer relied on under surrealdb 2.
+pub(crate) fn content_without_none<T: SurrealValue>(v: T) -> Value {
+    match v.into_value() {
+        Value::Object(o) => {
+            let kept: std::collections::BTreeMap<String, Value> = o
+                .into_inner()
+                .into_iter()
+                .filter(|(_, val)| !matches!(val, Value::None))
+                .collect();
+            Value::Object(Object::from(kept))
+        }
+        other => other,
+    }
+}
 
 /// SurrealDB record id, e.g. `document:abc…`.
 pub type DocId = RecordId;
@@ -23,11 +49,14 @@ pub type MessageId = RecordId;
 /// boundary and breaks string-based identity comparison on the client.
 pub mod opt_record_id_str {
     use serde::{Deserialize, Deserializer, Serializer};
-    use surrealdb::RecordId;
+    use surrealdb::types::{RecordId, ToSql};
 
     pub fn serialize<S: Serializer>(v: &Option<RecordId>, s: S) -> Result<S::Ok, S::Error> {
         match v {
-            Some(id) => s.serialize_some(&id.to_string()),
+            // `to_sql()` is the canonical `table:key` form (RecordId lost
+            // its `Display` impl in surrealdb 3); same bytes as the old
+            // `to_string()` for our simple/ULID keys.
+            Some(id) => s.serialize_some(&id.to_sql()),
             None => s.serialize_none(),
         }
     }
@@ -44,12 +73,12 @@ pub mod opt_record_id_str {
         let parsed: Option<Wire> = Option::deserialize(d)?;
         Ok(parsed.map(|w| match w {
             Wire::Str(s) => match s.split_once(':') {
-                Some((tb, key)) => RecordId::from((tb, key)),
+                Some((tb, key)) => RecordId::new(tb, key),
                 // Bare key without table prefix — implausible from any
                 // current producer, but be tolerant: synthesise as a
                 // `document` id (the only id-bearing public model that
                 // uses this adapter).
-                None => RecordId::from(("document", s.as_str())),
+                None => RecordId::new("document", s.as_str()),
             },
             Wire::Structured(rid) => rid,
         }))
@@ -134,11 +163,29 @@ fn default_version() -> i64 {
 /// coexist), else `"<tenant_id>|<canonical_id>"` so dedup is scoped per
 /// tenant (cross-tenant same canonical_id is allowed; same-tenant
 /// duplicate is rejected). Both `document` and `upload_session` use this.
-pub fn dedup_key(tenant_id: &RecordId, canonical_id: Option<&str>) -> Option<String> {
-    canonical_id.map(|cid| format!("{tenant_id}|{cid}"))
+/// Bare key string of a record id, e.g. `document:abc` → `"abc"`.
+///
+/// surrealdb 3 removed `RecordId::key()` and `RecordIdKey: Display`, so
+/// pulling the unprefixed key now means matching the key enum. Every id
+/// Delphi mints is string-keyed (ULIDs / slugs), so the `String` arm is
+/// the live path; the `Debug` fallback keeps it total for exotic keys.
+pub fn record_key(id: &RecordId) -> String {
+    use surrealdb::types::RecordIdKey;
+    match &id.key {
+        RecordIdKey::String(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+pub fn dedup_key(tenant_id: &RecordId, canonical_id: Option<&str>) -> Option<String> {
+    // `to_sql()` yields the canonical `tenant:<key>` string. RecordId lost
+    // `Display` in surrealdb 3, but for our ULID/slug keys `to_sql()`
+    // produces the same bytes the old `{tenant_id}` Display did, so the
+    // per-tenant dedup-key format is unchanged.
+    canonical_id.map(|cid| format!("{}|{cid}", tenant_id.to_sql()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct Content {
     pub text: String,
     #[serde(default = "default_format")]
@@ -158,7 +205,7 @@ fn default_extractor() -> String {
 /// One line-bounding rectangle of a chunk on a specific PDF page. PDF
 /// coordinate space (origin bottom-left, points = 1/72 inch). The viewer
 /// flips to CSS top-left coords using the page's height + rotation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SurrealValue)]
 pub struct Bbox {
     pub page: i64,
     pub x: f64,
@@ -167,7 +214,7 @@ pub struct Bbox {
     pub h: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct Chunk {
     /// Populated by the backend on read; ignored on write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,7 +242,7 @@ pub struct Chunk {
     pub chunk_strategy: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct ChunkSearchResult {
     pub chunk_id: RecordId,
     pub doc_id: RecordId,
@@ -247,7 +294,7 @@ pub struct Conversation {
 /// retrieval. Storage-owned (no `api` dependency); its field layout is
 /// the wire shape the SPA consumes, identical to `sse::CitationEntry` —
 /// the worker maps from one to the other.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SurrealValue)]
 pub struct Citation {
     /// Bracket number rendered as `[n]` in the assistant text.
     pub n: usize,
@@ -334,7 +381,7 @@ pub struct CreateUploadSessionParams {
 /// and the cleaner's list helpers. `tenant_id` and `user_id` are
 /// engine-managed; we expose them so handlers can do the redundant
 /// belt-and-suspenders identity check from the plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct UploadSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RecordId>,
@@ -358,14 +405,17 @@ pub struct UploadSession {
     pub declared_size: i64,
     pub declared_content_type: String,
     #[serde(default)]
+    #[surreal(default)]
     pub declared_metadata: serde_json::Value,
+    /// `surrealdb::types::Datetime` (not chrono) so the row decodes via
+    /// `SurrealValue`; serialises to the same RFC3339 JSON on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<DateTime<Utc>>,
+    pub started_at: Option<Datetime>,
 }
 
 /// Side-channel rejection record. Written by the validator-reject path
 /// inside `POST /uploads/:id/complete`; reaped by the nightly cleaner.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct IngestionRejection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RecordId>,
@@ -378,8 +428,9 @@ pub struct IngestionRejection {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sniffed_type: Option<String>,
+    /// `surrealdb::types::Datetime` (not chrono); see [`UploadSession::started_at`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rejected_at: Option<DateTime<Utc>>,
+    pub rejected_at: Option<Datetime>,
 }
 
 /// `commit_upload` error path: a row with the same

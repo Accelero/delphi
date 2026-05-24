@@ -9,6 +9,7 @@ use serde_json::json;
 use common::{AuthRequestBuilder, TestApp};
 
 use delphi::storage::{Bbox, Chunk, Document, Storage};
+use surrealdb::types::ToSql;
 
 #[tokio::test]
 async fn returns_chunk_payload_when_in_tenant() {
@@ -60,7 +61,7 @@ async fn returns_chunk_payload_when_in_tenant() {
         .await
         .expect("upsert chunk");
     let chunk_id = chunk_ids.into_iter().next().expect("chunk id");
-    let key = chunk_id.key().to_string();
+    let key = delphi::storage::record_key(&chunk_id);
 
     let req = Request::builder()
         .method("GET")
@@ -72,7 +73,7 @@ async fn returns_chunk_payload_when_in_tenant() {
     assert_eq!(res.status, StatusCode::OK, "{}", res.text());
     let body: serde_json::Value = res.json();
     assert!(body["id"].as_str().unwrap().starts_with("chunk:"));
-    assert_eq!(body["doc_id"].as_str().unwrap(), doc_id.to_string());
+    assert_eq!(body["doc_id"].as_str().unwrap(), doc_id.to_sql());
     assert_eq!(body["text"], "hello world");
     let bb = body["bboxes"].as_array().expect("bboxes array");
     assert_eq!(bb.len(), 2);
@@ -148,7 +149,7 @@ async fn returns_404_when_chunk_belongs_to_another_tenant() {
         .into_iter()
         .next()
         .unwrap();
-    let key = chunk_id.key().to_string();
+    let key = delphi::storage::record_key(&chunk_id);
 
     // Now drive the request as the default-tenant user. Engine
     // PERMISSIONS should refuse the SELECT and we get a 404.

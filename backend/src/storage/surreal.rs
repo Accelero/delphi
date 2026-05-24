@@ -15,11 +15,12 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use surrealdb::engine::any::Any;
-use surrealdb::{Datetime, RecordId, Surreal};
+use surrealdb::types::{Datetime, RecordId, SurrealValue, ToSql};
+use surrealdb::Surreal;
 
 use crate::error::{Error, Result};
+use crate::storage::models::content_without_none;
 use crate::storage::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
     ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
@@ -45,55 +46,48 @@ impl SurrealStorage {
 }
 
 // ─── wire structs ─────────────────────────────────────────────────────────
+//
+// surrealdb 3 binds/extracts via `SurrealValue`, not serde — and the derive
+// has no `skip`/`skip_serializing` equivalent: every field is emitted on
+// write. So the write payloads (`*Create`/`*Data`) physically omit `id` and
+// `tenant_id`; the engine fills `tenant_id` from `DEFAULT $auth.tenant_id`
+// and would be *overwritten with NONE* (failing the `ASSERT $value != NONE`,
+// or — worse, via `UPDATE … MERGE` — nulling a good value) if we sent them.
+// Reads use separate `*Read` structs that carry `id`/`tenant_id` back.
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DocumentWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    id: Option<RecordId>,
-    /// Engine fills this on CREATE via DEFAULT $auth.tenant_id; we skip
-    /// it on serialize so application code never accidentally sets it.
-    /// Populated on read so SSE filtering can see the tenant the row
-    /// belongs to.
-    #[serde(default, skip_serializing)]
-    tenant_id: Option<RecordId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+/// Write payload for `document` (CREATE CONTENT / UPDATE MERGE). No `id`,
+/// no `tenant_id` — see the module note above.
+#[derive(Debug, SurrealValue)]
+struct DocumentCreate {
+    #[surreal(default)]
     canonical_id: Option<String>,
     source_type: String,
     source_uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     storage_uri: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     title: Option<String>,
-    #[serde(default)]
     authors: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     published_at: Option<Datetime>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     ingested_at: Option<Datetime>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     paper_embedding: Option<Vec<f32>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     paper_embedding_model: Option<String>,
     content_hash: String,
-    #[serde(default = "default_version")]
     version: i64,
-    #[serde(default)]
     metadata: serde_json::Value,
 }
 
-fn default_version() -> i64 {
-    1
-}
-
-impl From<&Document> for DocumentWire {
+impl From<&Document> for DocumentCreate {
     fn from(d: &Document) -> Self {
         Self {
-            id: d.id.clone(),
-            tenant_id: None,
             canonical_id: d.canonical_id.clone(),
             source_type: d.source_type.clone(),
             source_uri: d.source_uri.clone(),
@@ -113,8 +107,51 @@ impl From<&Document> for DocumentWire {
     }
 }
 
-impl From<DocumentWire> for Document {
-    fn from(w: DocumentWire) -> Self {
+/// Read projection for `document`. Carries `id`/`tenant_id` (engine-set)
+/// back so SSE filtering and deep-links can see them.
+#[derive(Debug, SurrealValue)]
+struct DocumentRead {
+    #[surreal(default)]
+    id: Option<RecordId>,
+    /// Populated on read so SSE filtering can see the tenant the row
+    /// belongs to.
+    #[surreal(default)]
+    tenant_id: Option<RecordId>,
+    #[surreal(default)]
+    canonical_id: Option<String>,
+    source_type: String,
+    source_uri: String,
+    #[surreal(default)]
+    storage_uri: Option<String>,
+    #[surreal(default)]
+    title: Option<String>,
+    #[surreal(default)]
+    authors: Vec<String>,
+    #[surreal(default)]
+    published_at: Option<Datetime>,
+    #[surreal(default)]
+    ingested_at: Option<Datetime>,
+    #[surreal(default)]
+    language: Option<String>,
+    #[surreal(default)]
+    summary: Option<String>,
+    #[surreal(default)]
+    paper_embedding: Option<Vec<f32>>,
+    #[surreal(default)]
+    paper_embedding_model: Option<String>,
+    content_hash: String,
+    #[surreal(default = "default_version")]
+    version: i64,
+    #[surreal(default)]
+    metadata: serde_json::Value,
+}
+
+fn default_version() -> i64 {
+    1
+}
+
+impl From<DocumentRead> for Document {
+    fn from(w: DocumentRead) -> Self {
         Self {
             id: w.id,
             tenant_id: w.tenant_id,
@@ -138,20 +175,20 @@ impl From<DocumentWire> for Document {
 }
 
 fn datetime_to_chrono(d: Datetime) -> DateTime<Utc> {
-    d.into_inner().into()
+    d.into_inner()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct ConversationWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     id: Option<RecordId>,
-    #[serde(default)]
+    #[surreal(default)]
     tenant_id: Option<RecordId>,
-    #[serde(default)]
+    #[surreal(default)]
     title: Option<String>,
-    #[serde(default)]
+    #[surreal(default)]
     created_at: Option<Datetime>,
-    #[serde(default)]
+    #[surreal(default)]
     updated_at: Option<Datetime>,
 }
 
@@ -167,17 +204,17 @@ impl From<ConversationWire> for Conversation {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct ChatMessageWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     id: Option<RecordId>,
     role: String,
     content: String,
-    #[serde(default)]
+    #[surreal(default)]
     parent_id: Option<RecordId>,
-    #[serde(default)]
+    #[surreal(default)]
     citations: Option<Vec<Citation>>,
-    #[serde(default)]
+    #[surreal(default)]
     created_at: Option<Datetime>,
 }
 
@@ -194,12 +231,12 @@ impl From<ChatMessageWire> for ChatMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct IdRow {
     id: RecordId,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, SurrealValue)]
 struct ContentData {
     doc: RecordId,
     format: String,
@@ -207,7 +244,7 @@ struct ContentData {
     extractor: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, SurrealValue)]
 struct ChunkData {
     doc: RecordId,
     ordinal: i64,
@@ -218,6 +255,21 @@ struct ChunkData {
     embedding: Vec<f32>,
     embedding_model: String,
     chunk_strategy: String,
+}
+
+/// Assistant-message write payload for `commit_turn`. Bound as a single
+/// `CONTENT $struct` value: surrealdb 3 only honours the `FLEXIBLE` rule
+/// for the nested `citations` objects on a SCHEMAFULL table when the row
+/// is written this way — an inline `{ citations: $x }` literal trips
+/// "no such field exists" instead.
+#[derive(Debug, SurrealValue)]
+struct AssistantContent {
+    conversation: RecordId,
+    role: String,
+    content: String,
+    parent_id: RecordId,
+    #[surreal(default)]
+    citations: Option<Vec<Citation>>,
 }
 
 #[async_trait]
@@ -241,13 +293,13 @@ impl Storage for SurrealStorage {
             None => None,
         };
 
-        let wire = DocumentWire::from(doc);
+        let data = content_without_none(DocumentCreate::from(doc));
 
         if let Some(IdRow { id }) = existing {
             self.db
                 .query("UPDATE $rid MERGE $data")
                 .bind(("rid", id.clone()))
-                .bind(("data", wire))
+                .bind(("data", data))
                 .await?
                 .check()?;
             Ok(id)
@@ -255,7 +307,7 @@ impl Storage for SurrealStorage {
             let mut response = self
                 .db
                 .query("CREATE document CONTENT $data RETURN id")
-                .bind(("data", wire))
+                .bind(("data", data))
                 .await?;
             let row: Option<IdRow> = response.take(0)?;
             row.map(|r| r.id).ok_or(Error::EmptyResult)
@@ -268,7 +320,7 @@ impl Storage for SurrealStorage {
             .query("SELECT * FROM $rid LIMIT 1")
             .bind(("rid", id.clone()))
             .await?;
-        let row: Option<DocumentWire> = response.take(0)?;
+        let row: Option<DocumentRead> = response.take(0)?;
         Ok(row.map(Document::from))
     }
 
@@ -278,7 +330,7 @@ impl Storage for SurrealStorage {
             .query("SELECT * FROM document WHERE canonical_id = $cid LIMIT 1")
             .bind(("cid", canonical_id.to_string()))
             .await?;
-        let row: Option<DocumentWire> = response.take(0)?;
+        let row: Option<DocumentRead> = response.take(0)?;
         Ok(row.map(Document::from))
     }
 
@@ -656,7 +708,7 @@ impl Storage for SurrealStorage {
         // The user record id is `message:<ulid>`. We hand the key into
         // a `type::thing('message', $key)` builder so SurrealDB's
         // parser receives a record literal, not a string.
-        let user_rid = RecordId::from(("message", user_message_id));
+        let user_rid = RecordId::new("message", user_message_id);
         // The transaction does (in order):
         //   1. LET $parent_ts — bind the parent's created_at (or EPOCH).
         //   2. DELETE any messages newer than that — "last writer wins".
@@ -665,10 +717,11 @@ impl Storage for SurrealStorage {
         //      with `RETURN id` so we can read the new id back.
         //   5. UPDATE conversation.updated_at.
         //
-        // Response slot layout: `BEGIN/COMMIT` and `LET` are framing;
-        // the four data statements (DELETE, CREATE user, CREATE
-        // assistant, UPDATE) occupy slots 0..=3 in order. We pull the
-        // assistant id from slot 2.
+        // The assistant row is written via `CONTENT $asst_data` (a bound
+        // SurrealValue struct) rather than an inline object literal: on a
+        // SCHEMAFULL table, surrealdb 3 only applies the `citations` field's
+        // FLEXIBLE rule to the nested objects when they arrive as a bound
+        // payload (inline `{ citations: $x }` raises "no such field").
         let sql = "
             BEGIN;
             LET $parent_ts = IF $parent_id != NONE
@@ -684,13 +737,7 @@ impl Storage for SurrealStorage {
                 content: $user_text,
                 parent_id: $parent_id
             };
-            CREATE ONLY message CONTENT {
-                conversation: $conv,
-                role: 'assistant',
-                content: $asst_text,
-                parent_id: $user_rid,
-                citations: $citations
-            } RETURN id;
+            CREATE ONLY message CONTENT $asst_data RETURN id;
             UPDATE $conv SET updated_at = time::now();
             COMMIT;
         ";
@@ -701,24 +748,33 @@ impl Storage for SurrealStorage {
         } else {
             Some(citations.to_vec())
         };
+        let asst_data = AssistantContent {
+            conversation: conv.clone(),
+            role: "assistant".to_string(),
+            content: assistant_text.to_string(),
+            parent_id: user_rid.clone(),
+            citations: citations_bind,
+        };
         let mut response = self
             .db
             .query(sql)
             .bind(("conv", conv.clone()))
             .bind(("user_rid", user_rid))
             .bind(("user_text", user_text.to_string()))
-            .bind(("asst_text", assistant_text.to_string()))
             .bind(("parent_id", parent_id.cloned()))
-            .bind(("citations", citations_bind))
+            .bind(("asst_data", asst_data))
             .await?
             .check()?;
-        // Statement-slot map (BEGIN/COMMIT framing, LET counts):
-        //   0: LET $parent_ts
-        //   1: DELETE
-        //   2: CREATE user
-        //   3: CREATE ONLY assistant RETURN id  ← what we want
-        //   4: UPDATE
-        let row: Option<IdRow> = response.take(3)?;
+        // Statement-slot map (surrealdb 3): `BEGIN` consumes slot 0, then
+        // every statement gets its own slot, so the data statements are
+        // shifted one past their position in the SQL text:
+        //   0: BEGIN
+        //   1: LET $parent_ts
+        //   2: DELETE
+        //   3: CREATE user
+        //   4: CREATE ONLY assistant RETURN id  ← what we want
+        //   5: UPDATE
+        let row: Option<IdRow> = response.take(4)?;
         row.map(|r| r.id).ok_or(Error::EmptyResult)
     }
 
@@ -769,7 +825,7 @@ impl Storage for SurrealStorage {
                 .bind(("cursor_id", c.id));
         }
         let mut response = q.await?;
-        let wires: Vec<DocumentWire> = response.take(0)?;
+        let wires: Vec<DocumentRead> = response.take(0)?;
         Ok(wires.into_iter().map(Document::from).collect())
     }
 
@@ -783,6 +839,16 @@ impl Storage for SurrealStorage {
         // PERMISSIONS gate the row to the caller; a tenant-mismatched
         // canonical_id triggers the UNIQUE index → SurrealDB error,
         // propagated to the handler as a 409.
+        // surrealdb 3 distinguishes NULL from NONE: a JSON `null`
+        // (`serde_json::Value::Null`) binds as SurrealDB `NULL`, which
+        // fails to coerce into the non-optional `declared_metadata object
+        // DEFAULT {}` column (DEFAULT only fills NONE/absent). Manual
+        // uploads carry no metadata, so normalise `null` → `{}`.
+        let declared_metadata = if params.declared_metadata.is_null() {
+            serde_json::json!({})
+        } else {
+            params.declared_metadata.clone()
+        };
         let mut response = self
             .db
             .query(
@@ -816,7 +882,7 @@ impl Storage for SurrealStorage {
                 "declared_content_type",
                 params.declared_content_type.clone(),
             ))
-            .bind(("declared_metadata", params.declared_metadata.clone()))
+            .bind(("declared_metadata", declared_metadata))
             .await?
             .check()?;
         let row: Option<UploadSession> = response.take(0)?;
@@ -880,7 +946,7 @@ impl Storage for SurrealStorage {
             let existing: Option<IdRow> = conflict.take(0)?;
             if let Some(IdRow { id }) = existing {
                 return Err(Error::CanonicalIdConflict {
-                    existing_doc_id: id.to_string(),
+                    existing_doc_id: id.to_sql(),
                 });
             }
         }
@@ -918,7 +984,7 @@ impl Storage for SurrealStorage {
         // immediately.
         let mut attempt = 0usize;
         loop {
-            let rid = RecordId::from(("document", doc_id));
+            let rid = RecordId::new("document", doc_id);
             let content_data = ContentData {
                 doc: rid.clone(),
                 format: content.format.clone(),
@@ -930,14 +996,16 @@ impl Storage for SurrealStorage {
                     .db
                     .query(sql)
                     .bind(("rid", rid))
-                    .bind(("data", DocumentWire::from(doc)))
+                    .bind(("data", content_without_none(DocumentCreate::from(doc))))
                     .bind(("dedup_key", dedup_key.map(|s| s.to_string())))
                     .bind(("content", content_data))
                     .bind(("d", doc_id.to_string()))
                     .await?
                     .check()?;
-                // Slot 0 = CREATE … RETURN id.
-                let created: Option<IdRow> = response.take(0)?;
+                // Slot 1 = CREATE … RETURN id. surrealdb 3's `BEGIN`
+                // consumes slot 0, shifting every statement one past its
+                // position in the SQL text (same shift as `commit_turn`).
+                let created: Option<IdRow> = response.take(1)?;
                 created.map(|r| r.id).ok_or(Error::EmptyResult)
             }
             .await;

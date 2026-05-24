@@ -10,7 +10,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthContext {

@@ -19,7 +19,7 @@ use axum::http::{HeaderName, HeaderValue, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use serde::de::DeserializeOwned;
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 use tower::ServiceExt;
 
 use serde_json::json;

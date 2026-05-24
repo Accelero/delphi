@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use common::{AuthRequestBuilder, TestApp};
 use delphi::storage::Storage;
+use surrealdb::types::ToSql;
 
 fn key_of(id_str: &str) -> String {
     id_str
@@ -26,7 +27,7 @@ fn key_of(id_str: &str) -> String {
         .unwrap_or_else(|| id_str.to_string())
 }
 
-async fn create_conversation(app: &TestApp) -> surrealdb::RecordId {
+async fn create_conversation(app: &TestApp) -> surrealdb::types::RecordId {
     let req = AuthRequestBuilder::default().apply(
         Request::builder()
             .method("POST")
@@ -39,7 +40,7 @@ async fn create_conversation(app: &TestApp) -> surrealdb::RecordId {
     assert_eq!(res.status, StatusCode::CREATED, "{}", res.text());
     let body: Value = res.json();
     let id_str = body["id"].as_str().expect("id").to_string();
-    surrealdb::RecordId::from(("conversation", key_of(&id_str).as_str()))
+    surrealdb::types::RecordId::new("conversation", key_of(&id_str).as_str())
 }
 
 #[tokio::test]
@@ -151,7 +152,7 @@ async fn second_turn_respects_parent_chain() {
     assert_eq!(msgs[1].content, "a1");
     assert_eq!(msgs[2].content, "q2");
     assert_eq!(msgs[3].content, "a2");
-    assert!(asst2.to_string().starts_with("message:"));
+    assert!(asst2.to_sql().starts_with("message:"));
     // Parent chain runs user(q1) -> asst(a1) -> user(q2) -> asst(a2).
     assert_eq!(msgs[1].parent_id.as_ref(), msgs[0].id.as_ref());
     assert_eq!(msgs[2].parent_id.as_ref(), Some(&asst1));

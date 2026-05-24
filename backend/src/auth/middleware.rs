@@ -32,7 +32,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use super::bootstrap;
 use super::claims::{Claims, ClaimsError, ClaimsExtractor};

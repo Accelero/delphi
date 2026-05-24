@@ -31,7 +31,7 @@ use base64::Engine;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 use tokio::sync::broadcast;
 
 use crate::auth::AuthContext;
@@ -197,7 +197,7 @@ fn broadcast_to_sse(
 fn encode_cursor(ingested_at: DateTime<Utc>, id: RecordId) -> String {
     let wire = CursorWire {
         p: ingested_at.to_rfc3339(),
-        i: id.key().to_string(),
+        i: crate::storage::record_key(&id),
     };
     let json = serde_json::to_vec(&wire).expect("CursorWire serialize");
     URL_SAFE_NO_PAD.encode(json)
@@ -210,7 +210,7 @@ fn decode_cursor(s: &str) -> std::result::Result<FeedCursor, CursorError> {
     let utc = parsed.with_timezone(&Utc);
     Ok(FeedCursor {
         ingested_at: utc,
-        id: RecordId::from(("document", wire.i.as_str())),
+        id: RecordId::new("document", wire.i.as_str()),
     })
 }
 
@@ -224,11 +224,11 @@ mod tests {
 
     #[test]
     fn cursor_roundtrip() {
-        let id = RecordId::from(("document", "abc123"));
+        let id = RecordId::new("document", "abc123");
         let now = Utc::now();
         let encoded = encode_cursor(now, id);
         let decoded = decode_cursor(&encoded).expect("decode");
-        assert_eq!(decoded.id.key().to_string(), "abc123");
+        assert_eq!(crate::storage::record_key(&decoded.id), "abc123");
         assert_eq!(decoded.ingested_at, now);
     }
 

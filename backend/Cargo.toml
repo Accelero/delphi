@@ -18,7 +18,7 @@ path = "src/main.rs"
 # `kv-mem` enables the embedded in-memory engine for fast tests
 # (`Surreal::<Any>::connect("memory")`). Production keeps connecting via
 # `ws://`; the engine type is now resolved at runtime from the URL.
-surrealdb = { version = "2", default-features = false, features = [
+surrealdb = { version = "3", default-features = false, features = [
     "protocol-ws",
     "protocol-http",
     "kv-mem",
@@ -45,7 +45,12 @@ async-stream = "0.3"
 
 # serde
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` keeps `serde_json::Value` object keys in insertion order
+# (IndexMap, not BTreeMap). surrealdb 2 enabled this transitively; surrealdb 3
+# doesn't, which silently re-ordered our SSE/JSON wire output to alphabetical
+# (caught by the `api/sse.rs` byte snapshots). We depend on insertion order for
+# stable, declaration-ordered wire bytes, so pin it ourselves.
+serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # cli

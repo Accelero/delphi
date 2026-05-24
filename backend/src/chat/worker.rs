@@ -42,6 +42,8 @@ use tracing::{error, info, warn};
 use crate::api::sse::{self, CitationEntry};
 use crate::auth::AuthContext;
 use crate::embedder::Embedder;
+use surrealdb::types::ToSql;
+
 use crate::llm::{LlmClient, LlmDelta, LlmMessage, Role};
 use crate::state::AppState;
 use crate::storage::{
@@ -115,7 +117,7 @@ async fn run(mut handle: TurnHandle, task_id: TaskId, req: TurnRequest) {
     // has already terminated. `TurnHandle::Drop` is the panic-only
     // backstop.
     if let Err(e) = drive_turn(&mut handle, task_id, &req).await {
-        error!(conv = %req.conversation_id, task = %task_id, error = %e, "turn ended with internal error");
+        error!(conv = %req.conversation_id.to_sql(), task = %task_id, error = %e, "turn ended with internal error");
     }
 }
 
@@ -133,7 +135,7 @@ async fn drive_turn(
     let db = match req.pool.acquire(&req.bearer).await {
         Ok(d) => d,
         Err(e) => {
-            error!(conv = %req.conversation_id, error = %e, "worker pool acquire failed");
+            error!(conv = %req.conversation_id.to_sql(), error = %e, "worker pool acquire failed");
             handle.append(sse::error("auth setup failed")).await;
             handle.terminate(sse::clear()).await;
             return Err(format!("pool acquire: {e}"));
@@ -143,7 +145,7 @@ async fn drive_turn(
     let history = match db.list_messages(&req.conversation_id).await {
         Ok(m) => m,
         Err(e) => {
-            error!(conv = %req.conversation_id, error = %e, "list_messages failed");
+            error!(conv = %req.conversation_id.to_sql(), error = %e, "list_messages failed");
             handle.append(sse::error("history lookup failed")).await;
             handle.terminate(sse::clear()).await;
             return Err(format!("list_messages: {e}"));
@@ -155,7 +157,7 @@ async fn drive_turn(
         Ok(Some(c)) => c.title.is_some(),
         Ok(None) => false,
         Err(e) => {
-            error!(conv = %req.conversation_id, error = %e, "get_conversation failed");
+            error!(conv = %req.conversation_id.to_sql(), error = %e, "get_conversation failed");
             false
         }
     };
@@ -193,8 +195,8 @@ async fn drive_turn(
     }
 
     info!(
-        user_id = %req.auth.user_id,
-        conv = %req.conversation_id,
+        user_id = %req.auth.user_id.to_sql(),
+        conv = %req.conversation_id.to_sql(),
         task = %task_id,
         history_len = history.len(),
         "worker driving turn"
@@ -219,7 +221,7 @@ async fn drive_turn(
         tokio::select! {
             biased;
             _ = handle.cancelled() => {
-                info!(conv = %req.conversation_id, task = %task_id, "turn cancelled by /stop");
+                info!(conv = %req.conversation_id.to_sql(), task = %task_id, "turn cancelled by /stop");
                 break StopReason::Cancelled;
             }
             item = upstream.next() => match item {
@@ -268,7 +270,7 @@ async fn drive_turn(
         }
     };
 
-    let assistant_id_str = assistant_id.to_string();
+    let assistant_id_str = assistant_id.to_sql();
 
     // Emit `finish` immediately so the UI unblocks — the turn is complete
     // and durable. The first-turn auto-title runs off this critical path.
@@ -344,8 +346,8 @@ fn role_to_llm(role: &str) -> Option<Role> {
 
 #[derive(Debug, Clone)]
 struct Retrieved {
-    chunk_id: surrealdb::RecordId,
-    doc_id: surrealdb::RecordId,
+    chunk_id: surrealdb::types::RecordId,
+    doc_id: surrealdb::types::RecordId,
     #[allow(dead_code)]
     ordinal: i64,
     text: String,
@@ -371,7 +373,7 @@ async fn retrieve_for_query(
         return Ok(Vec::new());
     }
 
-    let mut seen: HashSet<surrealdb::RecordId> = HashSet::new();
+    let mut seen: HashSet<surrealdb::types::RecordId> = HashSet::new();
     let mut out: Vec<Retrieved> = Vec::new();
     for hit in &hits {
         let lo = (hit.ordinal - radius).max(0);
@@ -429,8 +431,8 @@ fn citation_entries(rows: &[Retrieved]) -> Vec<CitationEntry> {
         .enumerate()
         .map(|(i, r)| CitationEntry {
             n: i + 1,
-            chunk_id: r.chunk_id.to_string(),
-            doc_id: r.doc_id.to_string(),
+            chunk_id: r.chunk_id.to_sql(),
+            doc_id: r.doc_id.to_sql(),
             doc_title: r.doc_title.clone(),
             page: r.page,
         })
@@ -446,8 +448,8 @@ fn storage_citations(rows: &[Retrieved]) -> Vec<Citation> {
         .enumerate()
         .map(|(i, r)| Citation {
             n: i + 1,
-            chunk_id: r.chunk_id.to_string(),
-            doc_id: r.doc_id.to_string(),
+            chunk_id: r.chunk_id.to_sql(),
+            doc_id: r.doc_id.to_sql(),
             doc_title: r.doc_title.clone(),
             page: r.page,
         })

@@ -89,9 +89,9 @@ async fn unknown_tenant_falls_back_to_default() {
 
     let body: Value = res.json();
     let tenant = body["tenant"]["id"].as_str().unwrap();
-    let expected = format!("tenant:{}", app.default_tenant_id.key());
+    let expected = format!("tenant:{}", delphi::storage::record_key(&app.default_tenant_id));
     assert!(
-        tenant.contains(&app.default_tenant_id.key().to_string())
+        tenant.contains(&delphi::storage::record_key(&app.default_tenant_id))
             || tenant == expected
             || tenant.starts_with("tenant:"),
         "got tenant {tenant}, expected fallback to default"

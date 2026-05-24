@@ -32,7 +32,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::StreamExt;
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use crate::chat::Cursor;
 use crate::state::AppState;
@@ -43,7 +43,7 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     if k.is_empty() || k.contains(':') || k.len() != key.len() {
         return Err((StatusCode::BAD_REQUEST, "invalid conversation key").into_response());
     }
-    Ok(RecordId::from(("conversation", k)))
+    Ok(RecordId::new("conversation", k))
 }
 
 /// The browser resends the last frame's `id:` as a `Last-Event-Id`

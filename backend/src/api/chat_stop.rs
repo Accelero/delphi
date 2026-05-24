@@ -17,7 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Extension;
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use crate::state::AppState;
 use crate::storage::{AuthedDb, ConversationId, Storage};
@@ -27,7 +27,7 @@ fn parse_conversation_id(key: &str) -> Result<ConversationId, Response> {
     if k.is_empty() || k.contains(':') || k.len() != key.len() {
         return Err((StatusCode::BAD_REQUEST, "invalid conversation key").into_response());
     }
-    Ok(RecordId::from(("conversation", k)))
+    Ok(RecordId::new("conversation", k))
 }
 
 pub async fn stop(

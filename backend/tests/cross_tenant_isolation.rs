@@ -14,13 +14,13 @@
 mod common;
 
 use jsonwebtoken::{encode, EncodingKey, Header};
-use surrealdb::RecordId;
+use surrealdb::types::{RecordId, SurrealValue};
 
 use delphi::storage::{JwtAccessConfig, JwtAccessKind, SystemDb};
 
 const TEST_SECRET: &str = "test-only-secret-do-not-use-anywhere-real-please";
 
-#[derive(serde::Deserialize)]
+#[derive(SurrealValue)]
 struct IdRow {
     id: RecordId,
 }
@@ -81,8 +81,8 @@ async fn build_world(ns: &str) -> World {
     let tenant_b = create_tenant(&system, "tenant-b", "Tenant B").await;
     let alice = create_user(&system, "https://idp.test/", "alice", "alice@a.test", &tenant_a).await;
     let bob = create_user(&system, "https://idp.test/", "bob", "bob@b.test", &tenant_b).await;
-    create_membership(&system, &alice, &tenant_a, "member").await;
-    create_membership(&system, &bob, &tenant_b, "member").await;
+    create_membership(&system, &alice, &tenant_a).await;
+    create_membership(&system, &bob, &tenant_b).await;
 
     let doc_a = create_document(&system, &tenant_a, "doc-shared", "Alice's document").await;
     let doc_b = create_document(&system, &tenant_b, "doc-shared", "Bob's document").await;
@@ -144,21 +144,16 @@ async fn create_user(
     row.unwrap().id
 }
 
-async fn create_membership(
-    system: &SystemDb,
-    user: &RecordId,
-    tenant: &RecordId,
-    role: &str,
-) {
+async fn create_membership(system: &SystemDb, user: &RecordId, tenant: &RecordId) {
+    // No `role` field: the `membership` table is SCHEMAFULL and the schema
+    // deliberately omits `role` (capabilities come from the JWT, not the
+    // DB). surrealdb 3 rejects writes of undefined fields, where surreal 2
+    // silently dropped them.
     system
         .raw()
-        .query(
-            "CREATE membership CONTENT \
-             { user: $u, tenant_id: $t, role: $r }",
-        )
+        .query("CREATE membership CONTENT { user: $u, tenant_id: $t }")
         .bind(("u", user.clone()))
         .bind(("t", tenant.clone()))
-        .bind(("r", role.to_string()))
         .await
         .unwrap()
         .check()
@@ -189,7 +184,7 @@ async fn create_document(
         .bind(("cid", canonical_id.to_string()))
         .bind(("uri", format!("https://test/{canonical_id}")))
         .bind(("title", title.to_string()))
-        .bind(("hash", format!("hash-{canonical_id}-{}", tenant.key())))
+        .bind(("hash", format!("hash-{canonical_id}-{}", delphi::storage::record_key(tenant))))
         .await
         .unwrap();
     let row: Option<IdRow> = r.take(0).unwrap();

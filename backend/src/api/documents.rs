@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::Serialize;
-use surrealdb::RecordId;
+use surrealdb::types::RecordId;
 
 use crate::object_store::AccessOp;
 use crate::state::AppState;
@@ -38,7 +38,7 @@ pub async fn view_url(
     Extension(db): Extension<Arc<AuthedDb>>,
     Path(key): Path<String>,
 ) -> Response {
-    let id = RecordId::from(("document", key.as_str()));
+    let id = RecordId::new("document", key.as_str());
 
     // Authz decision: tenant-scoped lookup through the JWT-bound session.
     let doc = match db.get_document(&id).await {

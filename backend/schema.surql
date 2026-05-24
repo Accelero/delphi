@@ -75,7 +75,7 @@ DEFINE FIELD IF NOT EXISTS plan               ON tenant TYPE string DEFAULT 'fre
 DEFINE FIELD IF NOT EXISTS billing_email      ON tenant TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS stripe_customer_id ON tenant TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at         ON tenant TYPE datetime DEFAULT time::now();
-DEFINE FIELD IF NOT EXISTS metadata           ON tenant FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS metadata           ON tenant TYPE object FLEXIBLE DEFAULT {};
 DEFINE INDEX IF NOT EXISTS tenant_slug        ON tenant FIELDS slug UNIQUE;
 
 -- `tenant_id` is denormalized from `membership` so PERMISSIONS clauses on
@@ -148,7 +148,7 @@ DEFINE FIELD IF NOT EXISTS language     ON document TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS summary      ON document TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS content_hash ON document TYPE string;
 DEFINE FIELD IF NOT EXISTS version      ON document TYPE int DEFAULT 1;
-DEFINE FIELD IF NOT EXISTS metadata     ON document FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS metadata     ON document TYPE object FLEXIBLE DEFAULT {};
 -- RAG v1: document-level embedding for "similar papers" + paper-rank reranking.
 -- Populated at ingest by SPECTER2 over `title + [SEP] + abstract`. 768-dim.
 -- Surfacing in the UI is deferred (see docs/architecture/rag.md "Deferred").
@@ -210,7 +210,7 @@ DEFINE FIELD IF NOT EXISTS extracted_at ON document_content TYPE datetime DEFAUL
 
 DEFINE INDEX IF NOT EXISTS document_content_doc       ON document_content FIELDS doc UNIQUE;
 DEFINE INDEX IF NOT EXISTS document_content_tenant_id ON document_content FIELDS tenant_id;
-DEFINE INDEX IF NOT EXISTS document_content_text      ON document_content FIELDS text SEARCH ANALYZER text_en BM25;
+DEFINE INDEX IF NOT EXISTS document_content_text      ON document_content FIELDS text FULLTEXT ANALYZER text_en BM25;
 
 -- ---------------------------------------------------------------------------
 -- chunk
@@ -233,7 +233,12 @@ DEFINE FIELD IF NOT EXISTS char_end        ON chunk TYPE int;
 -- fields — no rows in the wild yet since no chunker had run.
 REMOVE FIELD IF EXISTS page ON chunk;
 REMOVE FIELD IF EXISTS bbox ON chunk;
-DEFINE FIELD IF NOT EXISTS bboxes          ON chunk FLEXIBLE TYPE option<array<object>>;
+-- See `message.citations` for why the element subtype must be an explicit
+-- FLEXIBLE object: the auto-generated `bboxes[*] TYPE object` is otherwise
+-- non-flexible and rejects the rectangle keys on RECORD-session writes
+-- (only the root-session chunk test exercised this before).
+DEFINE FIELD IF NOT EXISTS bboxes          ON chunk TYPE option<array<object>>;
+DEFINE FIELD OVERWRITE     bboxes[*]       ON chunk TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS text            ON chunk TYPE string;
 DEFINE FIELD IF NOT EXISTS embedding       ON chunk TYPE array<float>;
 DEFINE FIELD IF NOT EXISTS embedding_model ON chunk TYPE string;
@@ -243,7 +248,7 @@ DEFINE FIELD IF NOT EXISTS created_at      ON chunk TYPE datetime DEFAULT time::
 DEFINE INDEX IF NOT EXISTS chunk_doc       ON chunk FIELDS doc;
 DEFINE INDEX IF NOT EXISTS chunk_tenant_id ON chunk FIELDS tenant_id;
 DEFINE INDEX IF NOT EXISTS chunk_unique    ON chunk FIELDS doc, ordinal, embedding_model, chunk_strategy UNIQUE;
-DEFINE INDEX IF NOT EXISTS chunk_text      ON chunk FIELDS text SEARCH ANALYZER text_en BM25;
+DEFINE INDEX IF NOT EXISTS chunk_text      ON chunk FIELDS text FULLTEXT ANALYZER text_en BM25;
 DEFINE INDEX IF NOT EXISTS chunk_embedding ON chunk FIELDS embedding HNSW DIMENSION 384 DIST COSINE TYPE F32 EFC 200 M 16;
 
 -- ---------------------------------------------------------------------------
@@ -281,7 +286,7 @@ DEFINE FIELD OVERWRITE tenant_id  ON source_state TYPE record<tenant>
     DEFAULT $auth.tenant_id
     ASSERT $value != NONE;
 DEFINE FIELD IF NOT EXISTS adapter    ON source_state TYPE string;
-DEFINE FIELD IF NOT EXISTS cursor     ON source_state FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS cursor     ON source_state TYPE object FLEXIBLE DEFAULT {};
 DEFINE FIELD IF NOT EXISTS updated_at ON source_state TYPE datetime DEFAULT time::now();
 
 REMOVE INDEX IF EXISTS source_state_adapter ON source_state;
@@ -330,7 +335,7 @@ DEFINE FIELD IF NOT EXISTS title                 ON upload_session TYPE option<s
 DEFINE FIELD IF NOT EXISTS filename              ON upload_session TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS declared_size         ON upload_session TYPE int;
 DEFINE FIELD IF NOT EXISTS declared_content_type ON upload_session TYPE string;
-DEFINE FIELD IF NOT EXISTS declared_metadata     ON upload_session FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS declared_metadata     ON upload_session TYPE object FLEXIBLE DEFAULT {};
 DEFINE FIELD IF NOT EXISTS started_at            ON upload_session TYPE datetime DEFAULT time::now();
 
 DEFINE INDEX IF NOT EXISTS upload_session_doc_id     ON upload_session FIELDS doc_id UNIQUE;
@@ -392,7 +397,7 @@ DEFINE FIELD OVERWRITE user       ON conversation TYPE record<app_user>
 DEFINE FIELD IF NOT EXISTS title      ON conversation TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS created_at ON conversation TYPE datetime DEFAULT time::now();
 DEFINE FIELD IF NOT EXISTS updated_at ON conversation TYPE datetime DEFAULT time::now();
-DEFINE FIELD IF NOT EXISTS metadata   ON conversation FLEXIBLE TYPE object DEFAULT {};
+DEFINE FIELD IF NOT EXISTS metadata   ON conversation TYPE object FLEXIBLE DEFAULT {};
 REMOVE INDEX IF EXISTS conversation_tenant_user ON conversation;
 DEFINE INDEX IF NOT EXISTS conversation_tenant_user ON conversation FIELDS tenant_id, user;
 DEFINE INDEX IF NOT EXISTS conversation_updated_at  ON conversation FIELDS updated_at;
@@ -409,7 +414,11 @@ DEFINE FIELD OVERWRITE tenant_id      ON message TYPE record<tenant>
 DEFINE FIELD IF NOT EXISTS role           ON message TYPE string
     ASSERT $value INSIDE ['system','user','assistant','tool'];
 DEFINE FIELD IF NOT EXISTS content        ON message TYPE string;
-DEFINE FIELD IF NOT EXISTS parts          ON message FLEXIBLE TYPE array DEFAULT [];
+-- Untyped `array` (elements are `any`): stores arbitrary objects without
+-- a nested schema. surrealdb 3 forbids `FLEXIBLE` on non-object types and
+-- schema-checks the elements of `array<object>`, so a bare `array` is how
+-- you keep schemaless elements on a SCHEMAFULL table.
+DEFINE FIELD IF NOT EXISTS parts          ON message TYPE array DEFAULT [];
 -- Parent message in the linear chat history. NONE for the first
 -- message in a conversation. Powers the "last writer wins" commit_turn
 -- transaction: a new turn DELETEs anything created after its parent
@@ -419,10 +428,16 @@ DEFINE FIELD IF NOT EXISTS model          ON message TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS finish_reason  ON message TYPE option<string>;
 -- Resolved RAG citations for an assistant turn, so a reloaded
 -- conversation renders its `[N]` markers without re-running retrieval.
--- Assistant rows only (NONE elsewhere). FLEXIBLE: the element objects
--- ({n, chunk_id, doc_id, doc_title?, page?}) carry their own shape and
--- aren't worth a nested SCHEMAFULL definition.
-DEFINE FIELD IF NOT EXISTS citations      ON message FLEXIBLE TYPE option<array> DEFAULT NONE;
+-- Assistant rows only (NONE elsewhere). The element objects
+-- ({n, chunk_id, doc_id, doc_title?, page?}) carry their own shape. In
+-- surrealdb 3 a SCHEMAFULL table validates *every* nested field path, and
+-- `array<object>` auto-defines a NON-flexible `citations[*] TYPE object`
+-- subtype that then rejects the element keys for RECORD-session writes
+-- (root sessions skip the check, which is why this only bit chat, not the
+-- root-written chunk.bboxes). The fix is to OVERWRITE the element subtype
+-- as a FLEXIBLE object so arbitrary keys are allowed.
+DEFINE FIELD IF NOT EXISTS citations      ON message TYPE option<array<object>> DEFAULT NONE;
+DEFINE FIELD OVERWRITE     citations[*]   ON message TYPE object FLEXIBLE;
 DEFINE FIELD IF NOT EXISTS created_at     ON message TYPE datetime DEFAULT time::now();
 DEFINE INDEX IF NOT EXISTS message_conversation   ON message FIELDS conversation;
 REMOVE INDEX IF EXISTS message_tenant_created ON message;

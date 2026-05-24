@@ -21,10 +21,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::Deserialize;
 use surrealdb::engine::any::{self, Any};
 use surrealdb::opt::auth::Root;
-use surrealdb::{RecordId, Surreal};
+use surrealdb::types::{RecordId, SurrealValue};
+use surrealdb::Surreal;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::{Error, Result};
@@ -94,9 +94,11 @@ impl RequestDbPool {
         for _ in 0..size {
             let db = any::connect(&url).await?;
             if engine_requires_auth(&url) {
+                // surrealdb 3's `Root` owns its credentials (`String`), so
+                // clone per pool connection.
                 db.signin(Root {
-                    username: &user,
-                    password: &password,
+                    username: user.clone(),
+                    password: password.clone(),
                 })
                 .await?;
             }
@@ -274,11 +276,13 @@ impl AuthedDb {
 /// Subset of `app_user` fields the identity middleware reads after
 /// authenticate. All values come from `$auth`, which is bound by the
 /// `app_session` access method's AUTHENTICATE clause.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, SurrealValue)]
 pub struct AuthRecord {
     pub id: RecordId,
     pub tenant_id: RecordId,
+    #[surreal(default)]
     pub email: String,
+    #[surreal(default)]
     pub display_name: Option<String>,
 }
 

@@ -49,7 +49,7 @@ async fn mints_download_url_for_in_tenant_doc() {
         .upsert_document(&doc("vu-ok", Some("s3://delphi/tenants/test/vu-ok")))
         .await
         .expect("upsert doc");
-    let key = doc_id.key().to_string();
+    let key = delphi::storage::record_key(&doc_id);
 
     let req = AuthRequestBuilder::default().apply(
         Request::builder()
@@ -77,7 +77,7 @@ async fn returns_404_when_no_stored_original() {
         .upsert_document(&doc("vu-nofile", None))
         .await
         .expect("upsert doc");
-    let key = doc_id.key().to_string();
+    let key = delphi::storage::record_key(&doc_id);
 
     let req = AuthRequestBuilder::default().apply(
         Request::builder()
@@ -117,7 +117,7 @@ async fn cross_tenant_doc_cannot_be_minted() {
         .upsert_document(&doc("vu-other", Some("s3://delphi/tenants/other/vu-other")))
         .await
         .expect("upsert doc");
-    let key = doc_id.key().to_string();
+    let key = delphi::storage::record_key(&doc_id);
 
     // Default-tenant caller: engine PERMISSIONS refuse the SELECT, the
     // handler sees `Ok(None)` → 404, and no URL is ever minted.

@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+use surrealdb::types::ToSql;
 
 use super::context::AuthContext;
 
@@ -18,12 +19,12 @@ pub async fn me(auth: Option<AuthContext>) -> Response {
     };
     Json(json!({
         "user": {
-            "id": auth.user_id.to_string(),
+            "id": auth.user_id.to_sql(),
             "email": auth.email,
             "name": auth.display_name,
         },
         "tenant": {
-            "id": auth.tenant_id.to_string(),
+            "id": auth.tenant_id.to_sql(),
         },
         "roles": auth.roles,
         "dev": auth.is_dev,

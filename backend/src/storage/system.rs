@@ -19,14 +19,14 @@
 //! every query.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use surrealdb::engine::any::Any;
 use surrealdb::opt::auth::Root;
-use surrealdb::{Datetime, RecordId, Surreal};
+use surrealdb::types::{Datetime, RecordId, SurrealValue};
+use surrealdb::Surreal;
 
 use crate::error::{Error, Result};
 
+use super::models::content_without_none;
 use super::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
     ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
@@ -123,8 +123,8 @@ impl SystemDb {
         let requires_auth = engine_requires_auth(url);
         if requires_auth {
             db.signin(Root {
-                username: user,
-                password,
+                username: user.to_string(),
+                password: password.to_string(),
             })
             .await?;
         }
@@ -340,17 +340,17 @@ impl SystemDb {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct CountRow {
     n: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct IdRow {
     id: RecordId,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, SurrealValue)]
 struct CursorRow {
     cursor: serde_json::Value,
 }
@@ -405,37 +405,71 @@ pub struct SystemStorage {
     tenant: RecordId,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DocumentWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    id: Option<RecordId>,
+// Same surrealdb-3 split as `surreal.rs`: writes use a payload struct that
+// physically omits `id` (the engine assigns it), reads use a struct that
+// carries `id` back. `tenant_id` *is* on the write payload here — the system
+// path runs as root with no `$auth`, so `DEFAULT $auth.tenant_id` can't fill
+// it; SystemStorage sets it explicitly.
+#[derive(Debug, SurrealValue)]
+struct DocumentCreate {
     tenant_id: RecordId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     canonical_id: Option<String>,
     source_type: String,
     source_uri: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     storage_uri: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     title: Option<String>,
-    #[serde(default)]
     authors: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     published_at: Option<Datetime>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     ingested_at: Option<Datetime>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     language: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     summary: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     paper_embedding: Option<Vec<f32>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[surreal(default)]
     paper_embedding_model: Option<String>,
     content_hash: String,
-    #[serde(default = "default_version")]
     version: i64,
-    #[serde(default)]
+    metadata: serde_json::Value,
+}
+
+#[derive(Debug, SurrealValue)]
+struct DocumentRead {
+    #[surreal(default)]
+    id: Option<RecordId>,
+    tenant_id: RecordId,
+    #[surreal(default)]
+    canonical_id: Option<String>,
+    source_type: String,
+    source_uri: String,
+    #[surreal(default)]
+    storage_uri: Option<String>,
+    #[surreal(default)]
+    title: Option<String>,
+    #[surreal(default)]
+    authors: Vec<String>,
+    #[surreal(default)]
+    published_at: Option<Datetime>,
+    #[surreal(default)]
+    ingested_at: Option<Datetime>,
+    #[surreal(default)]
+    language: Option<String>,
+    #[surreal(default)]
+    summary: Option<String>,
+    #[surreal(default)]
+    paper_embedding: Option<Vec<f32>>,
+    #[surreal(default)]
+    paper_embedding_model: Option<String>,
+    content_hash: String,
+    #[surreal(default = "default_version")]
+    version: i64,
+    #[surreal(default)]
     metadata: serde_json::Value,
 }
 
@@ -444,9 +478,8 @@ fn default_version() -> i64 {
 }
 
 impl SystemStorage {
-    fn into_wire(&self, d: &Document) -> DocumentWire {
-        DocumentWire {
-            id: d.id.clone(),
+    fn into_wire(&self, d: &Document) -> DocumentCreate {
+        DocumentCreate {
             tenant_id: self.tenant.clone(),
             canonical_id: d.canonical_id.clone(),
             source_type: d.source_type.clone(),
@@ -466,7 +499,7 @@ impl SystemStorage {
         }
     }
 
-    fn from_wire(w: DocumentWire) -> Document {
+    fn from_wire(w: DocumentRead) -> Document {
         Document {
             id: w.id,
             tenant_id: Some(w.tenant_id),
@@ -476,12 +509,8 @@ impl SystemStorage {
             storage_uri: w.storage_uri,
             title: w.title,
             authors: w.authors,
-            published_at: w
-                .published_at
-                .map(|d| -> DateTime<Utc> { d.into_inner().into() }),
-            ingested_at: w
-                .ingested_at
-                .map(|d| -> DateTime<Utc> { d.into_inner().into() }),
+            published_at: w.published_at.map(Datetime::into_inner),
+            ingested_at: w.ingested_at.map(Datetime::into_inner),
             language: w.language,
             summary: w.summary,
             paper_embedding: w.paper_embedding,
@@ -493,7 +522,7 @@ impl SystemStorage {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, SurrealValue)]
 struct ContentData {
     tenant_id: RecordId,
     doc: RecordId,
@@ -502,7 +531,7 @@ struct ContentData {
     extractor: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, SurrealValue)]
 struct ChunkData {
     tenant_id: RecordId,
     doc: RecordId,
@@ -538,13 +567,13 @@ impl Storage for SystemStorage {
             None => None,
         };
 
-        let wire = self.into_wire(doc);
+        let data = content_without_none(self.into_wire(doc));
 
         if let Some(IdRow { id }) = existing {
             self.db
                 .query("UPDATE $rid MERGE $data")
                 .bind(("rid", id.clone()))
-                .bind(("data", wire))
+                .bind(("data", data))
                 .await?
                 .check()?;
             Ok(id)
@@ -552,7 +581,7 @@ impl Storage for SystemStorage {
             let mut response = self
                 .db
                 .query("CREATE document CONTENT $data RETURN id")
-                .bind(("data", wire))
+                .bind(("data", data))
                 .await?;
             let row: Option<IdRow> = response.take(0)?;
             row.map(|r| r.id).ok_or(Error::EmptyResult)
@@ -566,7 +595,7 @@ impl Storage for SystemStorage {
             .bind(("rid", id.clone()))
             .bind(("t", self.tenant.clone()))
             .await?;
-        let row: Option<DocumentWire> = response.take(0)?;
+        let row: Option<DocumentRead> = response.take(0)?;
         Ok(row.map(Self::from_wire))
     }
 
@@ -580,7 +609,7 @@ impl Storage for SystemStorage {
             .bind(("t", self.tenant.clone()))
             .bind(("cid", canonical_id.to_string()))
             .await?;
-        let row: Option<DocumentWire> = response.take(0)?;
+        let row: Option<DocumentRead> = response.take(0)?;
         Ok(row.map(Self::from_wire))
     }
 
@@ -870,7 +899,7 @@ impl Storage for SystemStorage {
                 .bind(("cursor_id", c.id));
         }
         let mut response = q.await?;
-        let wires: Vec<DocumentWire> = response.take(0)?;
+        let wires: Vec<DocumentRead> = response.take(0)?;
         Ok(wires.into_iter().map(Self::from_wire).collect())
     }
 

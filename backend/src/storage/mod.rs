@@ -28,9 +28,9 @@ mod surreal;
 mod system;
 
 pub use models::{
-    dedup_key, Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation,
-    Content, Conversation, ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor,
-    Filters, IngestionRejection, MessageId, UploadSession,
+    dedup_key, record_key, Bbox, CanonicalIdConflict, ChatMessage, Chunk, ChunkId,
+    ChunkSearchResult, Citation, Content, Conversation, ConversationId, CreateUploadSessionParams,
+    DocId, Document, FeedCursor, Filters, IngestionRejection, MessageId, UploadSession,
 };
 pub use request::{AuthRecord, AuthedDb, RequestDbPool};
 pub use surreal::SurrealStorage;
