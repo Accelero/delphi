@@ -112,9 +112,13 @@ infer = "0.19"
 # Direct-to-S3 ingestion (ingestion v2). `aws-sdk-s3` drives MinIO /
 # Hetzner / R2 / B2 / AWS through one client; `aws-config` builds the
 # SDK config from explicit knobs (no ambient AWS env discovery needed).
-# rustls keeps the build OpenSSL-free, matching reqwest + surrealdb.
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rustls"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "rustls", "sigv4a"] }
+# `default-https-client` (not the legacy `rustls` feature) selects the
+# modern `aws-smithy-http-client/rustls-aws-lc` backend → rustls 0.23 +
+# aws-lc-rs, unified with reqwest/surrealdb. The old `rustls` feature
+# pulled `legacy-rustls-ring` (rustls 0.21 → vulnerable rustls-webpki
+# 0.101, RUSTSEC-2026-0098/0099/0104). Keeps the build OpenSSL-free.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "sigv4a"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-types = "1"
 

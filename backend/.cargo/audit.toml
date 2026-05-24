@@ -1,0 +1,26 @@
+# cargo-audit configuration.
+#
+# These advisories have been individually assessed and cannot be acted on
+# from this crate today — they are forced by `surrealdb-core`'s own
+# dependency tree (re-evaluate whenever surrealdb is bumped). Everything
+# else stays un-ignored, so a *new* advisory still fails the run.
+
+[advisories]
+ignore = [
+    # rsa 0.9.x — "Marvin Attack" timing side-channel (no upstream fix).
+    # Pulled by `jsonwebtoken/rust_crypto`, which surrealdb-core enables
+    # ONLY under `cfg(target_family = "wasm")`. Our backend is a non-wasm
+    # binary and selects `aws_lc_rs`, so `rsa` is never compiled in
+    # (`cargo tree -i rsa` is empty for the host target). Not exploitable
+    # in anything we ship.
+    "RUSTSEC-2023-0071",
+
+    # bincode 2.x — unmaintained (status advisory, no CVE). Forced by
+    # surrealdb-core → surrealmx. No fix without surrealdb dropping it.
+    "RUSTSEC-2025-0141",
+
+    # atomic-polyfill 1.x — unmaintained (status advisory, no CVE). Forced
+    # by surrealdb-core → geo → rstar → heapless 0.7. No fix without
+    # surrealdb bumping its geo/rstar stack.
+    "RUSTSEC-2023-0089",
+]
