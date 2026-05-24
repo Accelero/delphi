@@ -56,11 +56,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # errors
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 
 # LLM agent framework (provider-agnostic)
-rig-core = { version = "0.35", features = ["all"] }
+# rig-core 0.37 renamed its lib crate; keep importing it as `rig` via a
+# package rename so call sites stay unchanged.
+rig = { package = "rig-core", version = "0.37", features = ["rustls"] }
 
 # auth: the BFF (Traefik + oauth2-proxy) hands the IdP-signed JWT to the
 # backend as `Authorization: Bearer <jwt>`. `JwtClaimsExtractor` re-validates
@@ -71,8 +73,8 @@ rig-core = { version = "0.35", features = ["all"] }
 # Source-adapter HTTP fetch + content hashing. The default reqwest TLS stack
 # (native-tls) drags in OpenSSL; rustls keeps the build pure-Rust and matches
 # what surrealdb already pulls in.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "form"] }
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 
@@ -81,10 +83,14 @@ base64 = "0.22"
 # secret/JWKS via `DEFINE ACCESS … TYPE RECORD WITH JWT`. HS512-mode
 # only today; RS256 is a feature-flag away when we want upstream-IdP
 # JWTs to flow straight through to the DB without re-signing.
-jsonwebtoken = { version = "9", default-features = false }
+# jsonwebtoken 10 needs exactly one crypto provider selected. We use
+# `aws_lc_rs` (already in the tree via rustls + aws-sdk) rather than
+# `rust_crypto`: the latter pulls the pure-Rust `rsa` crate (RUSTSEC-2023-0071
+# Marvin Attack, unpatched) for RSA algorithms we never use — HS512 only.
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 
 # pdftotext bbox-layout extractor reads poppler's XHTML output.
-quick-xml = { version = "0.36", features = ["serialize"] }
+quick-xml = { version = "0.40", features = ["serialize"] }
 
 # `Bytes` is in our `ObjectStore` API to avoid copies when piping PDFs
 # from `reqwest` through to disk.
@@ -96,7 +102,7 @@ regex = "1"
 
 # Magic-byte content-type sniffer for the ingestion v2 object validator.
 # Lightweight, zero deps, pure-Rust.
-infer = "0.16"
+infer = "0.19"
 
 # Direct-to-S3 ingestion (ingestion v2). `aws-sdk-s3` drives MinIO /
 # Hetzner / R2 / B2 / AWS through one client; `aws-config` builds the
