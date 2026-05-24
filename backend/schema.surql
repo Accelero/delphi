@@ -327,6 +327,7 @@ DEFINE FIELD OVERWRITE canonical_id              ON upload_session TYPE option<s
 DEFINE FIELD IF NOT EXISTS source_type           ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS source_uri            ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS title                 ON upload_session TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS filename              ON upload_session TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS declared_size         ON upload_session TYPE int;
 DEFINE FIELD IF NOT EXISTS declared_content_type ON upload_session TYPE string;
 DEFINE FIELD IF NOT EXISTS declared_metadata     ON upload_session FLEXIBLE TYPE object DEFAULT {};

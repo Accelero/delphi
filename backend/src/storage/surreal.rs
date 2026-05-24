@@ -796,6 +796,7 @@ impl Storage for SurrealStorage {
                     source_type: $source_type, \
                     source_uri: $source_uri, \
                     title: $title, \
+                    filename: $filename, \
                     declared_size: $declared_size, \
                     declared_content_type: $declared_content_type, \
                     declared_metadata: $declared_metadata \
@@ -809,6 +810,7 @@ impl Storage for SurrealStorage {
             .bind(("source_type", params.source_type.clone()))
             .bind(("source_uri", params.source_uri.clone()))
             .bind(("title", params.title.clone()))
+            .bind(("filename", params.filename.clone()))
             .bind(("declared_size", params.declared_size as i64))
             .bind((
                 "declared_content_type",

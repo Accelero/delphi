@@ -123,6 +123,9 @@ impl UploadsConfig {
         if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_REJECT_POLYGLOTS") {
             object_policy.reject_polyglots = matches!(v.as_str(), "true" | "1" | "yes");
         }
+        if let Ok(v) = std::env::var("DELPHI_INGEST_VALIDATOR_REJECT_PDF_ACTIVE_CONTENT") {
+            object_policy.reject_pdf_active_content = matches!(v.as_str(), "true" | "1" | "yes");
+        }
 
         Self {
             part_size_bytes,
@@ -320,6 +323,7 @@ pub async fn create_upload(
             .clone()
             .unwrap_or_else(|| format!("urn:delphi:manual:{doc_id}")),
         title: req.title.clone(),
+        filename: req.filename.clone(),
         declared_size: req.size,
         declared_content_type: content_type.clone(),
         declared_metadata: req.metadata.clone(),

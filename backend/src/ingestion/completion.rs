@@ -23,8 +23,8 @@ use super::autofill::{
 };
 use super::text_extract::extract_text;
 use super::validation::{
-    sanitize_authors, sanitize_text, validate_descriptive_metadata, validate_uploaded_object,
-    DescriptiveView, MetadataPolicy, ObjectPolicy, ObjectReject, ValidatedAttrs,
+    sanitize_authors, sanitize_text, scan_pdf_active_content, validate_descriptive_metadata,
+    validate_uploaded_object, DescriptiveView, MetadataPolicy, ObjectPolicy, ObjectReject,
 };
 
 /// Everything the ordered stages need. Carries **both** DB handles:
@@ -65,58 +65,60 @@ pub enum CompletionError {
 /// Ordered post-upload ingestion stages. The order is load-bearing; read
 /// it top-to-bottom.
 pub async fn run_completion(ctx: &CompletionCtx<'_>) -> Result<DocId, CompletionError> {
-    // 4. Object validation in **always-accept mode** (full reject policy is
-    //    roadmap §0). We still run the magic-byte sniff — passing
-    //    octet-stream as the declared hint forces the validator to defer to
-    //    the bytes — so stage 5 gets the real content type (application/pdf,
-    //    text/plain) and text extraction + autofill actually fire. A
-    //    would-be rejection is downgraded to warn-and-accept: the bytes are
-    //    already committed and we don't fail uploads while the gate is off.
-    //    To restore enforcement, replace the fallback with
-    //    `.map_err(CompletionError::ObjectRejected)?`.
-    let validated = match validate_uploaded_object(
+    // 4. Object validation (enforced — roadmap §0). Dispatch on the
+    //    untrusted file ending; the bytes confirm it. A `.pdf` that isn't a
+    //    PDF, a disguised binary under a text ending, or an unknown-ending
+    //    file that's neither PDF nor UTF-8 text all reject here. A rejection
+    //    short-circuits; the handler's reject arm (`uploads.rs`,
+    //    `handle_reject`) wipes the S3 object, records the rejection, and
+    //    returns 422.
+    let validated = validate_uploaded_object(
+        ctx.session.filename.as_deref(),
         &ctx.session.s3_key,
         ctx.session.declared_size as u64,
-        "application/octet-stream",
         ctx.object_store,
         ctx.object_policy,
     )
     .await
-    {
-        Ok(v) => v,
-        Err(reject) => {
-            tracing::warn!(
-                reason = reject.reason_code(),
-                key = %ctx.session.s3_key,
-                "object validation would reject; accepting anyway (always-accept mode; roadmap §0 will enforce)"
-            );
-            ValidatedAttrs {
-                size: ctx.session.declared_size as u64,
-                etag: String::new(),
-                sniffed_content_type: "application/octet-stream".to_string(),
-            }
-        }
-    };
+    .map_err(CompletionError::ObjectRejected)?;
 
-    // 5. Extract raw text (LLM needs something to read; also persisted).
-    //    Keyed on the *sniffed* type from stage 4 — the declared type may be
-    //    "unknown" (octet-stream), but the validator resolved what the bytes
-    //    actually are. Extraction failure ⇒ empty text, non-fatal.
-    let content = extract_text(
-        ctx.object_store,
-        &ctx.session.s3_key,
-        &validated.sniffed_content_type,
-        ctx.object_policy.pdf_max_input_bytes,
-    )
-    .await
-    .unwrap_or_else(|e| {
-        tracing::warn!(error = %e, key = %ctx.session.s3_key, "text extraction failed; continuing with empty text");
-        Content {
-            text: String::new(),
-            format: "text".into(),
-            extractor: "none".into(),
+    // 4b. Read the committed bytes back **once** (bounded), shared by the
+    //     PDF active-content scan and text extraction. Any PDF that reaches
+    //     here is ≤ pdf_max_input_bytes (the validator's size cap), so this
+    //     ranged GET captures the whole file. Read-back failure is fatal:
+    //     we must not commit a PDF we couldn't scan.
+    let bytes = ctx
+        .object_store
+        .get_range(&ctx.session.s3_key, 0..ctx.object_policy.pdf_max_input_bytes)
+        .await
+        .map_err(|e| CompletionError::CommitFailed(format!("read-back failed: {e}")))?;
+
+    // 4c. PDF active-content scan (PDFiD-style). We serve the *original*
+    //     back to the in-app viewer via signed URLs, so a booby-trapped PDF
+    //     threatens downstream readers — reject embedded JS / auto-run /
+    //     launch / embedded files at admission.
+    if ctx.object_policy.reject_pdf_active_content
+        && validated.sniffed_content_type == "application/pdf"
+    {
+        if let Some(token) = scan_pdf_active_content(&bytes) {
+            tracing::warn!(token, key = %ctx.session.s3_key, "pdf active-content rejected");
+            return Err(CompletionError::ObjectRejected(ObjectReject::PdfActiveContent));
         }
-    });
+    }
+
+    // 5. Extract raw text from the already-fetched bytes (no second GET).
+    //    Keyed on the *sniffed* type from stage 4. Extraction failure ⇒
+    //    empty text, non-fatal.
+    let content = extract_text(&validated.sniffed_content_type, bytes)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, key = %ctx.session.s3_key, "text extraction failed; continuing with empty text");
+            Content {
+                text: String::new(),
+                format: "text".into(),
+                extractor: "none".into(),
+            }
+        });
 
     // 6. Autofill from text + prefill (deferred LLM; noop today).
     //    Autofill failure ⇒ prefill-only, non-fatal.

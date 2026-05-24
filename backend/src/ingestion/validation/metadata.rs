@@ -35,6 +35,11 @@ pub struct CreateUploadRequest {
     pub source_uri: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// Untrusted original filename from the client. Used only for (a) the
+    /// object validator's file-ending dispatch at `/complete` and (b) a
+    /// sanitised title fallback — never as an S3 key or a shell arg.
+    #[serde(default)]
+    pub filename: Option<String>,
     // NOTE: no `content_type` — the backend never sees the bytes at create
     // time, so a client-declared MIME is just an unverifiable claim. The
     // actual type is determined from the bytes by the object validator at
@@ -109,7 +114,7 @@ pub struct MetadataPolicy {
 impl Default for MetadataPolicy {
     fn default() -> Self {
         Self {
-            allowed_content_types: ["application/pdf", "text/plain", "text/markdown"]
+            allowed_content_types: ["application/pdf", "text/plain", "text/markdown", "text/html"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -297,33 +302,6 @@ pub fn validate_descriptive_metadata(
     Ok(())
 }
 
-/// Canonicalize a client- or sniffer-supplied MIME type for allowlist
-/// comparison.
-///
-/// The wire value is an untrusted hint: browsers attach charset params
-/// (`text/plain; charset=utf-8`), vary case (`TEXT/PLAIN`), pad with
-/// whitespace, and use non-standard markdown aliases. None of those should
-/// hard-reject an otherwise-supported file (the byte-level
-/// [`super::validate_uploaded_object`] sniff is the real gate). We strip
-/// parameters, lowercase, trim, and fold known aliases onto their canonical
-/// type. An empty/unrecognized value passes through unchanged so the
-/// allowlist still rejects it.
-pub fn canonical_content_type(raw: &str) -> String {
-    let base = raw
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    match base.as_str() {
-        // Common non-standard markdown spellings → the canonical type.
-        "text/x-markdown" | "text/x-web-markdown" | "application/markdown" | "application/x-markdown" => {
-            "text/markdown".to_string()
-        }
-        other => other.to_string(),
-    }
-}
-
 fn is_plausible_uri(s: &str) -> bool {
     // Very narrow: require an absolute http(s) URL. ArXiv adapter and
     // SPA both produce that; anything else is suspicious. We don't pull
@@ -397,6 +375,7 @@ mod tests {
             source_type: Some("manual".into()),
             source_uri: Some("https://example.test/abc123".into()),
             title: Some("A paper".into()),
+            filename: Some("abc123.pdf".into()),
             size: 1024,
             metadata: json!({}),
             tenant_id: None,
@@ -415,6 +394,7 @@ mod tests {
             source_type: None,
             source_uri: None,
             title: Some("A manual upload".into()),
+            filename: Some("manual.pdf".into()),
             size: 1024,
             metadata: json!({}),
             tenant_id: None,
@@ -512,18 +492,6 @@ mod tests {
             validate_ingestion_metadata(&req, &p),
             Err(MetadataReject::MalformedRequest(_))
         ));
-    }
-
-    #[test]
-    fn canonical_content_type_folds_variants() {
-        assert_eq!(canonical_content_type("text/plain; charset=utf-8"), "text/plain");
-        assert_eq!(canonical_content_type("  TEXT/PLAIN "), "text/plain");
-        assert_eq!(canonical_content_type("text/x-markdown"), "text/markdown");
-        assert_eq!(
-            canonical_content_type("application/octet-stream"),
-            "application/octet-stream"
-        );
-        assert_eq!(canonical_content_type(""), "");
     }
 
     #[test]

@@ -20,4 +20,6 @@ pub use metadata::{
     sanitize_authors, sanitize_text, validate_descriptive_metadata, validate_ingestion_metadata,
     CreateUploadRequest, DescriptiveView, MetadataField, MetadataPolicy, MetadataReject,
 };
-pub use object::{validate_uploaded_object, ObjectPolicy, ObjectReject, ValidatedAttrs};
+pub use object::{
+    scan_pdf_active_content, validate_uploaded_object, ObjectPolicy, ObjectReject, ValidatedAttrs,
+};

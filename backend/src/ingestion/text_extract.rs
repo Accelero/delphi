@@ -6,13 +6,17 @@
 //! the autofill extractor (and full-text search) has something to read.
 //! See `docs/SECURITY.md` ("Ingestion read-back exception").
 //!
-//! Bounds:
-//! - Download is capped at `ObjectPolicy.pdf_max_input_bytes` via a single
-//!   ranged GET — never an unbounded body read.
-//! - PDFs run through the existing sandboxed `pdftotext` discipline
-//!   (`PdftotextExtractor`: timeout + `kill_on_drop` + capped stdout),
-//!   then the `Vec<Word>` stream is joined into flat text.
-//! - text/markdown is a bounded read of the capped bytes + UTF-8 validate.
+//! The bounded read-back happens in `completion.rs` (one ranged GET capped
+//! at `ObjectPolicy.pdf_max_input_bytes`, shared with the PDF
+//! active-content scan). This module is handed those already-bounded bytes
+//! and only decides *how* to turn them into text:
+//! - PDFs run through the sandboxed `pdftotext` discipline
+//!   (`PdftotextExtractor`: timeout + `kill_on_drop` + capped stdout), then
+//!   the `Vec<Word>` stream is joined into flat text.
+//! - text/markdown is a UTF-8 passthrough.
+//! - text/html is stripped to flat text via `html2text` (tags are index
+//!   noise; stripping is fidelity, not security — XSS is a render-sink
+//!   concern handled in the SPA).
 //!
 //! Extraction failure is **non-fatal** to the pipeline: the caller treats
 //! an `Err` as "empty text" and proceeds (the bytes are already committed;
@@ -21,24 +25,16 @@
 use bytes::Bytes;
 
 use crate::error::{Error, Result};
-use crate::object_store::ObjectStore;
 use crate::storage::Content;
 use crate::text_extractor::{PdftotextExtractor, TextExtractor};
 
-/// Extract flat text from the committed object, bounded by `max_input_bytes`.
-/// Returns a [`Content`] ready for the `document_content` insert.
-pub async fn extract_text(
-    object_store: &dyn ObjectStore,
-    key: &str,
-    content_type: &str,
-    max_input_bytes: u64,
-) -> Result<Content> {
-    // Bounded download: one ranged GET, never the full unbounded body.
-    let bytes = object_store.get_range(key, 0..max_input_bytes).await?;
-
+/// Turn already-fetched, already-bounded object `bytes` into flat text,
+/// dispatching on the validator's resolved `content_type`.
+pub async fn extract_text(content_type: &str, bytes: Bytes) -> Result<Content> {
     match content_type {
         "application/pdf" => extract_pdf(bytes).await,
         "text/plain" | "text/markdown" => extract_text_like(bytes, content_type),
+        "text/html" => extract_html(bytes),
         other => Err(Error::NotImplemented(format!(
             "text extraction not supported for content-type {other}"
         ))),
@@ -78,6 +74,27 @@ fn extract_text_like(bytes: Bytes, content_type: &str) -> Result<Content> {
     })
 }
 
+/// Strip HTML to flat reading-order text via `html2text`. No network fetch,
+/// no resource loading; the input is the same capped read every arm uses.
+fn extract_html(bytes: Bytes) -> Result<Content> {
+    // UTF-8 tail check (the validator confirmed only the sniff window).
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err(Error::Adapter {
+            name: "html-extract".into(),
+            message: "html object is not valid UTF-8".into(),
+        });
+    }
+    let text = html2text::from_read(&bytes[..], 80).map_err(|e| Error::Adapter {
+        name: "html-extract".into(),
+        message: format!("html render failed: {e}"),
+    })?;
+    Ok(Content {
+        text,
+        format: "text".into(),
+        extractor: "html2text".into(),
+    })
+}
+
 /// Join a reading-order `Word` stream into flat text. Inserts a newline
 /// when the page changes, a space between words on the same page.
 fn join_words(words: &[crate::text_extractor::Word]) -> String {
@@ -98,7 +115,6 @@ fn join_words(words: &[crate::text_extractor::Word]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::object_store::MemObjectStore;
     use crate::text_extractor::Word;
 
     fn word(page: i64, text: &str) -> Word {
@@ -120,12 +136,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_passthrough_extracts() {
-        let store = MemObjectStore::new();
-        store
-            .put("k/txt", Bytes::from_static(b"plain body text"))
-            .await
-            .unwrap();
-        let content = extract_text(&store, "k/txt", "text/plain", 1024)
+        let content = extract_text("text/plain", Bytes::from_static(b"plain body text"))
             .await
             .unwrap();
         assert_eq!(content.text, "plain body text");
@@ -135,28 +146,23 @@ mod tests {
 
     #[tokio::test]
     async fn markdown_format_recorded() {
-        let store = MemObjectStore::new();
-        store
-            .put("k/md", Bytes::from_static(b"# heading"))
-            .await
-            .unwrap();
-        let content = extract_text(&store, "k/md", "text/markdown", 1024)
+        let content = extract_text("text/markdown", Bytes::from_static(b"# heading"))
             .await
             .unwrap();
         assert_eq!(content.format, "markdown");
     }
 
     #[tokio::test]
-    async fn download_is_bounded_by_cap() {
-        // The ranged GET caps the read: only the first N bytes reach us.
-        let store = MemObjectStore::new();
-        store
-            .put("k/big", Bytes::from(vec![b'a'; 100]))
-            .await
-            .unwrap();
-        let content = extract_text(&store, "k/big", "text/plain", 10)
-            .await
-            .unwrap();
-        assert_eq!(content.text.len(), 10);
+    async fn html_stripped_to_text() {
+        let content = extract_text(
+            "text/html",
+            Bytes::from_static(b"<html><body><h1>Title</h1><p>Hello world</p></body></html>"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(content.extractor, "html2text");
+        assert!(content.text.contains("Title"), "got: {:?}", content.text);
+        assert!(content.text.contains("Hello world"), "got: {:?}", content.text);
+        assert!(!content.text.contains("<p>"), "tags not stripped: {:?}", content.text);
     }
 }

@@ -322,6 +322,9 @@ pub struct CreateUploadSessionParams {
     pub source_type: String,
     pub source_uri: String,
     pub title: Option<String>,
+    /// Untrusted client filename; drives the object validator's file-ending
+    /// dispatch and the title fallback. `None` for natural-source writers.
+    pub filename: Option<String>,
     pub declared_size: u64,
     pub declared_content_type: String,
     pub declared_metadata: serde_json::Value,
@@ -350,6 +353,8 @@ pub struct UploadSession {
     pub source_uri: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
     pub declared_size: i64,
     pub declared_content_type: String,
     #[serde(default)]

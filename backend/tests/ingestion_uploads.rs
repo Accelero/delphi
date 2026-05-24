@@ -304,16 +304,22 @@ async fn cross_user_session_invisible() {
 }
 
 #[tokio::test]
-#[ignore = "TEMP: object validator bypassed for plumbing test; re-enable with the validator"]
 async fn complete_with_validator_reject_records_rejection() {
-    // Declare PDF, upload bytes that aren't a PDF. The validator at
-    // /complete sniffs and rejects with 422. The session row is gone,
-    // S3 object is deleted, and the rejection is logged.
+    // Upload genuine binary bytes — neither a PDF (no `%PDF-`) nor valid
+    // UTF-8 text. The byte-authoritative validator at /complete rejects
+    // with `NotInAllowlist` → 422. The session row is gone, the S3 object
+    // is deleted, and the rejection is logged.
+    //
+    // NOTE: until the file ending is plumbed to the validator (Phase 1),
+    // a "declared PDF but actually text" lie is *not* detectable — text is
+    // legitimately accepted as text/plain. Only non-PDF, non-UTF-8 bytes
+    // reject. So this test uses real binary.
     let app = TestApp::build_with_mem().await;
+    let bytes = bytes::Bytes::from_static(&[0xff, 0xfe, 0x00, 0x01, 0x02, 0x9c, 0xed]);
     let res = app
         .send(auth_post(
             "/api/ingestion/uploads",
-            create_body("manual:lie-1", "application/pdf", 11),
+            create_body("manual:lie-1", "application/octet-stream", bytes.len() as u64),
             "ingester",
         ))
         .await;
@@ -325,12 +331,7 @@ async fn complete_with_validator_reject_records_rejection() {
 
     let etag = app
         .object_store
-        .upload_part_direct(
-            &key,
-            &upload_id,
-            1,
-            bytes::Bytes::from_static(b"hello world"),
-        )
+        .upload_part_direct(&key, &upload_id, 1, bytes)
         .await
         .unwrap();
 

@@ -115,6 +115,7 @@ dashmap = "6"
 # ULIDs for chat task ids (client-generated, server-mirrored). Tiny
 # (no extra deps beyond getrandom which we already pull in transitively).
 ulid = "1"
+html2text = "0.17.1"
 
 # (added later when wired up)
 # rmcp = "0.2"
