@@ -26,7 +26,7 @@ use surrealdb::Surreal;
 
 use crate::error::{Error, Result};
 
-use super::models::content_without_none;
+use super::models::{content_without_none, IngestionRejectionWire, UploadSessionWire};
 use super::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
     ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
@@ -990,7 +990,8 @@ impl Storage for SystemStorage {
             .bind(("t", self.tenant.clone()))
             .bind(("d", doc_id.to_string()))
             .await?;
-        Ok(response.take(0)?)
+        let row: Option<UploadSessionWire> = response.take(0)?;
+        Ok(row.map(UploadSession::from))
     }
     async fn cas_upload_session_state(
         &self,
@@ -1070,7 +1071,8 @@ impl Storage for SystemStorage {
             .bind(("t", self.tenant.clone()))
             .bind(("d", doc_id.to_string()))
             .await?;
-        Ok(response.take(0)?)
+        let row: Option<IngestionRejectionWire> = response.take(0)?;
+        Ok(row.map(IngestionRejection::from))
     }
 }
 

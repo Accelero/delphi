@@ -20,7 +20,7 @@ use surrealdb::types::{Datetime, RecordId, SurrealValue, ToSql};
 use surrealdb::Surreal;
 
 use crate::error::{Error, Result};
-use crate::storage::models::content_without_none;
+use crate::storage::models::{content_without_none, IngestionRejectionWire, UploadSessionWire};
 use crate::storage::{
     Bbox, ChatMessage, Chunk, ChunkId, ChunkSearchResult, Citation, Content, Conversation,
     ConversationId, CreateUploadSessionParams, DocId, Document, FeedCursor, Filters,
@@ -885,8 +885,8 @@ impl Storage for SurrealStorage {
             .bind(("declared_metadata", declared_metadata))
             .await?
             .check()?;
-        let row: Option<UploadSession> = response.take(0)?;
-        row.ok_or(Error::EmptyResult)
+        let row: Option<UploadSessionWire> = response.take(0)?;
+        row.map(UploadSession::from).ok_or(Error::EmptyResult)
     }
 
     async fn get_upload_session(&self, doc_id: &str) -> Result<Option<UploadSession>> {
@@ -895,7 +895,8 @@ impl Storage for SurrealStorage {
             .query("SELECT * FROM upload_session WHERE doc_id = $d LIMIT 1")
             .bind(("d", doc_id.to_string()))
             .await?;
-        Ok(response.take(0)?)
+        let row: Option<UploadSessionWire> = response.take(0)?;
+        Ok(row.map(UploadSession::from))
     }
 
     async fn cas_upload_session_state(&self, doc_id: &str, from: &str, to: &str) -> Result<bool> {
@@ -1056,7 +1057,8 @@ impl Storage for SurrealStorage {
             )
             .bind(("d", doc_id.to_string()))
             .await?;
-        Ok(response.take(0)?)
+        let row: Option<IngestionRejectionWire> = response.take(0)?;
+        Ok(row.map(IngestionRejection::from))
     }
 }
 

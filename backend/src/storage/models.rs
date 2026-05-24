@@ -381,7 +381,7 @@ pub struct CreateUploadSessionParams {
 /// and the cleaner's list helpers. `tenant_id` and `user_id` are
 /// engine-managed; we expose them so handlers can do the redundant
 /// belt-and-suspenders identity check from the plan.
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RecordId>,
@@ -405,17 +405,69 @@ pub struct UploadSession {
     pub declared_size: i64,
     pub declared_content_type: String,
     #[serde(default)]
-    #[surreal(default)]
     pub declared_metadata: serde_json::Value,
-    /// `surrealdb::types::Datetime` (not chrono) so the row decodes via
-    /// `SurrealValue`; serialises to the same RFC3339 JSON on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at: Option<Datetime>,
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+/// `SurrealValue` read projection for [`UploadSession`]. Keeps SurrealDB's
+/// `Datetime` out of the public model (audit M4 — no SurrealDB types across
+/// the storage boundary); `From` converts to chrono. Written rows go
+/// through inline `CONTENT` binds, so there's no write counterpart.
+#[derive(Debug, SurrealValue)]
+pub(crate) struct UploadSessionWire {
+    #[surreal(default)]
+    id: Option<RecordId>,
+    #[surreal(default)]
+    tenant_id: Option<RecordId>,
+    #[surreal(default)]
+    user_id: Option<RecordId>,
+    doc_id: String,
+    s3_key: String,
+    s3_upload_id: String,
+    state: String,
+    #[surreal(default)]
+    canonical_id: Option<String>,
+    source_type: String,
+    source_uri: String,
+    #[surreal(default)]
+    title: Option<String>,
+    #[surreal(default)]
+    filename: Option<String>,
+    declared_size: i64,
+    declared_content_type: String,
+    #[surreal(default)]
+    declared_metadata: serde_json::Value,
+    #[surreal(default)]
+    started_at: Option<Datetime>,
+}
+
+impl From<UploadSessionWire> for UploadSession {
+    fn from(w: UploadSessionWire) -> Self {
+        Self {
+            id: w.id,
+            tenant_id: w.tenant_id,
+            user_id: w.user_id,
+            doc_id: w.doc_id,
+            s3_key: w.s3_key,
+            s3_upload_id: w.s3_upload_id,
+            state: w.state,
+            canonical_id: w.canonical_id,
+            source_type: w.source_type,
+            source_uri: w.source_uri,
+            title: w.title,
+            filename: w.filename,
+            declared_size: w.declared_size,
+            declared_content_type: w.declared_content_type,
+            declared_metadata: w.declared_metadata,
+            started_at: w.started_at.map(Datetime::into_inner),
+        }
+    }
 }
 
 /// Side-channel rejection record. Written by the validator-reject path
 /// inside `POST /uploads/:id/complete`; reaped by the nightly cleaner.
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestionRejection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<RecordId>,
@@ -428,9 +480,41 @@ pub struct IngestionRejection {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sniffed_type: Option<String>,
-    /// `surrealdb::types::Datetime` (not chrono); see [`UploadSession::started_at`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rejected_at: Option<Datetime>,
+    pub rejected_at: Option<DateTime<Utc>>,
+}
+
+/// `SurrealValue` read projection for [`IngestionRejection`]; see
+/// [`UploadSessionWire`] for why (audit M4). Written via inline `CONTENT`
+/// binds on the system path, so read-only.
+#[derive(Debug, SurrealValue)]
+pub(crate) struct IngestionRejectionWire {
+    #[surreal(default)]
+    id: Option<RecordId>,
+    #[surreal(default)]
+    tenant_id: Option<RecordId>,
+    #[surreal(default)]
+    user_id: Option<RecordId>,
+    doc_id: String,
+    reason: String,
+    #[surreal(default)]
+    sniffed_type: Option<String>,
+    #[surreal(default)]
+    rejected_at: Option<Datetime>,
+}
+
+impl From<IngestionRejectionWire> for IngestionRejection {
+    fn from(w: IngestionRejectionWire) -> Self {
+        Self {
+            id: w.id,
+            tenant_id: w.tenant_id,
+            user_id: w.user_id,
+            doc_id: w.doc_id,
+            reason: w.reason,
+            sniffed_type: w.sniffed_type,
+            rejected_at: w.rejected_at.map(Datetime::into_inner),
+        }
+    }
 }
 
 /// `commit_upload` error path: a row with the same

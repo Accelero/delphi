@@ -407,10 +407,9 @@ pub async fn sign_upload_part(
             .into_response();
     }
 
-    // Session TTL gate. `started_at` is a `surrealdb::types::Datetime`;
-    // unwrap to `chrono::DateTime<Utc>` for the age arithmetic.
+    // Session TTL gate.
     if let Some(started_at) = session.started_at {
-        let age = chrono::Utc::now() - started_at.into_inner();
+        let age = chrono::Utc::now() - started_at;
         if age
             > chrono::Duration::from_std(state.uploads_config.session_ttl)
                 .unwrap_or(chrono::Duration::MAX)
