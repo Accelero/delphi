@@ -81,7 +81,7 @@ base64 = "0.22"
 # secret/JWKS via `DEFINE ACCESS … TYPE RECORD WITH JWT`. HS512-mode
 # only today; RS256 is a feature-flag away when we want upstream-IdP
 # JWTs to flow straight through to the DB without re-signing.
-jsonwebtoken = { version = "9", default-features = false }
+jsonwebtoken = { version = "10", default-features = false }
 
 # pdftotext bbox-layout extractor reads poppler's XHTML output.
 quick-xml = { version = "0.36", features = ["serialize"] }
