@@ -1,0 +1,19 @@
+[package]
+name = "chat-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+delphi-config.workspace = true
+delphi-contracts.workspace = true
+delphi-llm.workspace = true
+delphi-nats.workspace = true
+delphi-storage.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+uuid.workspace = true

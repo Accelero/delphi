@@ -1,0 +1,12 @@
+[package]
+name = "delphi-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+rig.workspace = true
+tracing.workspace = true

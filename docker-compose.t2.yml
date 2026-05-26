@@ -1,0 +1,161 @@
+x-service-image: &service-image
+  image: delphi-service:latest
+  build:
+    context: .
+    dockerfile: Dockerfile.service
+
+services:
+  traefik:
+    image: traefik:v3.6
+    command: ["--configFile=/etc/traefik/traefik.yml"]
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./ops/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./ops/traefik/dynamic/routes.yml:/etc/traefik/dynamic/routes.yml:ro
+    depends_on:
+      - oauth2-proxy
+      - api-service
+      - realtime-service
+      - frontend
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    user: root
+    command: ["start-dev", "--import-realm"]
+    restart: unless-stopped
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HOSTNAME: localhost
+      KC_HOSTNAME_PORT: "18081"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_BACKCHANNEL: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+    volumes:
+      - ./ops/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      - keycloak-data:/opt/keycloak/data/h2
+    ports:
+      - "18081:8080"
+
+  redis:
+    image: redis:8-alpine
+    volumes:
+      - redis-data:/data
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.12.0
+    command:
+      - --config=/etc/oauth2-proxy/oauth2-proxy.cfg
+      - --alpha-config=/etc/oauth2-proxy/alpha.yaml
+    restart: unless-stopped
+    volumes:
+      - ./ops/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
+      - ./ops/oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
+    depends_on:
+      - keycloak
+      - redis
+
+  nats:
+    image: nats:2
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    user: root
+    command: ["start", "--user", "root", "--pass", "root", "rocksdb:/data/surrealdb"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - surreal-data:/data
+
+  api-service:
+    <<: *service-image
+    command: ["/usr/local/bin/api-service"]
+    environment:
+      BIND_ADDR: 0.0.0.0:3001
+      NATS_URL: nats://nats:4222
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_NAMESPACE: delphi
+      SURREAL_DATABASE: delphi
+      SURREAL_USER: root
+      SURREAL_PASSWORD: root
+      AUTH_JWKS_URL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
+      AUTH_EXPECTED_ISSUER: http://localhost:18081/realms/delphi
+      AUTH_DEFAULT_TENANT: tenant-a
+      CHAT_LOCK_TTL_SECONDS: "900"
+      CHAT_EVENTS_MAX_AGE_SECONDS: "1800"
+      CHAT_REPLAY_TTL_SECONDS: "1500"
+      CHAT_COMMAND_ACK_WAIT_SECONDS: "120"
+    depends_on:
+      - nats
+      - surrealdb
+    ports:
+      - "3001:3001"
+
+  realtime-service:
+    <<: *service-image
+    command: ["/usr/local/bin/realtime-service"]
+    environment:
+      BIND_ADDR: 0.0.0.0:3002
+      NATS_URL: nats://nats:4222
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_NAMESPACE: delphi
+      SURREAL_DATABASE: delphi
+      SURREAL_USER: root
+      SURREAL_PASSWORD: root
+      AUTH_JWKS_URL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
+      AUTH_EXPECTED_ISSUER: http://localhost:18081/realms/delphi
+      AUTH_DEFAULT_TENANT: tenant-a
+      CHAT_LOCK_TTL_SECONDS: "900"
+      CHAT_EVENTS_MAX_AGE_SECONDS: "1800"
+      CHAT_REPLAY_TTL_SECONDS: "1500"
+      CHAT_COMMAND_ACK_WAIT_SECONDS: "120"
+    depends_on:
+      - nats
+      - surrealdb
+    ports:
+      - "3002:3002"
+
+  chat-worker:
+    <<: *service-image
+    command: ["/usr/local/bin/chat-worker"]
+    env_file:
+      - .env
+    environment:
+      BIND_ADDR: 0.0.0.0:3003
+      NATS_URL: nats://nats:4222
+      SURREAL_URL: ws://surrealdb:8000/rpc
+      SURREAL_NAMESPACE: delphi
+      SURREAL_DATABASE: delphi
+      SURREAL_USER: root
+      SURREAL_PASSWORD: root
+      CHAT_LOCK_TTL_SECONDS: "900"
+      CHAT_EVENTS_MAX_AGE_SECONDS: "1800"
+      CHAT_REPLAY_TTL_SECONDS: "1500"
+      CHAT_COMMAND_ACK_WAIT_SECONDS: "120"
+      CHAT_COMMAND_ACK_PROGRESS_SECONDS: "30"
+      CHAT_STOP_POLL_SECONDS: "1"
+    depends_on:
+      - nats
+      - surrealdb
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    expose:
+      - "80"
+
+volumes:
+  keycloak-data:
+  nats-data:
+  redis-data:
+  surreal-data:

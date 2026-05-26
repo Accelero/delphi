@@ -1,0 +1,15 @@
+[package]
+name = "delphi-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+delphi-contracts.workspace = true
+serde.workspace = true
+surrealdb = { version = "3", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
+thiserror.workspace = true
+tokio.workspace = true
+ulid.workspace = true

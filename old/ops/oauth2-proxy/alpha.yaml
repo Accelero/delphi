@@ -1,0 +1,47 @@
+# oauth2-proxy alpha-config.
+#
+# Forward only the IdP-issued access token to the upstream as
+# `Authorization: Bearer <jwt>`. The backend's `JwtClaimsExtractor`
+# decodes the payload to lift sub / iss / email / preferred_username
+# / tenant_id / roles into a typed `AuthContext`. There is no longer
+# any X-Auth-* projection — one trust boundary, one path.
+
+server:
+  BindAddress: 0.0.0.0:4180
+
+providers:
+  - id: keycloak-dev
+    name: "Keycloak (dev)"
+    provider: oidc
+    clientID: delphi-dev
+    clientSecret: change-me
+    loginURL: http://localhost:8088/realms/delphi/protocol/openid-connect/auth
+    redeemURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/token
+    profileURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/userinfo
+    oidcConfig:
+      issuerURL: http://localhost:8088/realms/delphi
+      skipDiscovery: true
+      jwksURL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
+      emailClaim: email
+      userIDClaim: email
+      audienceClaims: [aud]
+      insecureSkipNonce: true
+
+# Forward-auth mode: oauth2-proxy proxies nothing of its own. Traefik
+# calls /oauth2/auth per request; static://202 keeps oauth2-proxy
+# happy without a real upstream.
+upstreamConfig:
+  upstreams:
+    - id: static
+      path: /
+      static: true
+      staticCode: 202
+
+# `claim: access_token` is a special name that gives us the raw
+# IdP-issued JWT — the backend's `JwtClaimsExtractor` decodes it for
+# all identity claims.
+injectResponseHeaders:
+  - name: Authorization
+    values:
+      - claim: access_token
+        prefix: "Bearer "

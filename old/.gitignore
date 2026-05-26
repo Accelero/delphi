@@ -1,0 +1,27 @@
+.env
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# rust
+target/
+**/*.rs.bk
+
+# node / frontend
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
+.tanstack/
+
+# claude code agent worktrees
+.claude/worktrees/
+
+# tests
+tests/playwright-report/
+tests/test-results/
+tests/.cache/
+coverage/
+
+# ingested document blobs (local object storage)
+data/

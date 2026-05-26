@@ -1,0 +1,14 @@
+.git
+target
+old
+data
+
+frontend/node_modules
+frontend/dist
+
+tests/node_modules
+tests/test-results
+tests/playwright-report
+
+*.log
+*.tsbuildinfo

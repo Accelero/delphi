@@ -1,0 +1,18 @@
+[package]
+name = "delphi-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+delphi-contracts.workspace = true
+http.workspace = true
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
