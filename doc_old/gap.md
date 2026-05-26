@@ -39,7 +39,9 @@ Implemented for the chat slice: schemafull `tenant`, `app_user`,
 by `delphi-storage`. All chat domain rows carry `tenant_id`; conversation and
 message access also carries `user_id` for the current owner-only model.
 `chat_message.ordinal` is the monotonic per-conversation order key and
-`message_id` remains the stable idempotency key.
+`message_id` remains the stable idempotency key. `chat_conversation` now also
+enforces global uniqueness for `conversation_id`, while tenant and user fields
+remain explicit isolation and authorization dimensions.
 
 Residual points:
 
@@ -103,18 +105,24 @@ Open points:
 
 ### Realtime Fanout
 
-The plan calls for one NATS/JetStream consumer per active conversation per
-realtime replica with local tab fanout. Current realtime service uses one
-wildcard event subscriber per realtime process and each WebSocket filters
-events locally.
+~~The plan calls for one NATS/JetStream consumer per active conversation per
+realtime replica with local tab fanout.~~
+
+Implemented: the realtime service no longer opens a process-wide
+`chat.events.>` subscriber. Each replica creates an exact-subject JetStream
+consumer for `chat.events.<tenant_id>.<conversation_id>` only when at least one
+local WebSocket is subscribed to that conversation, then fans those events out
+through a local per-conversation broadcast channel. Multiple tabs on the same
+replica share the same NATS consumer.
 
 Open points:
 
-- Decide whether wildcard process-level subscription is acceptable for v1.
-- If not, implement per-conversation subscription/fanout registries.
-- Add bounded outbound queues so one slow socket cannot block other sockets.
-- Track socket counts and event fanout costs so we know when the wildcard
-  approach stops being acceptable.
+- Add full-stack tests for two tabs on one replica and two realtime replicas.
+- Track socket counts, active conversation hubs, NATS consumer counts, and
+  event fanout costs.
+- Tune `REALTIME_WS_EVENT_QUEUE_SIZE`,
+  `REALTIME_WS_OUTBOUND_QUEUE_SIZE`, and
+  `REALTIME_CONVERSATION_EVENT_BUFFER_SIZE` under realistic stream sizes.
 
 ### WebSocket Reconnect
 
@@ -132,15 +140,18 @@ Residual points:
 
 ### Replay And Backpressure
 
-Replay logic exists, but uncertainty is not always converted into a required
-resync. If replay metadata names a range and JetStream returns an incomplete
-event set, the service should prefer `resync_required` over partial replay.
+~~Replay logic exists, but uncertainty is not always converted into a required
+resync.~~ If replay metadata names a range and JetStream returns an incomplete
+event set, the service sends `resync_required` instead of partial replay.
+Realtime sockets now use bounded outbound queues, and broadcast lag is
+converted into explicit `resync_required` messages for subscribed
+conversations.
 
-Open points:
+Residual points:
 
-- Convert broadcast lag and missing retained events into explicit
-  `resync_required`.
-- Add bounded per-socket outbound queues and close/resync lagging clients.
+- Backpressure and lag behavior still need full-stack tests.
+- Queue size is configurable via `REALTIME_WS_OUTBOUND_QUEUE_SIZE`, but the
+  default may need tuning under real stream sizes.
 - Test fresh late join during current turn.
 - Test reconnect with cursor inside current/previous retained turn.
 - Test stale cursor returning `resync_required`.
@@ -277,7 +288,8 @@ Intentional difference:
 
 1. ~~Add WebSocket reconnect/backoff and resubscribe with `last_event_id`.~~
    Done; remaining work is full-stack e2e coverage.
-2. Add realtime backpressure behavior and `resync_required` on lag.
+2. ~~Add realtime backpressure behavior and `resync_required` on lag.~~ Done;
+   remaining work is full-stack e2e coverage and tuning.
 3. Add stale-turn recovery and redelivery/idempotency handling around
    `chat_turn`.
 4. ~~Decide and implement the `chat_turn` lifecycle table.~~ Done for the
@@ -295,7 +307,8 @@ Intentional difference:
 
 - Reconnect and late-join correctness are not yet proven by tests.
 - Worker crash/redelivery semantics are not yet proven by tests.
-- Realtime wildcard fanout may become inefficient as event volume grows.
+- Realtime fanout now avoids wildcard event consumption, but multi-replica
+  behavior and consumer-count limits still need load testing.
 - `chat_turn` exists, but stale-turn recovery and redelivery behavior are not
   proven yet.
 - Frontend parity is incomplete for citations, titles, rich rendering, and

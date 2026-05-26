@@ -1,0 +1,11 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "entryPoints": ["src/main.tsx"],
+  "out": "docs",
+  "name": "Delphi Frontend",
+  "includeVersion": true,
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "readme": "none",
+  "plugin": []
+}

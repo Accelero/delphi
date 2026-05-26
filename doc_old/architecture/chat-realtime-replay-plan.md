@@ -9,8 +9,8 @@ Implemented so far:
   ranges.
 - `CHAT_LOCKS` owner state with `requested` -> `running`, `worker_id`,
   stop fields, lease expiry, lock renewal, and release.
-- Worker-specific stop wakeup subject:
-  `chat.control.worker.{worker_id}.stop`.
+- Conversation-targeted stop wakeup subject:
+  `chat.control.{tenant_id}.{conversation_id}.stop`.
 - Stop requests persist through the same lock key, so immediate stop and
   worker claim race through one compare-and-set state machine.
 - Interrupted turns commit user + partial assistant content with explicit
@@ -231,11 +231,11 @@ Stop API behavior:
    Preserve the current `turn_id`, `state`, `worker_id`, and lease fields.
    If the CAS fails because the worker claimed the turn or another stop
    updated the lock, re-read and retry. If the lock disappeared, return `204`.
-6. If the updated lock has a `worker_id`, publish a fast wakeup message to
-   that worker:
+6. If the updated lock is running, publish a fast wakeup message to the active
+   conversation subject:
 
 ```text
-chat.control.worker.{worker_id}.stop
+chat.control.{tenant_id}.{conversation_id}.stop
 ```
 
 Payload:
@@ -256,9 +256,9 @@ stop flag as part of its ownership claim.
 
 Worker claim ordering:
 
-1. Subscribe to `chat.control.worker.{worker_id}.stop` before making
-   `worker_id` visible in `CHAT_LOCKS`.
-2. Read `CHAT_LOCKS/{tenant_id}/{conversation_id}` with its revision.
+1. Read `CHAT_LOCKS/{tenant_id}/{conversation_id}` with its revision.
+2. Subscribe to `chat.control.{tenant_id}.{conversation_id}.stop` before
+   making ownership visible in `CHAT_LOCKS`.
 3. Compare-and-set `state = requested` to `state = running`, adding
    `worker_id` and preserving any stop request fields.
 4. If the CAS fails, re-read. A concurrent stop and a concurrent claim cannot
@@ -268,18 +268,18 @@ Worker claim ordering:
 
 Worker stop handling:
 
-- Every worker subscribes to exactly its own control subject:
+- A worker subscribes to one control subject per active conversation turn it
+  owns:
 
 ```text
-chat.control.worker.{worker_id}.stop
+chat.control.{tenant_id}.{conversation_id}.stop
 ```
 
 - Do not use a queue group for this subscription. Stop must reach the worker
-  that owns the LLM stream.
-- The worker keeps an in-memory map from `turn_id` to cancellation token for
-  active turns it owns.
-- On control message, the worker validates tenant, conversation, and turn,
-  then cancels the matching local token.
+  that owns the LLM stream for that conversation.
+- The worker keeps the subscription lifetime scoped to the active turn and
+  cancels the matching local token after validating tenant, conversation, and
+  turn.
 - While streaming, the worker races provider deltas against the cancellation
   token.
 - The worker also periodically rereads or watches
@@ -303,16 +303,27 @@ not from the HTTP `204`.
 
 Crash behavior:
 
-- If the worker is alive, the worker-specific control publish gives immediate
-  cancellation.
-- If the API publishes to a stale or dead `worker_id`, the stop fields in
-  `CHAT_LOCKS` remain authoritative.
+- If the worker is alive and owns the active conversation subscription, the
+  conversation-targeted control publish gives immediate cancellation.
+- If the wake-up is missed, the stop fields in `CHAT_LOCKS` remain
+  authoritative.
 - When progress ACKs stop, JetStream redelivers the original turn command.
 - The next worker claims the lock, sees `stop_requested = true`, and commits
   the turn as interrupted without starting or continuing the provider stream.
 - Because stop is keyed by `turn_id`, it cannot interrupt the next turn in the
   same conversation.
 - Lock TTL removes abandoned stop state if no worker ever handles it.
+
+Subscription scale note:
+
+- Conversation-targeted stop uses one plain NATS subscription per active turn,
+  rather than one per worker.
+- This keeps routing semantically correct and avoids worker-id based stop
+  addressing.
+- At very high worker concurrency, for example thousands of workers with many
+  active turns each, subscription count and churn must be measured. The
+  fallback design is worker-targeted wakeups with conversation stop semantics
+  preserved in `CHAT_LOCKS`.
 
 ## Command Consumer ACKs
 

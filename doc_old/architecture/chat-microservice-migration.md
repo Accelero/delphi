@@ -164,11 +164,13 @@ Streams and subjects:
   - retention: limits
   - cursor: JetStream stream sequence
   - stores live turn events for reconnect and late join
-- worker control subject
-  - subject: `chat.control.worker.<worker_id>.stop`
+- conversation stop control subject
+  - subject: `chat.control.<tenant_id>.<conversation_id>.stop`
   - core NATS low-latency wake-up
   - payload carries `{ tenant_id, conversation_id, turn_id }`
-  - not a queue group; the target worker is read from `CHAT_LOCKS`
+  - not a queue group; the active worker subscribes only while it owns that
+    conversation turn
+  - `CHAT_LOCKS.stop_requested` remains authoritative if the wake-up is missed
 - `CHAT_LOCKS`
   - JetStream KV bucket
   - key: `<tenant_id>/<conversation_id>`
@@ -270,11 +272,10 @@ Stop endpoint behavior:
   `stop_requested=true`, `stop_requested_by`, and `stop_requested_at`.
 - If the CAS fails, re-read and retry; this resolves stop-vs-worker-claim
   races.
-- If the updated lock has `worker_id`, publish a low-latency wake-up to
-  `chat.control.worker.<worker_id>.stop`.
-- If the lock is still requested and has no worker owner yet, do not publish
-  control; the worker sees `stop_requested` during its ownership CAS before
-  provider start.
+- If the lock is already running, publish a low-latency wake-up to
+  `chat.control.<tenant_id>.<conversation_id>.stop`.
+- If the lock is still requested, do not publish control; the worker sees
+  `stop_requested` during its ownership CAS before provider start.
 - Return 204 whether or not a turn is running.
 - Do not mutate visible chat state directly; worker live events are the
   source of truth.
@@ -324,7 +325,8 @@ Worker lifecycle:
 14. Publish each provider chunk as a `text_delta` unchanged and append it to
     the worker's partial assistant buffer.
 15. Race LLM stream against the local cancellation token fed by
-    `chat.control.worker.<worker_id>.stop` and lock watch/poll fallback checks.
+    `chat.control.<tenant_id>.<conversation_id>.stop` and lock watch/poll
+    fallback checks.
 16. On stop before normal finish: stop reading the provider stream, insert
     user + partial assistant messages in one transaction, mark the assistant
     message/turn `interrupted`, publish `interrupted`, and release lock.
@@ -669,9 +671,9 @@ Backend integration tests:
 - API submit publishes command.
 - API claims lock; worker verifies ownership and publishes `user_message`,
   `text_delta`, `finish`.
-- Stop sets `stop_requested` on `CHAT_LOCKS`, routes control to the lock's
-  `worker_id` when present, publishes `interrupted`, and commits user +
-  partial assistant messages with interrupt metadata.
+- Stop sets `stop_requested` on `CHAT_LOCKS`, publishes conversation-targeted
+  control when the lock is running, publishes `interrupted`, and commits user
+  + partial assistant messages with interrupt metadata.
 - Immediate stop while the lock is still `requested` is not lost; the API stop
   CAS and worker ownership CAS conflict on the same lock key, forcing one side
   to re-read the other's state.

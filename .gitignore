@@ -1,9 +1,13 @@
 /target/
 /frontend/node_modules/
 /frontend/dist/
+/frontend/docs/
 /tests/node_modules/
 /tests/test-results/
 /tests/playwright-report/
+/doc/.venv/
+/doc/site/
+/.uv-cache/
 *.log
 *.tsbuildinfo
 .env*
