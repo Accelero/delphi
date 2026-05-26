@@ -2,37 +2,72 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChatEvent, CitationEntry, MessageDto, ServerWsMessage } from "../lib/types";
 
 type ChatStatus = "ready" | "submitted" | "streaming" | "error";
+type LiveStatus = "submitted" | "streaming" | "stopping";
+export type RealtimeStatus = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
-export function useChatSocket(conversationId: string | null, seedMessages: MessageDto[]) {
+type ChatSocketOptions = {
+  onResync?: () => void | Promise<void>;
+  onTerminalRefresh?: () => void | Promise<void>;
+};
+
+const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 5000];
+
+export function useChatSocket(
+  conversationId: string | null,
+  seedMessages: MessageDto[],
+  options: ChatSocketOptions = {}
+) {
   const [messages, setMessages] = useState<MessageDto[]>(seedMessages);
-  const [status, setStatus] = useState<ChatStatus>("ready");
+  const [status, setStatus] = useState<ChatStatus | LiveStatus>("ready");
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>("idle");
   const [error, setError] = useState<string | null>(null);
-  const lastEventIdRef = useRef<string | null>(null);
+  const statusRef = useRef<ChatStatus | LiveStatus>("ready");
+  const seedSignatureRef = useRef("");
+  const lastEventIdByConversationRef = useRef(new Map<string, string>());
   const inFlightUserIdRef = useRef<string | null>(null);
   const overlayTextRef = useRef("");
   const liveCitationsRef = useRef<CitationEntry[]>([]);
+  const onResyncRef = useRef(options.onResync);
+  const onTerminalRefreshRef = useRef(options.onTerminalRefresh);
+  const seedSignature = useMemo(() => messagesSignature(seedMessages), [seedMessages]);
 
   useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => {
+    onResyncRef.current = options.onResync;
+    onTerminalRefreshRef.current = options.onTerminalRefresh;
+  }, [options.onResync, options.onTerminalRefresh]);
+
+  useEffect(() => {
+    seedSignatureRef.current = seedSignature;
     setMessages(seedMessages);
     setStatus("ready");
     setError(null);
-    lastEventIdRef.current = null;
     inFlightUserIdRef.current = null;
     overlayTextRef.current = "";
     liveCitationsRef.current = [];
-  }, [conversationId, seedMessages]);
+  }, [conversationId]);
+
+  useEffect(() => {
+    if (seedSignatureRef.current === seedSignature) return;
+    seedSignatureRef.current = seedSignature;
+    if (isLiveStatus(statusRef.current)) return;
+    setMessages(seedMessages);
+  }, [seedMessages, seedSignature]);
 
   const applyEvent = useCallback((event: ChatEvent) => {
     switch (event.type) {
       case "turn_started":
-        setStatus("submitted");
+        setStatus((current) => (current === "stopping" ? current : "submitted"));
         setError(null);
         return;
       case "user_message":
         inFlightUserIdRef.current = event.id;
         overlayTextRef.current = "";
         liveCitationsRef.current = [];
-        setStatus("streaming");
+        setStatus((current) => (current === "stopping" ? current : "streaming"));
         setMessages((current) => [
           ...current.filter((message) => message.id !== event.id && message.id !== "assistant-live"),
           {
@@ -56,7 +91,7 @@ export function useChatSocket(conversationId: string | null, seedMessages: Messa
         return;
       case "text_delta":
         overlayTextRef.current += event.delta;
-        setStatus("streaming");
+        setStatus((current) => (current === "stopping" ? current : "streaming"));
         setMessages((current) => upsertAssistantOverlay(current, overlayTextRef.current, liveCitationsRef.current));
         return;
       case "finish":
@@ -70,6 +105,23 @@ export function useChatSocket(conversationId: string | null, seedMessages: Messa
         );
         overlayTextRef.current = "";
         inFlightUserIdRef.current = null;
+        void onTerminalRefreshRef.current?.();
+        return;
+      case "interrupted":
+        setStatus("ready");
+        setMessages((current) =>
+          upsertInterruptedAssistant(
+            current,
+            event.assistant_message_id,
+            event.content,
+            liveCitationsRef.current,
+            event.finish_reason
+          )
+        );
+        overlayTextRef.current = "";
+        inFlightUserIdRef.current = null;
+        liveCitationsRef.current = [];
+        void onTerminalRefreshRef.current?.();
         return;
       case "clear":
         setStatus("ready");
@@ -81,6 +133,7 @@ export function useChatSocket(conversationId: string | null, seedMessages: Messa
         overlayTextRef.current = "";
         inFlightUserIdRef.current = null;
         liveCitationsRef.current = [];
+        void onTerminalRefreshRef.current?.();
         return;
       case "error":
         setStatus("error");
@@ -92,57 +145,126 @@ export function useChatSocket(conversationId: string | null, seedMessages: Messa
   }, []);
 
   useEffect(() => {
-    if (!conversationId) return;
+    if (!conversationId) {
+      setRealtimeStatus("idle");
+      return;
+    }
 
     const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(`${protocol}://${window.location.host}/ws/chat`);
     let closedByEffect = false;
+    let socket: WebSocket | null = null;
     let reconnectTimer: number | undefined;
+    let pingTimer: number | undefined;
+    let reconnectAttempt = 0;
 
-    const subscribe = () => {
-      socket.send(
+    const clearTimers = () => {
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
+      if (pingTimer) {
+        window.clearInterval(pingTimer);
+        pingTimer = undefined;
+      }
+    };
+
+    const resetTransientState = () => {
+      const inFlightUserId = inFlightUserIdRef.current;
+      setStatus("ready");
+      overlayTextRef.current = "";
+      inFlightUserIdRef.current = null;
+      liveCitationsRef.current = [];
+      setMessages((current) =>
+        current.filter((message) => message.id !== "assistant-live" && message.id !== inFlightUserId)
+      );
+    };
+
+    const subscribe = (target: WebSocket) => {
+      target.send(
         JSON.stringify({
           type: "subscribe_conversation",
           conversation_id: conversationId,
-          last_event_id: lastEventIdRef.current
+          last_event_id: lastEventIdByConversationRef.current.get(conversationId) ?? null
         })
       );
     };
 
-    socket.addEventListener("open", subscribe);
-    socket.addEventListener("message", (raw) => {
-      const msg = JSON.parse(raw.data) as ServerWsMessage;
+    const handleMessage = (raw: MessageEvent<string>) => {
+      let msg: ServerWsMessage;
+      try {
+        msg = JSON.parse(raw.data) as ServerWsMessage;
+      } catch {
+        setStatus("error");
+        setError("Realtime connection returned an invalid message.");
+        return;
+      }
+
       if (msg.type === "event" && msg.conversation_id === conversationId) {
         applyEvent(msg.event);
-        lastEventIdRef.current = msg.event_id;
+        lastEventIdByConversationRef.current.set(conversationId, msg.event_id);
       } else if (msg.type === "resync_required" && msg.conversation_id === conversationId) {
-        setStatus("ready");
-        overlayTextRef.current = "";
+        lastEventIdByConversationRef.current.delete(conversationId);
+        resetTransientState();
+        void Promise.resolve(onResyncRef.current?.()).finally(() => {
+          if (socket?.readyState === WebSocket.OPEN) {
+            subscribe(socket);
+          }
+        });
       } else if (msg.type === "error") {
         setStatus("error");
         setError(msg.message);
       }
-    });
-    socket.addEventListener("close", () => {
-      if (!closedByEffect) {
-        reconnectTimer = window.setTimeout(() => {
-          setStatus("error");
-          setError("Realtime connection closed. Reopen the chat or refresh after reconnecting.");
-        }, 1200);
-      }
-    });
+    };
 
-    const pingTimer = window.setInterval(() => {
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "ping" }));
-      }
-    }, 25000);
+    const scheduleReconnect = () => {
+      if (closedByEffect) return;
+      setRealtimeStatus(reconnectAttempt === 0 ? "disconnected" : "reconnecting");
+      const baseDelay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+      const jitter = Math.floor(Math.random() * 150);
+      reconnectAttempt += 1;
+      reconnectTimer = window.setTimeout(connect, baseDelay + jitter);
+    };
+
+    const connect = () => {
+      if (closedByEffect) return;
+      clearTimers();
+      socket?.close();
+      setRealtimeStatus(reconnectAttempt === 0 ? "connecting" : "reconnecting");
+      const nextSocket = new WebSocket(`${protocol}://${window.location.host}/ws/chat`);
+      socket = nextSocket;
+
+      nextSocket.addEventListener("open", () => {
+        reconnectAttempt = 0;
+        setRealtimeStatus("connected");
+        setError(null);
+        subscribe(nextSocket);
+        pingTimer = window.setInterval(() => {
+          if (nextSocket.readyState === WebSocket.OPEN) {
+            nextSocket.send(JSON.stringify({ type: "ping" }));
+          }
+        }, 25000);
+      });
+      nextSocket.addEventListener("message", handleMessage);
+      nextSocket.addEventListener("close", () => {
+        if (socket !== nextSocket) return;
+        clearTimers();
+        scheduleReconnect();
+      });
+      nextSocket.addEventListener("error", () => {
+        nextSocket.close();
+      });
+    };
+
+    connect();
 
     return () => {
       closedByEffect = true;
-      window.clearInterval(pingTimer);
-      if (reconnectTimer) window.clearTimeout(reconnectTimer);
-      socket.close();
+      clearTimers();
+      if (socket) {
+        socket.close();
+        socket = null;
+      }
+      setRealtimeStatus("idle");
     };
   }, [conversationId, applyEvent]);
 
@@ -151,7 +273,20 @@ export function useChatSocket(conversationId: string | null, seedMessages: Messa
     return committed.at(-1)?.id ?? null;
   }, [messages]);
 
-  return { messages, status, error, lastMessageId, setStatus };
+  return { messages, status, realtimeStatus, error, lastMessageId, setStatus };
+}
+
+function isLiveStatus(status: ChatStatus | LiveStatus): status is LiveStatus {
+  return status === "submitted" || status === "streaming" || status === "stopping";
+}
+
+function messagesSignature(messages: MessageDto[]): string {
+  return messages
+    .map(
+      (message) =>
+        `${message.id}:${message.created_at}:${message.content.length}:${message.interrupted ?? false}:${message.finish_reason ?? ""}`
+    )
+    .join("|");
 }
 
 function upsertAssistantOverlay(
@@ -166,11 +301,38 @@ function upsertAssistantOverlay(
     parent_message_id: null,
     citations,
     turn_id: null,
+    interrupted: false,
+    finish_reason: null,
     created_at: new Date().toISOString()
   };
   const index = messages.findIndex((message) => message.id === "assistant-live");
   if (index === -1) return [...messages, overlay];
   const next = messages.slice();
   next[index] = overlay;
+  return next;
+}
+
+function upsertInterruptedAssistant(
+  messages: MessageDto[],
+  assistantMessageId: string,
+  content: string,
+  citations: CitationEntry[],
+  finishReason: string
+): MessageDto[] {
+  const next = messages.filter((message) => message.id !== "assistant-live");
+  const assistant = {
+    id: assistantMessageId,
+    role: "assistant" as const,
+    content,
+    parent_message_id: null,
+    citations,
+    turn_id: null,
+    interrupted: true,
+    finish_reason: finishReason,
+    created_at: new Date().toISOString()
+  };
+  const index = next.findIndex((message) => message.id === assistantMessageId);
+  if (index === -1) return [...next, assistant];
+  next[index] = assistant;
   return next;
 }

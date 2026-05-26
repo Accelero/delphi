@@ -1,4 +1,4 @@
-import { ArrowDown, Send, Square } from "lucide-react";
+import { ArrowDown, LoaderCircle, Send, Square } from "lucide-react";
 import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ulid } from "ulid";
 import { useChatSocket } from "../../hooks/useChatSocket";
@@ -20,12 +20,17 @@ export function ChatPane({
   const sentinelRef = useRef<HTMLDivElement | null>(null);
   const lastScrollTopRef = useRef(0);
   const [follow, setFollow] = useState(true);
-  const { messages, status, error, lastMessageId, setStatus } = useChatSocket(
+  const { messages, status, realtimeStatus, error, lastMessageId, setStatus } = useChatSocket(
     conversation?.id ?? null,
-    conversation?.messages ?? []
+    conversation?.messages ?? [],
+    {
+      onResync: onRefresh,
+      onTerminalRefresh: onRefresh
+    }
   );
   const turns = useMemo(() => groupTurns(messages), [messages]);
-  const busy = status === "submitted" || status === "streaming";
+  const busy = status === "submitted" || status === "streaming" || status === "stopping";
+  const stopping = status === "stopping";
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -77,7 +82,12 @@ export function ChatPane({
 
   const stop = async () => {
     if (!conversation) return;
-    await api.stopTurn(conversation.id);
+    setStatus("stopping");
+    try {
+      await api.stopTurn(conversation.id);
+    } catch {
+      setStatus("streaming");
+    }
   };
 
   if (!conversation) {
@@ -114,6 +124,9 @@ export function ChatPane({
             {busy && messages.at(-1)?.role === "user" ? (
               <div className="pb-8 text-sm text-stone-500">Thinking...</div>
             ) : null}
+            {realtimeStatus === "reconnecting" || realtimeStatus === "disconnected" ? (
+              <div className="pb-8 text-sm text-stone-500">Reconnecting...</div>
+            ) : null}
             {error ? <div className="pb-8 text-sm text-red-600">{error}</div> : null}
             <div ref={sentinelRef} aria-hidden className="h-px" />
           </div>
@@ -144,8 +157,19 @@ export function ChatPane({
             }}
           />
           {busy ? (
-            <Button type="button" size="icon" variant="destructive" onClick={stop} aria-label="Stop">
-              <Square className="h-4 w-4" />
+            <Button
+              type="button"
+              size="icon"
+              variant="destructive"
+              onClick={stop}
+              disabled={stopping}
+              aria-label={stopping ? "Stopping" : "Stop"}
+            >
+              {stopping ? (
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+              ) : (
+                <Square className="h-4 w-4" />
+              )}
             </Button>
           ) : (
             <Button type="submit" size="icon" disabled={!draft.trim()} aria-label="Send">
@@ -169,7 +193,12 @@ function MessageRow({ message, streaming }: { message: MessageDto; streaming: bo
         }
       >
         {message.role === "assistant" ? (
-          <MessageBody content={message.content} streaming={streaming} />
+          <>
+            <MessageBody content={message.content} streaming={streaming} />
+            {message.interrupted ? (
+              <div className="mt-2 text-xs text-stone-500">Interrupted</div>
+            ) : null}
+          </>
         ) : (
           message.content
         )}

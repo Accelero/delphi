@@ -46,7 +46,10 @@ fn split_history(messages: Vec<LlmMessage>) -> Result<(String, Vec<Message>)> {
     for message in messages {
         match message.role {
             Role::System => {
-                history.push(Message::user(format!("[system] {}", message.content)));
+                if let Some(previous) = last_user.take() {
+                    history.push(Message::user(previous));
+                }
+                history.push(Message::system(message.content));
             }
             Role::User => {
                 if let Some(previous) = last_user.take() {
@@ -256,6 +259,10 @@ mod tests {
     fn split_history_uses_trailing_user_as_prompt() {
         let (prompt, history) = split_history(vec![
             LlmMessage {
+                role: Role::System,
+                content: "be precise".into(),
+            },
+            LlmMessage {
                 role: Role::User,
                 content: "hello".into(),
             },
@@ -271,6 +278,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(prompt, "next");
+        assert_eq!(history.len(), 3);
+        assert!(matches!(history[0], Message::System { .. }));
+    }
+
+    #[test]
+    fn split_history_flushes_deferred_user_before_system_message() {
+        let (prompt, history) = split_history(vec![
+            LlmMessage {
+                role: Role::User,
+                content: "first".into(),
+            },
+            LlmMessage {
+                role: Role::System,
+                content: "side instruction".into(),
+            },
+            LlmMessage {
+                role: Role::User,
+                content: "second".into(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(prompt, "second");
         assert_eq!(history.len(), 2);
+        assert!(matches!(history[0], Message::User { .. }));
+        assert!(matches!(history[1], Message::System { .. }));
     }
 }

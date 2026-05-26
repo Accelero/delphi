@@ -268,6 +268,15 @@ struct ReplayPlan {
 }
 
 #[derive(Debug)]
+struct ReplayRange {
+    start_seq: u64,
+    end_seq: u64,
+    last_seen_sequence: u64,
+    required_start_seq: Option<u64>,
+    required_end_seq: Option<u64>,
+}
+
+#[derive(Debug)]
 enum ReplayDecisionError {
     ResyncRequired,
     Internal(String),
@@ -302,9 +311,7 @@ async fn build_replay_plan(
         };
     };
 
-    let Some((start_seq, end_seq, last_seen_sequence)) =
-        replay_range(&index, last_event_id, conversation, latest_sequence)?
-    else {
+    let Some(range) = replay_range(&index, last_event_id, conversation, latest_sequence)? else {
         return Ok(ReplayPlan {
             events: Vec::new(),
             last_seen_sequence: last_event_id.and_then(parse_event_id).unwrap_or(0),
@@ -313,17 +320,22 @@ async fn build_replay_plan(
 
     let events = state
         .bus
-        .replay_events(&auth.tenant_id, conversation_id, start_seq, end_seq)
+        .replay_events(
+            &auth.tenant_id,
+            conversation_id,
+            range.start_seq,
+            range.end_seq,
+        )
         .await
         .map_err(|error| ReplayDecisionError::Internal(error.to_string()))?;
 
-    if last_event_id.is_none() && events.is_empty() && start_seq <= end_seq {
+    if replay_is_incomplete(&events, &range) {
         return Err(ReplayDecisionError::ResyncRequired);
     }
 
     Ok(ReplayPlan {
         events,
-        last_seen_sequence,
+        last_seen_sequence: range.last_seen_sequence,
     })
 }
 
@@ -332,7 +344,7 @@ fn replay_range(
     last_event_id: Option<&str>,
     conversation: &ConversationDetail,
     latest_sequence: u64,
-) -> Result<Option<(u64, u64, u64)>, ReplayDecisionError> {
+) -> Result<Option<ReplayRange>, ReplayDecisionError> {
     let Some(last_event_id) = last_event_id else {
         let Some(current) = index.current_turn.as_ref() else {
             return Ok(None);
@@ -341,7 +353,13 @@ fn replay_range(
             return Ok(None);
         }
         let end_seq = current.end_seq.unwrap_or(latest_sequence);
-        return Ok(Some((current.start_seq, end_seq, 0)));
+        return Ok(Some(ReplayRange {
+            start_seq: current.start_seq,
+            end_seq,
+            last_seen_sequence: 0,
+            required_start_seq: Some(current.start_seq),
+            required_end_seq: current.end_seq,
+        }));
     };
 
     let last_sequence = parse_event_id(last_event_id).ok_or(ReplayDecisionError::ResyncRequired)?;
@@ -351,7 +369,13 @@ fn replay_range(
             if last_sequence >= end_seq {
                 return Ok(None);
             }
-            return Ok(Some((last_sequence + 1, end_seq, last_sequence)));
+            return Ok(Some(ReplayRange {
+                start_seq: last_sequence + 1,
+                end_seq,
+                last_seen_sequence: last_sequence,
+                required_start_seq: None,
+                required_end_seq: current.end_seq,
+            }));
         }
     }
 
@@ -366,11 +390,46 @@ fn replay_range(
             if last_sequence >= end_seq {
                 return Ok(None);
             }
-            return Ok(Some((last_sequence + 1, end_seq, last_sequence)));
+            return Ok(Some(ReplayRange {
+                start_seq: last_sequence + 1,
+                end_seq,
+                last_seen_sequence: last_sequence,
+                required_start_seq: None,
+                required_end_seq: match index.current_turn.as_ref() {
+                    Some(current) => current.end_seq,
+                    None => previous.end_seq,
+                },
+            }));
         }
     }
 
     Err(ReplayDecisionError::ResyncRequired)
+}
+
+fn replay_is_incomplete(events: &[delphi_nats::SequencedChatEvent], range: &ReplayRange) -> bool {
+    if range.required_start_seq.is_some() && events.is_empty() {
+        return true;
+    }
+
+    if let Some(required_start_seq) = range.required_start_seq {
+        let first_sequence = events
+            .first()
+            .and_then(|event| parse_event_id(&event.event_id));
+        if first_sequence != Some(required_start_seq) {
+            return true;
+        }
+    }
+
+    if let Some(required_end_seq) = range.required_end_seq {
+        let last_sequence = events
+            .last()
+            .and_then(|event| parse_event_id(&event.event_id));
+        if last_sequence != Some(required_end_seq) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn turn_contains_sequence(turn: &ReplayTurn, sequence: u64, latest_sequence: u64) -> bool {

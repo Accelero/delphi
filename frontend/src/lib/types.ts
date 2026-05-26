@@ -13,6 +13,8 @@ export type MessageDto = {
   parent_message_id?: string | null;
   citations: CitationEntry[];
   turn_id?: string | null;
+  interrupted?: boolean;
+  finish_reason?: string | null;
   created_at: string;
 };
 
@@ -32,6 +34,12 @@ export type ChatEvent =
   | { type: "citations"; citations: CitationEntry[] }
   | { type: "text_delta"; delta: string }
   | { type: "finish"; assistant_message_id: string; finish_reason: "stop" | "error" }
+  | {
+      type: "interrupted";
+      assistant_message_id: string;
+      content: string;
+      finish_reason: "user_interrupted";
+    }
   | { type: "clear"; reason: "cancelled" | "worker_lost" | "failed_before_commit" }
   | { type: "error"; message: string }
   | { type: "title_updated"; title: string };

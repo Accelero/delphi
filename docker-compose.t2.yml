@@ -87,6 +87,7 @@ services:
       SURREAL_DATABASE: delphi
       SURREAL_USER: root
       SURREAL_PASSWORD: root
+      SURREAL_BOOTSTRAP_SCHEMA: "true"
       AUTH_JWKS_URL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
       AUTH_EXPECTED_ISSUER: http://localhost:18081/realms/delphi
       AUTH_DEFAULT_TENANT: tenant-a
@@ -111,6 +112,7 @@ services:
       SURREAL_DATABASE: delphi
       SURREAL_USER: root
       SURREAL_PASSWORD: root
+      SURREAL_BOOTSTRAP_SCHEMA: "false"
       AUTH_JWKS_URL: http://keycloak:8080/realms/delphi/protocol/openid-connect/certs
       AUTH_EXPECTED_ISSUER: http://localhost:18081/realms/delphi
       AUTH_DEFAULT_TENANT: tenant-a
@@ -137,6 +139,7 @@ services:
       SURREAL_DATABASE: delphi
       SURREAL_USER: root
       SURREAL_PASSWORD: root
+      SURREAL_BOOTSTRAP_SCHEMA: "false"
       CHAT_LOCK_TTL_SECONDS: "900"
       CHAT_EVENTS_MAX_AGE_SECONDS: "1800"
       CHAT_REPLAY_TTL_SECONDS: "1500"

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 import type { ConversationDetail, ConversationSummary } from "../../lib/types";
 import { ChatPane } from "./ChatPane";
@@ -9,16 +9,20 @@ export function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [active, setActive] = useState<ConversationDetail | null>(null);
 
-  const refreshList = async () => {
+  const refreshList = useCallback(async () => {
     const rows = await api.listConversations();
     setConversations(rows);
     if (!activeId && rows[0]) setActiveId(rows[0].id);
-  };
+  }, [activeId]);
 
-  const refreshActive = async () => {
+  const refreshActive = useCallback(async () => {
     if (!activeId) return;
     setActive(await api.getConversation(activeId));
-  };
+  }, [activeId]);
+
+  const refreshChatState = useCallback(async () => {
+    await Promise.all([refreshActive(), refreshList()]);
+  }, [refreshActive, refreshList]);
 
   useEffect(() => {
     api.me().then(refreshList).catch(() => undefined);
@@ -53,7 +57,7 @@ export function App() {
         onSelect={setActiveId}
         onDelete={remove}
       />
-      <ChatPane conversation={active} onRefresh={refreshActive} />
+      <ChatPane conversation={active} onRefresh={refreshChatState} />
     </div>
   );
 }

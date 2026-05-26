@@ -247,6 +247,25 @@ async fn enqueue_turn(
         ))
         .await?;
 
+    if let Err(error) = state
+        .repo
+        .record_turn_requested(
+            &auth.tenant_id,
+            &auth.user_id,
+            &conversation_id,
+            &turn_id,
+            &user_message_id,
+            parent_message_id.as_deref(),
+        )
+        .await
+    {
+        state
+            .bus
+            .release_lock(&auth.tenant_id, &conversation_id, &turn_id)
+            .await;
+        return Err(error.into());
+    }
+
     let command = TurnRequested {
         v: CONTRACT_VERSION,
         command_id: turn_id.clone(),
@@ -262,6 +281,16 @@ async fn enqueue_turn(
     };
 
     if let Err(error) = state.bus.publish_turn_requested(command).await {
+        let _ = state
+            .repo
+            .record_turn_failed(
+                &auth.tenant_id,
+                &auth.user_id,
+                &conversation_id,
+                &turn_id,
+                &format!("failed to publish turn request: {error}"),
+            )
+            .await;
         state
             .bus
             .release_lock(&auth.tenant_id, &conversation_id, &turn_id)

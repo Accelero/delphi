@@ -79,6 +79,28 @@ async fn run_turn(state: WorkerState, command: TurnRequested) -> anyhow::Result<
         )
         .await?;
 
+    if let Err(error) = state
+        .repo
+        .record_turn_running(
+            &command.tenant_id,
+            &command.user_id,
+            &command.conversation_id,
+            &command.turn_id,
+            &state.worker_id,
+        )
+        .await
+    {
+        state
+            .bus
+            .release_lock(
+                &command.tenant_id,
+                &command.conversation_id,
+                &command.turn_id,
+            )
+            .await;
+        return Err(error.into());
+    }
+
     let (shutdown_maintenance, maintenance_errors, maintenance_task) =
         start_turn_maintenance(state.clone(), command.clone());
 
@@ -348,18 +370,26 @@ fn llm_messages(
     command: &TurnRequested,
 ) -> Vec<LlmMessage> {
     let mut messages = Vec::with_capacity(history.len() + 1);
-    messages.push(LlmMessage {
-        role: Role::System,
-        content: "You are delphi, a research assistant.".to_owned(),
-    });
-    messages.extend(history.into_iter().map(|message| LlmMessage {
-        role: match message.role {
-            MessageRole::User => Role::User,
-            MessageRole::Assistant => Role::Assistant,
-            MessageRole::System => Role::System,
-        },
-        content: message.content,
-    }));
+    let last_history_message_id = history.last().map(|message| message.id.clone());
+    for message in history {
+        let interrupted_tail =
+            Some(message.id.as_str()) == last_history_message_id.as_deref() && message.interrupted;
+        messages.push(LlmMessage {
+            role: match message.role {
+                MessageRole::User => Role::User,
+                MessageRole::Assistant => Role::Assistant,
+                MessageRole::System => Role::System,
+            },
+            content: message.content,
+        });
+        if interrupted_tail {
+            messages.push(LlmMessage {
+                role: Role::System,
+                content: "The previous assistant response was interrupted by the user and may be incomplete. Treat it as partial context, not as a finished answer."
+                    .to_owned(),
+            });
+        }
+    }
     messages.push(LlmMessage {
         role: Role::User,
         content: command.text.clone(),
@@ -372,6 +402,16 @@ async fn publish_failed_turn(
     command: &TurnRequested,
     message: String,
 ) -> anyhow::Result<()> {
+    let _ = state
+        .repo
+        .record_turn_failed(
+            &command.tenant_id,
+            &command.user_id,
+            &command.conversation_id,
+            &command.turn_id,
+            &message,
+        )
+        .await;
     publish_event(
         state,
         command,
@@ -453,4 +493,93 @@ async fn lock_stop_requested(state: &WorkerState, command: &TurnRequested) -> an
             &command.turn_id,
         )
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use delphi_contracts::MessageDto;
+
+    fn command() -> TurnRequested {
+        TurnRequested {
+            v: CONTRACT_VERSION,
+            command_id: "01HX0000000000000000000001".to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            user_id: "user-a".to_owned(),
+            conversation_id: "conversation-a".to_owned(),
+            turn_id: "01HX0000000000000000000002".to_owned(),
+            user_message_id: "01HX0000000000000000000003".to_owned(),
+            text: "continue from there".to_owned(),
+            parent_message_id: Some("01HX0000000000000000000005".to_owned()),
+            bearer_subject: "user-a".to_owned(),
+            ts: Utc::now(),
+        }
+    }
+
+    fn message(id: &str, role: MessageRole, content: &str, interrupted: bool) -> MessageDto {
+        MessageDto {
+            id: id.to_owned(),
+            role,
+            content: content.to_owned(),
+            parent_message_id: None,
+            citations: Vec::new(),
+            turn_id: Some("01HX0000000000000000000004".to_owned()),
+            interrupted,
+            finish_reason: interrupted.then(|| "user_interrupted".to_owned()),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn llm_messages_marks_interrupted_tail_as_partial_context() {
+        let history = vec![
+            message(
+                "01HX0000000000000000000004",
+                MessageRole::User,
+                "summarize this",
+                false,
+            ),
+            message(
+                "01HX0000000000000000000005",
+                MessageRole::Assistant,
+                "The summary starts with",
+                true,
+            ),
+        ];
+
+        let messages = llm_messages(history, &command());
+
+        assert!(messages.iter().any(|message| {
+            message.role == Role::System
+                && message.content.contains("interrupted by the user")
+                && message.content.contains("partial context")
+        }));
+        assert_eq!(messages.last().unwrap().role, Role::User);
+        assert_eq!(messages.last().unwrap().content, "continue from there");
+    }
+
+    #[test]
+    fn llm_messages_does_not_mark_older_interrupted_messages() {
+        let history = vec![
+            message(
+                "01HX0000000000000000000004",
+                MessageRole::Assistant,
+                "old partial",
+                true,
+            ),
+            message(
+                "01HX0000000000000000000005",
+                MessageRole::User,
+                "later message",
+                false,
+            ),
+        ];
+
+        let messages = llm_messages(history, &command());
+
+        assert!(!messages
+            .iter()
+            .any(|message| message.content.contains("interrupted by the user")));
+    }
 }

@@ -70,6 +70,34 @@ pub trait ChatRepository: Clone + Send + Sync + 'static {
         parent_message_id: Option<&str>,
     ) -> Result<(), StorageError>;
 
+    async fn record_turn_requested(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        user_message_id: &str,
+        parent_message_id: Option<&str>,
+    ) -> Result<(), StorageError>;
+
+    async fn record_turn_running(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        worker_id: &str,
+    ) -> Result<(), StorageError>;
+
+    async fn record_turn_failed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        error: &str,
+    ) -> Result<(), StorageError>;
+
     async fn commit_turn(
         &self,
         tenant_id: &str,
@@ -129,7 +157,9 @@ impl SurrealChatRepository {
             })?;
 
         let repo = Self { db };
-        repo.bootstrap_with_retry().await?;
+        if should_bootstrap_schema() {
+            repo.bootstrap_with_retry().await?;
+        }
         Ok(repo)
     }
 
@@ -138,7 +168,7 @@ impl SurrealChatRepository {
         loop {
             match self.bootstrap().await {
                 Ok(()) => return Ok(()),
-                Err(error) if is_transient_conflict(&error) && attempt < 4 => {
+                Err(error) if is_transient_conflict(&error) && attempt < 20 => {
                     attempt += 1;
                     tokio::time::sleep(std::time::Duration::from_millis(25 * attempt as u64)).await;
                 }
@@ -151,18 +181,93 @@ impl SurrealChatRepository {
         self.db
             .query(
                 "
-                DEFINE TABLE IF NOT EXISTS chat_conversation SCHEMALESS;
-                DEFINE TABLE IF NOT EXISTS chat_message SCHEMALESS;
+                DEFINE TABLE OVERWRITE tenant SCHEMAFULL;
+                DEFINE FIELD OVERWRITE tenant_id ON tenant TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE name ON tenant TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE created_at ON tenant TYPE datetime DEFAULT time::now();
+                DEFINE FIELD OVERWRITE metadata ON tenant TYPE object FLEXIBLE DEFAULT {};
+                REMOVE INDEX IF EXISTS tenant_id ON tenant;
+                DEFINE INDEX IF NOT EXISTS tenant_id ON tenant FIELDS tenant_id UNIQUE;
+
+                DEFINE TABLE OVERWRITE app_user SCHEMAFULL;
+                DEFINE FIELD OVERWRITE tenant_id ON app_user TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE user_id ON app_user TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE email ON app_user TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE display_name ON app_user TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE created_at ON app_user TYPE datetime DEFAULT time::now();
+                DEFINE FIELD OVERWRITE last_seen_at ON app_user TYPE option<datetime> DEFAULT NONE;
+                REMOVE INDEX IF EXISTS app_user_identity ON app_user;
+                REMOVE INDEX IF EXISTS app_user_tenant ON app_user;
+                DEFINE INDEX IF NOT EXISTS app_user_identity ON app_user FIELDS tenant_id, user_id UNIQUE;
+                DEFINE INDEX IF NOT EXISTS app_user_tenant ON app_user FIELDS tenant_id;
+
+                DEFINE TABLE OVERWRITE chat_conversation SCHEMAFULL;
+                DEFINE FIELD OVERWRITE conversation_id ON chat_conversation TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE tenant_id ON chat_conversation TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE user_id ON chat_conversation TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE title ON chat_conversation TYPE string DEFAULT 'New chat';
+                DEFINE FIELD OVERWRITE created_at ON chat_conversation TYPE datetime DEFAULT time::now();
+                DEFINE FIELD OVERWRITE updated_at ON chat_conversation TYPE datetime DEFAULT time::now();
+                DEFINE FIELD OVERWRITE deleted_at ON chat_conversation TYPE option<datetime> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE next_message_ordinal ON chat_conversation TYPE int DEFAULT 1;
+                REMOVE INDEX IF EXISTS chat_conversation_owner ON chat_conversation;
+                REMOVE INDEX IF EXISTS chat_conversation_updated ON chat_conversation;
                 DEFINE INDEX IF NOT EXISTS chat_conversation_owner
                     ON chat_conversation FIELDS tenant_id, user_id, conversation_id UNIQUE;
                 DEFINE INDEX IF NOT EXISTS chat_conversation_updated
                     ON chat_conversation FIELDS tenant_id, user_id, updated_at;
+
+                DEFINE TABLE OVERWRITE chat_message SCHEMAFULL;
+                DEFINE FIELD OVERWRITE message_id ON chat_message TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE tenant_id ON chat_message TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE user_id ON chat_message TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE conversation_id ON chat_message TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE role ON chat_message TYPE string ASSERT $value INSIDE ['system', 'user', 'assistant', 'tool'];
+                DEFINE FIELD OVERWRITE content ON chat_message TYPE string DEFAULT '';
+                DEFINE FIELD OVERWRITE parent_message_id ON chat_message TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE citations ON chat_message TYPE array DEFAULT [];
+                DEFINE FIELD OVERWRITE turn_id ON chat_message TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE interrupted ON chat_message TYPE bool DEFAULT false;
+                DEFINE FIELD OVERWRITE finish_reason ON chat_message TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE ordinal ON chat_message TYPE int ASSERT $value > 0;
+                DEFINE FIELD OVERWRITE created_at ON chat_message TYPE datetime DEFAULT time::now();
+                REMOVE INDEX IF EXISTS chat_message_order ON chat_message;
+                REMOVE INDEX IF EXISTS chat_message_id ON chat_message;
+                REMOVE INDEX IF EXISTS chat_message_parent ON chat_message;
+                REMOVE INDEX IF EXISTS chat_message_turn ON chat_message;
+                REMOVE INDEX IF EXISTS chat_message_ordinal_unique ON chat_message;
                 DEFINE INDEX IF NOT EXISTS chat_message_order
-                    ON chat_message FIELDS tenant_id, conversation_id, created_at;
+                    ON chat_message FIELDS tenant_id, user_id, conversation_id, ordinal;
                 DEFINE INDEX IF NOT EXISTS chat_message_id
                     ON chat_message FIELDS tenant_id, message_id UNIQUE;
+                DEFINE INDEX IF NOT EXISTS chat_message_ordinal_unique
+                    ON chat_message FIELDS tenant_id, conversation_id, ordinal UNIQUE;
                 DEFINE INDEX IF NOT EXISTS chat_message_parent
                     ON chat_message FIELDS tenant_id, conversation_id, parent_message_id;
+                DEFINE INDEX IF NOT EXISTS chat_message_turn
+                    ON chat_message FIELDS tenant_id, conversation_id, turn_id;
+
+                DEFINE TABLE OVERWRITE chat_turn SCHEMAFULL;
+                DEFINE FIELD OVERWRITE turn_id ON chat_turn TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE tenant_id ON chat_turn TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE user_id ON chat_turn TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE conversation_id ON chat_turn TYPE string ASSERT $value != '';
+                DEFINE FIELD OVERWRITE user_message_id ON chat_turn TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE assistant_message_id ON chat_turn TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE parent_message_id ON chat_turn TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE status ON chat_turn TYPE string ASSERT $value INSIDE ['requested', 'running', 'committed', 'interrupted', 'failed'];
+                DEFINE FIELD OVERWRITE worker_id ON chat_turn TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE error ON chat_turn TYPE option<string> DEFAULT NONE;
+                DEFINE FIELD OVERWRITE created_at ON chat_turn TYPE datetime DEFAULT time::now();
+                DEFINE FIELD OVERWRITE updated_at ON chat_turn TYPE datetime DEFAULT time::now();
+                REMOVE INDEX IF EXISTS chat_turn_id ON chat_turn;
+                REMOVE INDEX IF EXISTS chat_turn_conversation ON chat_turn;
+                REMOVE INDEX IF EXISTS chat_turn_status ON chat_turn;
+                DEFINE INDEX IF NOT EXISTS chat_turn_id ON chat_turn FIELDS tenant_id, turn_id UNIQUE;
+                DEFINE INDEX IF NOT EXISTS chat_turn_conversation
+                    ON chat_turn FIELDS tenant_id, user_id, conversation_id, created_at;
+                DEFINE INDEX IF NOT EXISTS chat_turn_status
+                    ON chat_turn FIELDS tenant_id, conversation_id, status;
                 ",
             )
             .await
@@ -184,9 +289,13 @@ struct DbConversation {
     #[surreal(default)]
     title: String,
     #[surreal(default)]
+    created_at: DateTime<Utc>,
+    #[surreal(default)]
     updated_at: DateTime<Utc>,
     #[surreal(default)]
     deleted_at: Option<DateTime<Utc>>,
+    #[surreal(default)]
+    next_message_ordinal: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -214,7 +323,37 @@ struct DbMessage {
     #[surreal(default)]
     finish_reason: Option<String>,
     #[surreal(default)]
+    ordinal: i64,
+    #[surreal(default)]
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+struct DbChatTurn {
+    #[surreal(default)]
+    turn_id: String,
+    #[surreal(default)]
+    tenant_id: String,
+    #[surreal(default)]
+    user_id: String,
+    #[surreal(default)]
+    conversation_id: String,
+    #[surreal(default)]
+    user_message_id: Option<String>,
+    #[surreal(default)]
+    assistant_message_id: Option<String>,
+    #[surreal(default)]
+    parent_message_id: Option<String>,
+    #[surreal(default)]
+    status: String,
+    #[surreal(default)]
+    worker_id: Option<String>,
+    #[surreal(default)]
+    error: Option<String>,
+    #[surreal(default)]
+    created_at: DateTime<Utc>,
+    #[surreal(default)]
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
@@ -234,6 +373,7 @@ impl ChatRepository for SurrealChatRepository {
         tenant_id: &str,
         user_id: &str,
     ) -> Result<Vec<ConversationSummary>, StorageError> {
+        self.ensure_principal(tenant_id, user_id).await?;
         let mut response = self
             .db
             .query(
@@ -269,13 +409,17 @@ impl ChatRepository for SurrealChatRepository {
         user_id: &str,
         title: Option<String>,
     ) -> Result<ConversationDetail, StorageError> {
+        self.ensure_principal(tenant_id, user_id).await?;
+        let now = Utc::now();
         let row = DbConversation {
             conversation_id: ulid::Ulid::new().to_string(),
             tenant_id: tenant_id.to_owned(),
             user_id: user_id.to_owned(),
             title: title.unwrap_or_else(|| "New chat".to_owned()),
-            updated_at: Utc::now(),
+            created_at: now,
+            updated_at: now,
             deleted_at: None,
+            next_message_ordinal: 1,
         };
 
         self.db
@@ -298,7 +442,7 @@ impl ChatRepository for SurrealChatRepository {
             .get_visible_conversation(tenant_id, user_id, conversation_id)
             .await?;
         let messages = self
-            .list_messages(tenant_id, conversation_id)
+            .list_messages(tenant_id, user_id, conversation_id)
             .await?
             .into_iter()
             .map(db_message_to_dto)
@@ -339,7 +483,7 @@ impl ChatRepository for SurrealChatRepository {
         let rows: Vec<DbConversation> = response.take(0).map_err(storage_internal)?;
         let conversation = rows.into_iter().next().ok_or(StorageError::NotFound)?;
         let messages = self
-            .list_messages(tenant_id, conversation_id)
+            .list_messages(tenant_id, user_id, conversation_id)
             .await?
             .into_iter()
             .map(db_message_to_dto)
@@ -396,15 +540,17 @@ impl ChatRepository for SurrealChatRepository {
             .db
             .query(
                 "
-                SELECT message_id, created_at
+                SELECT message_id, ordinal
                 FROM chat_message
                 WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
                   AND conversation_id = $conversation_id
-                ORDER BY created_at DESC
+                ORDER BY ordinal DESC
                 LIMIT 1
                 ",
             )
             .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
             .bind(("conversation_id", conversation_id.to_owned()))
             .await
             .map_err(storage_internal)?
@@ -417,6 +563,104 @@ impl ChatRepository for SurrealChatRepository {
         } else {
             Err(StorageError::StaleParent)
         }
+    }
+
+    async fn record_turn_requested(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        user_message_id: &str,
+        parent_message_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.get_visible_conversation(tenant_id, user_id, conversation_id)
+            .await?;
+        self.upsert_turn(DbChatTurn {
+            turn_id: turn_id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            user_id: user_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            user_message_id: Some(user_message_id.to_owned()),
+            assistant_message_id: None,
+            parent_message_id: parent_message_id.map(str::to_owned),
+            status: "requested".to_owned(),
+            worker_id: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
+        .await
+    }
+
+    async fn record_turn_running(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        worker_id: &str,
+    ) -> Result<(), StorageError> {
+        self.get_visible_conversation(tenant_id, user_id, conversation_id)
+            .await?;
+        let now = Utc::now();
+        self.db
+            .query(
+                "
+                UPDATE chat_turn
+                SET status = 'running', worker_id = $worker_id, error = NONE, updated_at = $updated_at
+                WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
+                  AND conversation_id = $conversation_id
+                  AND turn_id = $turn_id
+                ",
+            )
+            .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
+            .bind(("conversation_id", conversation_id.to_owned()))
+            .bind(("turn_id", turn_id.to_owned()))
+            .bind(("worker_id", worker_id.to_owned()))
+            .bind(("updated_at", now))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        Ok(())
+    }
+
+    async fn record_turn_failed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        self.get_visible_conversation(tenant_id, user_id, conversation_id)
+            .await?;
+        let now = Utc::now();
+        self.db
+            .query(
+                "
+                UPDATE chat_turn
+                SET status = 'failed', error = $error, updated_at = $updated_at
+                WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
+                  AND conversation_id = $conversation_id
+                  AND turn_id = $turn_id
+                ",
+            )
+            .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
+            .bind(("conversation_id", conversation_id.to_owned()))
+            .bind(("turn_id", turn_id.to_owned()))
+            .bind(("error", error.to_owned()))
+            .bind(("updated_at", now))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        Ok(())
     }
 
     async fn commit_turn(
@@ -501,6 +745,11 @@ impl SurrealChatRepository {
 
         let now = Utc::now();
         let assistant_created_at = now + Duration::milliseconds(1);
+        let parent_ordinal = self
+            .parent_ordinal(tenant_id, user_id, conversation_id, parent_message_id)
+            .await?;
+        let user_ordinal = parent_ordinal + 1;
+        let assistant_ordinal = parent_ordinal + 2;
         let user = DbMessage {
             message_id: user_message_id.to_owned(),
             tenant_id: tenant_id.to_owned(),
@@ -513,6 +762,7 @@ impl SurrealChatRepository {
             turn_id: Some(turn_id.to_owned()),
             interrupted: false,
             finish_reason: None,
+            ordinal: user_ordinal,
             created_at: now,
         };
         let assistant = DbMessage {
@@ -527,38 +777,48 @@ impl SurrealChatRepository {
             turn_id: Some(turn_id.to_owned()),
             interrupted,
             finish_reason,
+            ordinal: assistant_ordinal,
             created_at: assistant_created_at,
         };
         let title: String = user_text.chars().take(48).collect();
+        let turn_status = if interrupted {
+            "interrupted"
+        } else {
+            "committed"
+        };
 
         self.db
             .query(
                 "
                 BEGIN;
-                LET $parent_rows = SELECT created_at
-                    FROM chat_message
-                    WHERE tenant_id = $tenant_id
-                      AND conversation_id = $conversation_id
-                      AND message_id = $parent_message_id
-                    LIMIT 1;
-                LET $parent_created_at = IF $parent_message_id != NONE
-                    THEN $parent_rows[0].created_at
-                    ELSE time::EPOCH
-                    END;
                 DELETE chat_message
                 WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
                   AND conversation_id = $conversation_id
-                  AND created_at > $parent_created_at;
+                  AND ordinal > $parent_ordinal;
                 CREATE chat_message CONTENT $user_message;
                 CREATE chat_message CONTENT $assistant_message;
                 UPDATE chat_conversation
                 SET
                     updated_at = $updated_at,
-                    title = IF title = 'New chat' THEN $title ELSE title END
+                    title = IF title = 'New chat' THEN $title ELSE title END,
+                    next_message_ordinal = $next_message_ordinal
                 WHERE tenant_id = $tenant_id
                   AND user_id = $user_id
                   AND conversation_id = $conversation_id
                   AND deleted_at = NONE;
+                UPDATE chat_turn
+                SET
+                    status = $turn_status,
+                    user_message_id = $user_message_id,
+                    assistant_message_id = $assistant_message_id,
+                    parent_message_id = $parent_message_id,
+                    error = NONE,
+                    updated_at = $updated_at
+                WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
+                  AND conversation_id = $conversation_id
+                  AND turn_id = $turn_id;
                 COMMIT;
                 ",
             )
@@ -566,10 +826,16 @@ impl SurrealChatRepository {
             .bind(("assistant_message", assistant))
             .bind(("updated_at", now))
             .bind(("title", title))
+            .bind(("next_message_ordinal", assistant_ordinal + 1))
             .bind(("tenant_id", tenant_id.to_owned()))
             .bind(("user_id", user_id.to_owned()))
             .bind(("conversation_id", conversation_id.to_owned()))
             .bind(("parent_message_id", parent_message_id.map(str::to_owned)))
+            .bind(("parent_ordinal", parent_ordinal))
+            .bind(("turn_status", turn_status.to_owned()))
+            .bind(("turn_id", turn_id.to_owned()))
+            .bind(("user_message_id", user_message_id.to_owned()))
+            .bind(("assistant_message_id", assistant_message_id.to_owned()))
             .await
             .map_err(storage_internal)?
             .check()
@@ -600,20 +866,241 @@ struct ConversationIdRow {
 struct MessageIdRow {
     #[surreal(default)]
     message_id: String,
+    #[surreal(default)]
+    ordinal: i64,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct TenantIdRow {
+    #[surreal(default)]
+    tenant_id: String,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct UserIdRow {
+    #[surreal(default)]
+    user_id: String,
+}
+
+#[derive(Debug, Deserialize, SurrealValue)]
+struct TurnIdRow {
+    #[surreal(default)]
+    turn_id: String,
 }
 
 impl SurrealChatRepository {
+    async fn ensure_principal(&self, tenant_id: &str, user_id: &str) -> Result<(), StorageError> {
+        let now = Utc::now();
+        let mut tenant_response = self
+            .db
+            .query(
+                "
+                SELECT tenant_id
+                FROM tenant
+                WHERE tenant_id = $tenant_id
+                LIMIT 1
+                ",
+            )
+            .bind(("tenant_id", tenant_id.to_owned()))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        let tenants: Vec<TenantIdRow> = tenant_response.take(0).map_err(storage_internal)?;
+        if tenants.is_empty() {
+            self.db
+                .query(
+                    "
+                    CREATE tenant CONTENT {
+                        tenant_id: $tenant_id,
+                        name: $tenant_id,
+                        created_at: $created_at,
+                        metadata: {}
+                    }
+                    ",
+                )
+                .bind(("tenant_id", tenant_id.to_owned()))
+                .bind(("created_at", now))
+                .await
+                .map_err(storage_internal)?
+                .check()
+                .map_err(storage_internal)?;
+        }
+
+        let mut user_response = self
+            .db
+            .query(
+                "
+                SELECT user_id
+                FROM app_user
+                WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
+                LIMIT 1
+                ",
+            )
+            .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        let users: Vec<UserIdRow> = user_response.take(0).map_err(storage_internal)?;
+        if users.is_empty() {
+            self.db
+                .query(
+                    "
+                    CREATE app_user CONTENT {
+                        tenant_id: $tenant_id,
+                        user_id: $user_id,
+                        email: NONE,
+                        display_name: NONE,
+                        created_at: $created_at,
+                        last_seen_at: $created_at
+                    }
+                    ",
+                )
+                .bind(("tenant_id", tenant_id.to_owned()))
+                .bind(("user_id", user_id.to_owned()))
+                .bind(("created_at", now))
+                .await
+                .map_err(storage_internal)?
+                .check()
+                .map_err(storage_internal)?;
+        } else {
+            self.db
+                .query(
+                    "
+                    UPDATE app_user
+                    SET last_seen_at = $last_seen_at
+                    WHERE tenant_id = $tenant_id
+                      AND user_id = $user_id
+                    ",
+                )
+                .bind(("tenant_id", tenant_id.to_owned()))
+                .bind(("user_id", user_id.to_owned()))
+                .bind(("last_seen_at", now))
+                .await
+                .map_err(storage_internal)?
+                .check()
+                .map_err(storage_internal)?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_turn(&self, turn: DbChatTurn) -> Result<(), StorageError> {
+        let mut response = self
+            .db
+            .query(
+                "
+                SELECT turn_id
+                FROM chat_turn
+                WHERE tenant_id = $tenant_id
+                  AND turn_id = $turn_id
+                LIMIT 1
+                ",
+            )
+            .bind(("tenant_id", turn.tenant_id.clone()))
+            .bind(("turn_id", turn.turn_id.clone()))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        let rows: Vec<TurnIdRow> = response.take(0).map_err(storage_internal)?;
+        if rows.is_empty() {
+            self.db
+                .query("CREATE chat_turn CONTENT $data")
+                .bind(("data", turn))
+                .await
+                .map_err(storage_internal)?
+                .check()
+                .map_err(storage_internal)?;
+        } else {
+            self.db
+                .query(
+                    "
+                    UPDATE chat_turn
+                    SET
+                        user_id = $user_id,
+                        conversation_id = $conversation_id,
+                        user_message_id = $user_message_id,
+                        assistant_message_id = $assistant_message_id,
+                        parent_message_id = $parent_message_id,
+                        status = $status,
+                        worker_id = $worker_id,
+                        error = $error,
+                        updated_at = $updated_at
+                    WHERE tenant_id = $tenant_id
+                      AND turn_id = $turn_id
+                    ",
+                )
+                .bind(("tenant_id", turn.tenant_id))
+                .bind(("turn_id", turn.turn_id))
+                .bind(("user_id", turn.user_id))
+                .bind(("conversation_id", turn.conversation_id))
+                .bind(("user_message_id", turn.user_message_id))
+                .bind(("assistant_message_id", turn.assistant_message_id))
+                .bind(("parent_message_id", turn.parent_message_id))
+                .bind(("status", turn.status))
+                .bind(("worker_id", turn.worker_id))
+                .bind(("error", turn.error))
+                .bind(("updated_at", turn.updated_at))
+                .await
+                .map_err(storage_internal)?
+                .check()
+                .map_err(storage_internal)?;
+        }
+        Ok(())
+    }
+
+    async fn parent_ordinal(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        parent_message_id: Option<&str>,
+    ) -> Result<i64, StorageError> {
+        let Some(parent_message_id) = parent_message_id else {
+            return Ok(0);
+        };
+        let mut response = self
+            .db
+            .query(
+                "
+                SELECT ordinal
+                FROM chat_message
+                WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
+                  AND conversation_id = $conversation_id
+                  AND message_id = $parent_message_id
+                LIMIT 1
+                ",
+            )
+            .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
+            .bind(("conversation_id", conversation_id.to_owned()))
+            .bind(("parent_message_id", parent_message_id.to_owned()))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        let rows: Vec<MessageIdRow> = response.take(0).map_err(storage_internal)?;
+        rows.first()
+            .map(|row| row.ordinal)
+            .ok_or(StorageError::StaleParent)
+    }
+
     async fn get_visible_conversation(
         &self,
         tenant_id: &str,
         user_id: &str,
         conversation_id: &str,
     ) -> Result<DbConversation, StorageError> {
+        self.ensure_principal(tenant_id, user_id).await?;
         let mut response = self
             .db
             .query(
                 "
-                SELECT conversation_id, tenant_id, user_id, title, updated_at, deleted_at
+                SELECT conversation_id, tenant_id, user_id, title, created_at, updated_at, deleted_at, next_message_ordinal
                 FROM chat_conversation
                 WHERE tenant_id = $tenant_id
                   AND user_id = $user_id
@@ -636,20 +1123,23 @@ impl SurrealChatRepository {
     async fn list_messages(
         &self,
         tenant_id: &str,
+        user_id: &str,
         conversation_id: &str,
     ) -> Result<Vec<DbMessage>, StorageError> {
         let mut response = self
             .db
             .query(
                 "
-                SELECT message_id, tenant_id, user_id, conversation_id, role, content, parent_message_id, citations, turn_id, interrupted, finish_reason, created_at
+                SELECT message_id, tenant_id, user_id, conversation_id, role, content, parent_message_id, citations, turn_id, interrupted, finish_reason, ordinal, created_at
                 FROM chat_message
                 WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
                   AND conversation_id = $conversation_id
-                ORDER BY created_at ASC
+                ORDER BY ordinal ASC
                 ",
             )
             .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
             .bind(("conversation_id", conversation_id.to_owned()))
             .await
             .map_err(storage_internal)?
@@ -719,6 +1209,15 @@ fn is_transient_conflict(error: &StorageError) -> bool {
         || message.contains("Resource busy")
 }
 
+fn should_bootstrap_schema() -> bool {
+    std::env::var("SURREAL_BOOTSTRAP_SCHEMA")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value != "0" && value != "false" && value != "no"
+        })
+        .unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MemoryChatRepository {
     inner: Arc<Mutex<MemoryState>>,
@@ -737,6 +1236,7 @@ struct StoredConversation {
     title: String,
     updated_at: DateTime<Utc>,
     deleted_at: Option<DateTime<Utc>>,
+    next_message_ordinal: i64,
     messages: Vec<MessageDto>,
 }
 
@@ -777,6 +1277,7 @@ impl ChatRepository for MemoryChatRepository {
             title: title.unwrap_or_else(|| "New chat".to_owned()),
             updated_at: now,
             deleted_at: None,
+            next_message_ordinal: 1,
             messages: Vec::new(),
         };
 
@@ -853,6 +1354,55 @@ impl ChatRepository for MemoryChatRepository {
         } else {
             Err(StorageError::StaleParent)
         }
+    }
+
+    async fn record_turn_requested(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        _turn_id: &str,
+        _user_message_id: &str,
+        _parent_message_id: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let state = self.inner.lock().await;
+        let row = state
+            .conversations
+            .get(conversation_id)
+            .ok_or(StorageError::NotFound)?;
+        ensure_visible(row, tenant_id, user_id)
+    }
+
+    async fn record_turn_running(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        _turn_id: &str,
+        _worker_id: &str,
+    ) -> Result<(), StorageError> {
+        let state = self.inner.lock().await;
+        let row = state
+            .conversations
+            .get(conversation_id)
+            .ok_or(StorageError::NotFound)?;
+        ensure_visible(row, tenant_id, user_id)
+    }
+
+    async fn record_turn_failed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        _turn_id: &str,
+        _error: &str,
+    ) -> Result<(), StorageError> {
+        let state = self.inner.lock().await;
+        let row = state
+            .conversations
+            .get(conversation_id)
+            .ok_or(StorageError::NotFound)?;
+        ensure_visible(row, tenant_id, user_id)
     }
 
     async fn commit_turn(
@@ -940,17 +1490,16 @@ impl MemoryChatRepository {
         ensure_visible(row, tenant_id, user_id)?;
 
         let now = Utc::now();
-        let parent_created_at = match parent_message_id {
+        let retain_len = match parent_message_id {
             Some(parent_id) => row
                 .messages
                 .iter()
-                .find(|message| message.id == parent_id)
-                .map(|message| message.created_at)
+                .position(|message| message.id == parent_id)
+                .map(|position| position + 1)
                 .ok_or(StorageError::StaleParent)?,
-            None => DateTime::<Utc>::MIN_UTC,
+            None => 0,
         };
-        row.messages
-            .retain(|message| message.created_at <= parent_created_at);
+        row.messages.truncate(retain_len);
         row.messages.push(MessageDto {
             id: user_message_id.to_owned(),
             role: MessageRole::User,
@@ -977,6 +1526,7 @@ impl MemoryChatRepository {
         if row.title == "New chat" {
             row.title = user_text.chars().take(48).collect();
         }
+        row.next_message_ordinal = row.messages.len() as i64 + 1;
 
         Ok(to_detail(row))
     }
