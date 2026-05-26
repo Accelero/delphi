@@ -210,8 +210,11 @@ impl SurrealChatRepository {
                 DEFINE FIELD OVERWRITE updated_at ON chat_conversation TYPE datetime DEFAULT time::now();
                 DEFINE FIELD OVERWRITE deleted_at ON chat_conversation TYPE option<datetime> DEFAULT NONE;
                 DEFINE FIELD OVERWRITE next_message_ordinal ON chat_conversation TYPE int DEFAULT 1;
+                REMOVE INDEX IF EXISTS chat_conversation_id ON chat_conversation;
                 REMOVE INDEX IF EXISTS chat_conversation_owner ON chat_conversation;
                 REMOVE INDEX IF EXISTS chat_conversation_updated ON chat_conversation;
+                DEFINE INDEX IF NOT EXISTS chat_conversation_id
+                    ON chat_conversation FIELDS conversation_id UNIQUE;
                 DEFINE INDEX IF NOT EXISTS chat_conversation_owner
                     ON chat_conversation FIELDS tenant_id, user_id, conversation_id UNIQUE;
                 DEFINE INDEX IF NOT EXISTS chat_conversation_updated

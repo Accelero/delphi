@@ -7,16 +7,116 @@ use axum::Router;
 use delphi_auth::{AuthContext, AuthError, AuthVerifier};
 use delphi_config::{init_tracing, ServiceConfig};
 use delphi_contracts::{ClientWsMessage, ConversationDetail, ServerWsMessage};
-use delphi_nats::{ChatBus, NatsChatBus, NatsChatBusOptions, ReplayIndex, ReplayTurn};
+use delphi_nats::{
+    ChatBus, NatsChatBus, NatsChatBusOptions, ReplayIndex, ReplayTurn, SequencedChatEvent,
+};
 use delphi_storage::{ChatRepository, SurrealChatRepository};
-use std::collections::{HashMap, HashSet};
+use futures::{SinkExt, StreamExt};
+use std::collections::HashMap;
+use std::sync::{Arc, Weak};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
+
+const DEFAULT_WS_OUTBOUND_QUEUE_SIZE: usize = 256;
+const DEFAULT_WS_EVENT_QUEUE_SIZE: usize = 1024;
+const DEFAULT_CONVERSATION_EVENT_BUFFER_SIZE: usize = 1024;
 
 #[derive(Clone)]
 struct AppState {
     auth: AuthVerifier,
     bus: NatsChatBus,
+    events: ConversationEventRegistry,
     repo: SurrealChatRepository,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct ConversationKey {
+    tenant_id: String,
+    conversation_id: String,
+}
+
+#[derive(Clone, Default)]
+struct ConversationEventRegistry {
+    hubs: Arc<Mutex<HashMap<ConversationKey, Weak<ConversationEventHub>>>>,
+}
+
+struct ConversationEventHub {
+    sender: broadcast::Sender<SequencedChatEvent>,
+    task: JoinHandle<()>,
+}
+
+impl ConversationEventHub {
+    fn subscribe(self: &Arc<Self>) -> ConversationEventSubscription {
+        ConversationEventSubscription {
+            hub: self.clone(),
+            receiver: self.sender.subscribe(),
+        }
+    }
+}
+
+impl Drop for ConversationEventHub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct ConversationEventSubscription {
+    hub: Arc<ConversationEventHub>,
+    receiver: broadcast::Receiver<SequencedChatEvent>,
+}
+
+impl ConversationEventRegistry {
+    async fn subscribe(
+        &self,
+        bus: &NatsChatBus,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationEventSubscription, delphi_nats::ChatBusError> {
+        let key = ConversationKey {
+            tenant_id: tenant_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+        };
+
+        if let Some(hub) = self.existing_hub(&key).await {
+            return Ok(hub.subscribe());
+        }
+
+        let mut source = bus
+            .subscribe_conversation_events(tenant_id, conversation_id)
+            .await?;
+        let (sender, _) = broadcast::channel(conversation_event_buffer_size());
+        let fanout_sender = sender.clone();
+        let task = tokio::spawn(async move {
+            while let Some(event) = source.recv().await {
+                let _ = fanout_sender.send(event);
+            }
+        });
+        let hub = Arc::new(ConversationEventHub { sender, task });
+
+        let mut hubs = self.hubs.lock().await;
+        if let Some(existing) = hubs.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing.subscribe());
+        }
+        hubs.insert(key, Arc::downgrade(&hub));
+        Ok(hub.subscribe())
+    }
+
+    async fn existing_hub(&self, key: &ConversationKey) -> Option<Arc<ConversationEventHub>> {
+        self.hubs.lock().await.get(key).and_then(Weak::upgrade)
+    }
+}
+
+struct ActiveSubscription {
+    task: JoinHandle<()>,
+}
+
+enum SocketEvent {
+    Event(SequencedChatEvent),
+    Lagged {
+        conversation_id: String,
+        skipped: u64,
+    },
 }
 
 impl axum::extract::FromRef<AppState> for AuthVerifier {
@@ -31,20 +131,14 @@ async fn main() -> anyhow::Result<()> {
     let config = ServiceConfig::from_env(3002)?;
     let state = AppState {
         auth: AuthVerifier::from_env()?,
+        bus: NatsChatBus::connect(&config.nats_url, NatsChatBusOptions::default()).await?,
+        events: ConversationEventRegistry::default(),
         repo: SurrealChatRepository::connect(
             &config.surreal_url,
             &config.surreal_namespace,
             &config.surreal_database,
             &config.surreal_user,
             &config.surreal_password,
-        )
-        .await?,
-        bus: NatsChatBus::connect(
-            &config.nats_url,
-            NatsChatBusOptions {
-                subscribe_events: true,
-                ..NatsChatBusOptions::default()
-            },
         )
         .await?,
     };
@@ -73,21 +167,32 @@ async fn chat_ws(
     Ok(ws.on_upgrade(move |socket| run_socket(socket, auth, state)))
 }
 
-async fn run_socket(mut socket: WebSocket, auth: AuthContext, state: AppState) {
+async fn run_socket(socket: WebSocket, auth: AuthContext, state: AppState) {
     tracing::info!(user_id = %auth.user_id, tenant_id = %auth.tenant_id, "websocket connected");
-    let mut subscriptions = HashSet::<String>::new();
+    let mut subscriptions = HashMap::<String, ActiveSubscription>::new();
     let mut last_sent_sequences = HashMap::<String, u64>::new();
-    let mut events = state.bus.subscribe_events();
+    let (mut socket_sender, mut socket_receiver) = socket.split();
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Message>(ws_outbound_queue_size());
+    let (socket_event_tx, mut socket_event_rx) =
+        mpsc::channel::<SocketEvent>(ws_event_queue_size());
+    let writer = tokio::spawn(async move {
+        while let Some(message) = outbound_rx.recv().await {
+            if socket_sender.send(message).await.is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         tokio::select! {
-            inbound = socket.recv() => {
+            inbound = socket_receiver.next() => {
                 match inbound {
                     Some(Ok(Message::Text(text))) => {
                         if !handle_client_message(
-                            &mut socket,
+                            &outbound_tx,
                             &mut subscriptions,
                             &mut last_sent_sequences,
+                            &socket_event_tx,
                             &text,
                             &auth,
                             &state,
@@ -97,7 +202,7 @@ async fn run_socket(mut socket: WebSocket, auth: AuthContext, state: AppState) {
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(bytes))) => {
-                        if socket.send(Message::Pong(bytes)).await.is_err() {
+                        if send_ws_message(&outbound_tx, Message::Pong(bytes)).is_err() {
                             break;
                         }
                     }
@@ -108,14 +213,36 @@ async fn run_socket(mut socket: WebSocket, auth: AuthContext, state: AppState) {
                     }
                 }
             }
-            event = events.recv() => {
-                let Ok(event) = event else {
-                    continue;
+            event = socket_event_rx.recv() => {
+                let event = match event {
+                    Some(SocketEvent::Event(event)) => event,
+                    Some(SocketEvent::Lagged { conversation_id, skipped }) => {
+                        tracing::warn!(
+                            skipped,
+                            user_id = %auth.user_id,
+                            tenant_id = %auth.tenant_id,
+                            conversation_id,
+                            "websocket conversation event receiver lagged; requesting resync"
+                        );
+                        if send_server_message(
+                            &outbound_tx,
+                            &ServerWsMessage::ResyncRequired {
+                                conversation_id: conversation_id.clone(),
+                            },
+                        )
+                        .is_err()
+                        {
+                            break;
+                        }
+                        last_sent_sequences.remove(&conversation_id);
+                        continue;
+                    }
+                    None => break,
                 };
                 if event.envelope.tenant_id != auth.tenant_id {
                     continue;
                 }
-                if !subscriptions.contains(&event.envelope.conversation_id) {
+                if !subscriptions.contains_key(&event.envelope.conversation_id) {
                     continue;
                 }
                 if event.envelope.user_id != auth.user_id {
@@ -135,7 +262,12 @@ async fn run_socket(mut socket: WebSocket, auth: AuthContext, state: AppState) {
                     event_id: event.event_id,
                     event: event.envelope.event,
                 };
-                if send_json(&mut socket, &msg).await.is_err() {
+                if send_server_message(&outbound_tx, &msg).is_err() {
+                    tracing::warn!(
+                        user_id = %auth.user_id,
+                        conversation_id = %event.envelope.conversation_id,
+                        "websocket outbound queue full or closed; disconnecting slow client"
+                    );
                     break;
                 }
                 last_sent_sequences.insert(msg_conversation_id(&msg), sequence);
@@ -143,13 +275,20 @@ async fn run_socket(mut socket: WebSocket, auth: AuthContext, state: AppState) {
         }
     }
 
+    for (_, subscription) in subscriptions {
+        subscription.task.abort();
+    }
+    drop(outbound_tx);
+    writer.abort();
+    let _ = writer.await;
     tracing::info!(user_id = %auth.user_id, "websocket disconnected");
 }
 
 async fn handle_client_message(
-    socket: &mut WebSocket,
-    subscriptions: &mut HashSet<String>,
+    outbound: &mpsc::Sender<Message>,
+    subscriptions: &mut HashMap<String, ActiveSubscription>,
     last_sent_sequences: &mut HashMap<String, u64>,
+    socket_events: &mpsc::Sender<SocketEvent>,
     text: &str,
     auth: &AuthContext,
     state: &AppState,
@@ -167,17 +306,45 @@ async fn handle_client_message(
             {
                 Ok(conversation) => conversation,
                 Err(_) => {
-                    return send_json(
-                        socket,
+                    return send_server_message(
+                        outbound,
                         &ServerWsMessage::Error {
                             code: "not_found".to_owned(),
                             message: "conversation not found".to_owned(),
                         },
                     )
-                    .await
                     .is_ok();
                 }
             };
+
+            if !subscriptions.contains_key(&conversation_id) {
+                let subscription = match subscribe_socket_to_conversation(
+                    state,
+                    auth,
+                    &conversation_id,
+                    socket_events,
+                )
+                .await
+                {
+                    Ok(subscription) => subscription,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            conversation_id,
+                            "failed to subscribe websocket to conversation events"
+                        );
+                        return send_server_message(
+                            outbound,
+                            &ServerWsMessage::Error {
+                                code: "subscribe_failed".to_owned(),
+                                message: "failed to subscribe to conversation events".to_owned(),
+                            },
+                        )
+                        .is_ok();
+                    }
+                };
+                subscriptions.insert(conversation_id.clone(), subscription);
+            }
 
             let replay_plan = match build_replay_plan(
                 state,
@@ -190,32 +357,31 @@ async fn handle_client_message(
             {
                 Ok(plan) => plan,
                 Err(ReplayDecisionError::ResyncRequired) => {
-                    return send_json(socket, &ServerWsMessage::ResyncRequired { conversation_id })
-                        .await
-                        .is_ok();
+                    return send_server_message(
+                        outbound,
+                        &ServerWsMessage::ResyncRequired { conversation_id },
+                    )
+                    .is_ok();
                 }
                 Err(ReplayDecisionError::Internal(error)) => {
                     tracing::warn!(%error, conversation_id, "failed to prepare websocket replay");
-                    return send_json(
-                        socket,
+                    return send_server_message(
+                        outbound,
                         &ServerWsMessage::Error {
                             code: "replay_failed".to_owned(),
                             message: "failed to prepare websocket replay".to_owned(),
                         },
                     )
-                    .await
                     .is_ok();
                 }
             };
 
-            subscriptions.insert(conversation_id.clone());
-            if send_json(
-                socket,
+            if send_server_message(
+                outbound,
                 &ServerWsMessage::Subscribed {
                     conversation_id: conversation_id.clone(),
                 },
             )
-            .await
             .is_err()
             {
                 return false;
@@ -234,7 +400,7 @@ async fn handle_client_message(
                     event_id: event.event_id,
                     event: event.envelope.event,
                 };
-                if send_json(socket, &msg).await.is_err() {
+                if send_server_message(outbound, &msg).is_err() {
                     return false;
                 }
                 last_sent = sequence;
@@ -243,22 +409,65 @@ async fn handle_client_message(
             true
         }
         Ok(ClientWsMessage::UnsubscribeConversation { conversation_id }) => {
-            subscriptions.remove(&conversation_id);
+            if let Some(subscription) = subscriptions.remove(&conversation_id) {
+                subscription.task.abort();
+            }
+            last_sent_sequences.remove(&conversation_id);
             true
         }
-        Ok(ClientWsMessage::Ping { nonce }) => send_json(socket, &ServerWsMessage::Pong { nonce })
-            .await
-            .is_ok(),
-        Err(_) => send_json(
-            socket,
+        Ok(ClientWsMessage::Ping { nonce }) => {
+            send_server_message(outbound, &ServerWsMessage::Pong { nonce }).is_ok()
+        }
+        Err(_) => send_server_message(
+            outbound,
             &ServerWsMessage::Error {
                 code: "invalid_message".to_owned(),
                 message: "invalid websocket message".to_owned(),
             },
         )
-        .await
         .is_ok(),
     }
+}
+
+async fn subscribe_socket_to_conversation(
+    state: &AppState,
+    auth: &AuthContext,
+    conversation_id: &str,
+    socket_events: &mpsc::Sender<SocketEvent>,
+) -> Result<ActiveSubscription, delphi_nats::ChatBusError> {
+    let subscription = state
+        .events
+        .subscribe(&state.bus, &auth.tenant_id, conversation_id)
+        .await?;
+    let ConversationEventSubscription { hub, mut receiver } = subscription;
+    let sender = socket_events.clone();
+    let conversation_id = conversation_id.to_owned();
+    let task = tokio::spawn(async move {
+        let _hub = hub;
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if sender.send(SocketEvent::Event(event)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    if sender
+                        .send(SocketEvent::Lagged {
+                            conversation_id: conversation_id.clone(),
+                            skipped,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    Ok(ActiveSubscription { task })
 }
 
 #[derive(Debug)]
@@ -457,9 +666,43 @@ fn msg_conversation_id(msg: &ServerWsMessage) -> String {
     }
 }
 
-async fn send_json(socket: &mut WebSocket, msg: &ServerWsMessage) -> Result<(), axum::Error> {
+fn send_server_message(
+    outbound: &mpsc::Sender<Message>,
+    msg: &ServerWsMessage,
+) -> Result<(), mpsc::error::TrySendError<Message>> {
     let text = serde_json::to_string(msg).expect("server websocket message serializes");
-    socket.send(Message::Text(text.into())).await
+    send_ws_message(outbound, Message::Text(text.into()))
+}
+
+fn send_ws_message(
+    outbound: &mpsc::Sender<Message>,
+    message: Message,
+) -> Result<(), mpsc::error::TrySendError<Message>> {
+    outbound.try_send(message)
+}
+
+fn ws_outbound_queue_size() -> usize {
+    std::env::var("REALTIME_WS_OUTBOUND_QUEUE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WS_OUTBOUND_QUEUE_SIZE)
+}
+
+fn ws_event_queue_size() -> usize {
+    std::env::var("REALTIME_WS_EVENT_QUEUE_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_WS_EVENT_QUEUE_SIZE)
+}
+
+fn conversation_event_buffer_size() -> usize {
+    std::env::var("REALTIME_CONVERSATION_EVENT_BUFFER_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CONVERSATION_EVENT_BUFFER_SIZE)
 }
 
 struct WsAuthError;

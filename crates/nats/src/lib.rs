@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 const CHAT_COMMANDS_STREAM: &str = "CHAT_COMMANDS";
 const CHAT_EVENTS_STREAM: &str = "CHAT_EVENTS";
@@ -143,6 +143,11 @@ pub trait ChatBus: Clone + Send + Sync + 'static {
         end_seq: u64,
     ) -> Result<Vec<SequencedChatEvent>, ChatBusError>;
     async fn latest_event_sequence(&self) -> Result<u64, ChatBusError>;
+    async fn subscribe_conversation_events(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<mpsc::Receiver<SequencedChatEvent>, ChatBusError>;
     async fn publish_stop(
         &self,
         worker_id: &str,
@@ -577,6 +582,71 @@ impl ChatBus for NatsChatBus {
         Ok(info.state.last_sequence)
     }
 
+    async fn subscribe_conversation_events(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<mpsc::Receiver<SequencedChatEvent>, ChatBusError> {
+        let stream = self
+            .js
+            .get_or_create_stream(event_stream_config())
+            .await
+            .map_err(|error| ChatBusError::Payload(format!("open event stream: {error}")))?;
+        let subject = ChatSubjects::events(tenant_id, conversation_id);
+        let consumer: PushConsumer = stream
+            .create_consumer(consumer::push::Config {
+                deliver_subject: self.client.new_inbox(),
+                deliver_policy: DeliverPolicy::New,
+                ack_policy: AckPolicy::None,
+                inactive_threshold: Duration::from_secs(60),
+                filter_subject: subject.clone(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                ChatBusError::Payload(format!("create conversation event consumer: {error}"))
+            })?;
+        let mut messages = consumer.messages().await.map_err(|error| {
+            ChatBusError::Payload(format!("subscribe conversation events: {error}"))
+        })?;
+        let (sender, receiver) = mpsc::channel(1024);
+        let tenant_id = tenant_id.to_owned();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            while let Some(message) = messages.next().await {
+                let Ok(message) = message else {
+                    tracing::warn!(?message, "conversation event consumer receive failed");
+                    continue;
+                };
+                let sequence = match message.info() {
+                    Ok(info) => info.stream_sequence,
+                    Err(error) => {
+                        tracing::warn!(%error, "conversation event missing jetstream metadata");
+                        continue;
+                    }
+                };
+                let mut event = match serde_json::from_slice::<SequencedChatEvent>(&message.payload)
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        tracing::warn!(%error, "invalid conversation event payload");
+                        continue;
+                    }
+                };
+                if event.envelope.tenant_id != tenant_id
+                    || event.envelope.conversation_id != conversation_id
+                {
+                    continue;
+                }
+                event.event_id = sequence.to_string();
+                if sender.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(receiver)
+    }
+
     async fn publish_stop(
         &self,
         worker_id: &str,
@@ -840,6 +910,35 @@ impl ChatBus for InMemoryChatBus {
 
     async fn latest_event_sequence(&self) -> Result<u64, ChatBusError> {
         Ok(*self.inner.next_event_sequence.lock().await)
+    }
+
+    async fn subscribe_conversation_events(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<mpsc::Receiver<SequencedChatEvent>, ChatBusError> {
+        let mut events = self.inner.events.subscribe();
+        let (sender, receiver) = mpsc::channel(1024);
+        let tenant_id = tenant_id.to_owned();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event)
+                        if event.envelope.tenant_id == tenant_id
+                            && event.envelope.conversation_id == conversation_id =>
+                    {
+                        if sender.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(receiver)
     }
 
     async fn publish_stop(
