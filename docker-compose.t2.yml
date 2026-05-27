@@ -15,10 +15,14 @@ services:
       - ./ops/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./ops/traefik/dynamic/routes.yml:/etc/traefik/dynamic/routes.yml:ro
     depends_on:
-      - oauth2-proxy
-      - api-service
-      - realtime-service
-      - frontend
+      oauth2-proxy:
+        condition: service_started
+      api-service:
+        condition: service_healthy
+      realtime-service:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
 
   keycloak:
     image: quay.io/keycloak/keycloak:26.4
@@ -39,11 +43,28 @@ services:
       - keycloak-data:/opt/keycloak/data/h2
     ports:
       - "18081:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/bin/bash",
+          "-ec",
+          "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
 
   redis:
     image: redis:8-alpine
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   oauth2-proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.12.0
@@ -55,8 +76,10 @@ services:
       - ./ops/oauth2-proxy/oauth2-proxy.cfg:/etc/oauth2-proxy/oauth2-proxy.cfg:ro
       - ./ops/oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
     depends_on:
-      - keycloak
-      - redis
+      keycloak:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   nats:
     image: nats:2
@@ -97,10 +120,18 @@ services:
       CHAT_REPLAY_TTL_SECONDS: "1500"
       CHAT_COMMAND_ACK_WAIT_SECONDS: "120"
     depends_on:
-      - nats
-      - surrealdb
+      nats:
+        condition: service_started
+      surrealdb:
+        condition: service_started
     ports:
       - "3001:3001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3001/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   realtime-service:
     <<: *service-image
@@ -126,10 +157,18 @@ services:
       REALTIME_WS_EVENT_QUEUE_SIZE: "1024"
       REALTIME_CONVERSATION_EVENT_BUFFER_SIZE: "1024"
     depends_on:
-      - nats
-      - surrealdb
+      nats:
+        condition: service_started
+      surrealdb:
+        condition: service_started
     ports:
       - "3002:3002"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3002/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   chat-worker:
     <<: *service-image
@@ -158,9 +197,18 @@ services:
       DELPHI_TITLE_MODEL: ${DELPHI_TITLE_MODEL:-Qwen2.5-0.5B-Instruct}
       DELPHI_TITLE_API_KEY: ${DELPHI_TITLE_API_KEY:-sk-noauth}
     depends_on:
-      - nats
-      - surrealdb
-      - title-llm
+      nats:
+        condition: service_started
+      surrealdb:
+        condition: service_started
+      title-llm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3003/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   title-llm:
     image: ghcr.io/ggml-org/llama.cpp:server
@@ -193,6 +241,12 @@ services:
       dockerfile: frontend/Dockerfile
     expose:
       - "80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
 volumes:
   keycloak-data:

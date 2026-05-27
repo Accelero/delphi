@@ -1,3 +1,4 @@
+use axum::{routing::get, Router};
 use chrono::Utc;
 use delphi_config::{init_tracing, ServiceConfig};
 use delphi_contracts::{
@@ -62,6 +63,13 @@ async fn main() -> anyhow::Result<()> {
         title_llm,
         worker_id,
     };
+    let health_listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
+    tokio::spawn(async move {
+        let app = Router::new().route("/healthz", get(healthz));
+        if let Err(error) = axum::serve(health_listener, app).await {
+            tracing::error!(?error, "chat-worker health server failed");
+        }
+    });
     let mut commands = state.bus.subscribe_commands();
 
     loop {
@@ -73,6 +81,10 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+}
+
+async fn healthz() -> &'static str {
+    "ok"
 }
 
 async fn run_turn(state: WorkerState, command: TurnRequested) -> anyhow::Result<()> {

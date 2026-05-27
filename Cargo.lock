@@ -546,6 +546,7 @@ name = "chat-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chrono",
  "delphi-config",
  "delphi-contracts",
