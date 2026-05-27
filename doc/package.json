@@ -1,0 +1,33 @@
+{
+  "name": "delphi-docs",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@terrastruct/d2": "^0.1.33",
+    "@types/mdx": "latest",
+    "fumadocs-core": "latest",
+    "fumadocs-ui": "latest",
+    "github-slugger": "latest",
+    "hast-util-to-html": "latest",
+    "mdast-util-from-markdown": "latest",
+    "mdast-util-gfm": "latest",
+    "mdast-util-to-hast": "latest",
+    "micromark-extension-gfm": "latest",
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "tailwindcss": "latest",
+    "typescript": "latest"
+  }
+}

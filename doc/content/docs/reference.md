@@ -1,3 +1,8 @@
+---
+title: Source Reference
+description: Generated source documentation entry points for Delphi.
+---
+
 # Source Reference
 
 Source reference documentation is generated with the native toolchains and is

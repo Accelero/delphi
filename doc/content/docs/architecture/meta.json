@@ -1,0 +1,9 @@
+{
+  "title": "Architecture",
+  "pages": [
+    "chat-system",
+    "chat-request-flow",
+    "chat-failure-analysis",
+    "alteration"
+  ]
+}

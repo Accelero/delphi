@@ -7,6 +7,13 @@
 /tests/playwright-report/
 /doc/.venv/
 /doc/site/
+/doc/.next/
+/doc/.source/
+/doc/.turbo/
+/doc/.vercel/
+/doc/.cache/
+/doc/node_modules/
+/doc/out/
 /.uv-cache/
 *.log
 *.tsbuildinfo

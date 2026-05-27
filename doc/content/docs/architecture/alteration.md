@@ -1,19 +1,25 @@
-# Alteration Notes
+---
+title: Design Notes
+description: Open design decisions and architecture refinements for Delphi chat.
+---
 
-These are walkthrough decisions to apply to the main architecture and gap
-analysis after the current chat workflow review is complete.
+# Design Notes
+
+These are open design decisions and architecture refinements for the current
+Delphi chat workflow.
 
 ## Transient Turn State In NATS KV
 
-Decision under review:
+Current implementation:
 
 - Move transient active-turn state out of SurrealDB lifecycle rows and into
   `CHAT_LOCKS`.
-- Treat `CHAT_LOCKS` as the authority for `requested`, `running`, active
-  ownership, lease expiry, bounded prompt payload/reference, and stop flags.
+- Treat `CHAT_LOCKS` as the authority for `requested`, `running`, terminal
+  handoff markers, active ownership, lease expiry, bounded prompt
+  payload/reference, and stop flags.
 - Treat SurrealDB as the authority for visible outcomes: committed messages,
   interrupted partial assistant messages, conversation metadata, and optional
-  failure markers.
+  terminal turn audit markers.
 
 Motivation:
 
@@ -22,7 +28,7 @@ Motivation:
 - Let abandoned requested/running work expire through the KV lease/TTL.
 - Keep the hot coordination path in NATS while DB remains committed truth.
 
-Proposed submit flow:
+Submit flow:
 
 1. API authenticates and authorizes conversation access.
 2. API validates `parent_message_id` against the committed DB tail.
@@ -36,15 +42,21 @@ Requested lock payload:
 ```json
 {
   "turn_id": "01...",
+  "user_id": "user-a",
   "user_message_id": "01...",
   "parent_message_id": "01...",
   "text": "bounded prompt text for now",
+  "bearer_subject": "user-a",
   "state": "requested",
   "worker_id": null,
   "stop_requested": false,
   "stop_requested_by": null,
   "stop_requested_at": null,
-  "lease_expires_at": "2026-05-27T10:00:00Z"
+  "lease_expires_at": "2026-05-27T10:00:00Z",
+  "assistant_message_id": null,
+  "terminal_content": null,
+  "terminal_error": null,
+  "terminal_event_published": false
 }
 ```
 
@@ -55,6 +67,10 @@ Notes:
 - Later, large prompts should use `text_ref` instead of inline text.
 - `chat_turn` can remain as optional audit/debug state, but should not be
   required for requested/running coordination.
+- After DB commit, the worker marks the KV state terminal before publishing the
+  terminal chat event. Redelivery can then ACK without rerunning the provider
+  and can publish a missing terminal event if the previous worker crashed in
+  that window.
 - On worker crash, stale running state should converge to error/resync and let
   the user reprompt, not silently regenerate a different answer.
 
