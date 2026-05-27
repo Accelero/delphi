@@ -61,47 +61,47 @@ Residual points:
 ~~The plan requires durable `chat_turn` lifecycle rows for `requested`,
 `running`, `committed`, `interrupted`, and `failed`.~~
 
-Implemented for the normal turn path: API creates/updates
-`chat_turn(status=requested)`, worker marks `running`, commits mark
-`committed` or `interrupted`, and failed pre-commit paths mark `failed` with
-an error string.
+Superseded by the KV ownership model: `requested` and `running` now live in
+NATS KV `CHAT_LOCKS` with the bounded prompt payload, worker ownership, lease,
+stop flags, and terminal handoff markers. SurrealDB `chat_turn` is terminal
+only: `committed`, `interrupted`, or `failed`.
 
 Residual points:
 
-- There is no recovery/reconciler job for stale `requested` or `running` rows.
 - Turn state is not exposed through admin/debug APIs yet.
-- Redelivery behavior is not fully proven against durable turn state. A
-  redelivered command should consult the stored turn state before repeating
-  provider side effects or producing duplicate terminal events.
+- Full-stack tests still need to prove the KV ownership path under real
+  redelivery.
 
 ### Crash Recovery
 
-Lock TTL, lock renewal, and JetStream redelivery exist. A reconciler does not.
+~~Lock TTL, lock renewal, and JetStream redelivery exist. A reconciler does not.~~
 
-Open points:
+Implemented for the chat-worker path: redelivery checks `CHAT_LOCKS` before any
+provider call. Fresh `running` turns are not rerun; stale `running` turns are
+marked `failed`, write terminal failure state, publish cleanup, ACK, and
+release. Terminal KV markers (`committed`, `interrupted`, `failed`) allow a
+redelivered command to publish any missing terminal event, ACK, and release
+without rerunning the provider.
 
-- Add a stale-turn recovery path that marks abandoned turns failed/cancelled.
-- Publish `clear` when a turn cannot be completed after worker death.
-- Add tests for worker crash before provider start, mid-stream, and after DB
-  commit but before final ACK.
-- Make crash cases converge without wedged locks, permanent streaming UI, or
-  ambiguous committed state.
+Residual points:
+
+- Add admin/debug views or runbooks for inspecting terminal/stuck turn state.
 
 ### Idempotency And Redelivery
 
-NATS JetStream gives at-least-once delivery. Commands use deterministic NATS
+~~NATS JetStream gives at-least-once delivery. Commands use deterministic NATS
 message IDs and worker progress ACKs, and message IDs are stable ULIDs, but
-the full redelivery state machine is not yet proven.
+the full redelivery state machine is not yet proven.~~
 
-Open points:
+Implemented: `TurnRequested` is now a small wakeup; the prompt payload and
+ownership state live in `CHAT_LOCKS`. The worker loads the KV state before
+claiming/running, transitions `requested -> running` with CAS, renews the
+lease while streaming, writes terminal Surreal state, marks KV terminal before
+publishing the terminal event, ACKs the command, then releases the KV marker.
 
-- Worker should check `chat_turn` before executing a redelivered command.
-- A terminal `committed`, `interrupted`, or `failed` turn should not re-run the
-  provider.
-- Duplicate commits should converge on the same persisted visible history or
-  return a clear stale/resync path.
-- Add integration tests for redelivery after provider start, after DB commit,
-  and before final JetStream ACK.
+Residual points:
+
+- None for implementation. Integration tests remain tracked under Tests.
 
 ### Realtime Fanout
 
@@ -290,10 +290,11 @@ Intentional difference:
    Done; remaining work is full-stack e2e coverage.
 2. ~~Add realtime backpressure behavior and `resync_required` on lag.~~ Done;
    remaining work is full-stack e2e coverage and tuning.
-3. Add stale-turn recovery and redelivery/idempotency handling around
-   `chat_turn`.
-4. ~~Decide and implement the `chat_turn` lifecycle table.~~ Done for the
-   normal path; remaining work is stale-turn recovery and redelivery behavior.
+3. ~~Add stale-turn recovery and redelivery/idempotency handling around
+   active chat turns.~~ Done via the NATS KV ownership state machine; remaining
+   work is integration coverage.
+4. ~~Decide and implement turn lifecycle ownership.~~ Done: `requested` and
+   `running` live in NATS KV, while terminal outcomes live in SurrealDB.
 5. Port old frontend scroll pinning and richer markdown/citation rendering.
 6. Add RAG/citations and title generation after the transport path is stable.
 7. Harden operations with dependency readiness, metrics, tracing, NATS auth
@@ -306,11 +307,12 @@ Intentional difference:
 ## Highest Risks
 
 - Reconnect and late-join correctness are not yet proven by tests.
-- Worker crash/redelivery semantics are not yet proven by tests.
+- Worker crash/redelivery semantics are implemented but not yet proven by
+  full-stack tests.
 - Realtime fanout now avoids wildcard event consumption, but multi-replica
   behavior and consumer-count limits still need load testing.
-- `chat_turn` exists, but stale-turn recovery and redelivery behavior are not
-  proven yet.
+- `chat_turn` is terminal-only; active-turn recovery now lives in NATS KV but
+  still needs full-stack crash tests.
 - Frontend parity is incomplete for citations, titles, rich rendering, and
   route/query behavior.
 - RAG citations, source grounding, and title updates are still absent, so the
