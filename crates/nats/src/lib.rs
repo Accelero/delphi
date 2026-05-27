@@ -39,33 +39,67 @@ pub enum ChatBusError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatLock {
     pub tenant_id: String,
+    pub user_id: String,
     pub conversation_id: String,
     pub turn_id: String,
+    pub user_message_id: String,
+    pub text: String,
+    pub parent_message_id: Option<String>,
+    pub bearer_subject: String,
     pub state: ChatLockState,
     pub worker_id: Option<String>,
     pub stop_requested: bool,
     pub stop_requested_by: Option<String>,
     pub stop_requested_at: Option<DateTime<Utc>>,
     pub lease_expires_at: DateTime<Utc>,
+    pub assistant_message_id: Option<String>,
+    pub terminal_content: Option<String>,
+    pub terminal_error: Option<String>,
+    pub terminal_event_published: bool,
 }
 
 impl ChatLock {
-    pub fn requested(tenant_id: String, conversation_id: String, turn_id: String) -> Self {
+    pub fn requested(
+        tenant_id: String,
+        user_id: String,
+        conversation_id: String,
+        turn_id: String,
+        user_message_id: String,
+        text: String,
+        parent_message_id: Option<String>,
+        bearer_subject: String,
+    ) -> Self {
         Self {
             tenant_id,
+            user_id,
             conversation_id,
             turn_id,
+            user_message_id,
+            text,
+            parent_message_id,
+            bearer_subject,
             state: ChatLockState::Requested,
             worker_id: None,
             stop_requested: false,
             stop_requested_by: None,
             stop_requested_at: None,
             lease_expires_at: lock_expires_at(),
+            assistant_message_id: None,
+            terminal_content: None,
+            terminal_error: None,
+            terminal_event_published: false,
         }
     }
 
-    fn is_expired(&self) -> bool {
+    pub fn is_expired(&self) -> bool {
         self.lease_expires_at <= Utc::now()
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            ChatLockState::Committed | ChatLockState::Interrupted | ChatLockState::Failed
+        )
     }
 }
 
@@ -74,6 +108,9 @@ impl ChatLock {
 pub enum ChatLockState {
     Requested,
     Running,
+    Committed,
+    Interrupted,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,6 +136,11 @@ pub struct ReplayTurn {
 #[async_trait]
 pub trait ChatBus: Clone + Send + Sync + 'static {
     async fn acquire_lock(&self, lock: ChatLock) -> Result<(), ChatBusError>;
+    async fn load_lock(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ChatLock>, ChatBusError>;
     async fn claim_lock(
         &self,
         tenant_id: &str,
@@ -106,6 +148,20 @@ pub trait ChatBus: Clone + Send + Sync + 'static {
         turn_id: &str,
         worker_id: &str,
     ) -> Result<ChatLock, ChatBusError>;
+    async fn mark_lock_terminal(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        worker_id: Option<&str>,
+        terminal: ChatTerminalUpdate,
+    ) -> Result<ChatLock, ChatBusError>;
+    async fn mark_terminal_event_published(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<(), ChatBusError>;
     async fn request_stop(
         &self,
         tenant_id: &str,
@@ -158,6 +214,14 @@ pub trait ChatBus: Clone + Send + Sync + 'static {
     fn subscribe_events(&self) -> broadcast::Receiver<SequencedChatEvent>;
     fn subscribe_commands(&self) -> broadcast::Receiver<TurnRequested>;
     fn subscribe_stops(&self) -> broadcast::Receiver<StopSignal>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTerminalUpdate {
+    pub state: ChatLockState,
+    pub assistant_message_id: Option<String>,
+    pub content: Option<String>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -383,6 +447,14 @@ impl ChatBus for NatsChatBus {
         acquire_kv_lock(&self.locks, lock).await
     }
 
+    async fn load_lock(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ChatLock>, ChatBusError> {
+        load_kv_lock(&self.locks, tenant_id, conversation_id).await
+    }
+
     async fn claim_lock(
         &self,
         tenant_id: &str,
@@ -391,6 +463,34 @@ impl ChatBus for NatsChatBus {
         worker_id: &str,
     ) -> Result<ChatLock, ChatBusError> {
         claim_kv_lock(&self.locks, tenant_id, conversation_id, turn_id, worker_id).await
+    }
+
+    async fn mark_lock_terminal(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        worker_id: Option<&str>,
+        terminal: ChatTerminalUpdate,
+    ) -> Result<ChatLock, ChatBusError> {
+        mark_kv_lock_terminal(
+            &self.locks,
+            tenant_id,
+            conversation_id,
+            turn_id,
+            worker_id,
+            terminal,
+        )
+        .await
+    }
+
+    async fn mark_terminal_event_published(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<(), ChatBusError> {
+        mark_kv_terminal_event_published(&self.locks, tenant_id, conversation_id, turn_id).await
     }
 
     async fn request_stop(
@@ -739,6 +839,15 @@ impl ChatBus for InMemoryChatBus {
         Ok(())
     }
 
+    async fn load_lock(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ChatLock>, ChatBusError> {
+        let key = ChatSubjects::lock_key(tenant_id, conversation_id);
+        Ok(self.inner.locks.lock().await.get(&key).cloned())
+    }
+
     async fn claim_lock(
         &self,
         tenant_id: &str,
@@ -750,9 +859,16 @@ impl ChatBus for InMemoryChatBus {
         let mut locks = self.inner.locks.lock().await;
         match locks.get_mut(&key) {
             Some(existing) if existing.turn_id == turn_id => {
+                if existing.is_terminal() {
+                    return Ok(existing.clone());
+                }
+                if existing.is_expired() {
+                    return Err(ChatBusError::Payload(
+                        "chat lock payload expired before worker claim".to_owned(),
+                    ));
+                }
                 if existing.state == ChatLockState::Running
                     && existing.worker_id.as_deref() != Some(worker_id)
-                    && !existing.is_expired()
                 {
                     return Err(ChatBusError::InFlight);
                 }
@@ -762,18 +878,57 @@ impl ChatBus for InMemoryChatBus {
                 Ok(existing.clone())
             }
             Some(existing) if !existing.is_expired() => Err(ChatBusError::InFlight),
-            Some(_) | None => {
-                let mut lock = ChatLock::requested(
-                    tenant_id.to_owned(),
-                    conversation_id.to_owned(),
-                    turn_id.to_owned(),
-                );
-                lock.state = ChatLockState::Running;
-                lock.worker_id = Some(worker_id.to_owned());
-                locks.insert(key, lock.clone());
-                Ok(lock)
+            Some(_) | None => Err(ChatBusError::Payload(
+                "chat lock payload missing before worker claim".to_owned(),
+            )),
+        }
+    }
+
+    async fn mark_lock_terminal(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+        worker_id: Option<&str>,
+        terminal: ChatTerminalUpdate,
+    ) -> Result<ChatLock, ChatBusError> {
+        let key = ChatSubjects::lock_key(tenant_id, conversation_id);
+        let mut locks = self.inner.locks.lock().await;
+        let Some(lock) = locks.get_mut(&key) else {
+            return Err(ChatBusError::InFlight);
+        };
+        if lock.turn_id != turn_id {
+            return Err(ChatBusError::InFlight);
+        }
+        if let Some(worker_id) = worker_id {
+            if lock.worker_id.as_deref() != Some(worker_id) {
+                return Err(ChatBusError::InFlight);
             }
         }
+        lock.state = terminal.state;
+        lock.assistant_message_id = terminal.assistant_message_id;
+        lock.terminal_content = terminal.content;
+        lock.terminal_error = terminal.error;
+        lock.terminal_event_published = false;
+        lock.lease_expires_at = lock_expires_at();
+        Ok(lock.clone())
+    }
+
+    async fn mark_terminal_event_published(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<(), ChatBusError> {
+        let key = ChatSubjects::lock_key(tenant_id, conversation_id);
+        let mut locks = self.inner.locks.lock().await;
+        let Some(lock) = locks.get_mut(&key) else {
+            return Ok(());
+        };
+        if lock.turn_id == turn_id && lock.is_terminal() {
+            lock.terminal_event_published = true;
+        }
+        Ok(())
     }
 
     async fn request_stop(
@@ -993,6 +1148,27 @@ async fn acquire_kv_lock(locks: &Store, lock: ChatLock) -> Result<(), ChatBusErr
     create_kv_lock(locks, key, lock).await
 }
 
+async fn load_kv_lock(
+    locks: &Store,
+    tenant_id: &str,
+    conversation_id: &str,
+) -> Result<Option<ChatLock>, ChatBusError> {
+    let key = ChatSubjects::lock_key(tenant_id, conversation_id);
+    let entry = locks
+        .entry(key)
+        .await
+        .map_err(|error| ChatBusError::Payload(format!("read chat lock: {error}")))?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    if entry.operation != Operation::Put {
+        return Ok(None);
+    }
+    serde_json::from_slice::<ChatLock>(&entry.value)
+        .map(Some)
+        .map_err(|error| ChatBusError::Payload(format!("decode chat lock: {error}")))
+}
+
 async fn create_kv_lock(locks: &Store, key: String, lock: ChatLock) -> Result<(), ChatBusError> {
     let payload =
         serde_json::to_vec(&lock).map_err(|error| ChatBusError::Payload(error.to_string()))?;
@@ -1019,39 +1195,20 @@ async fn claim_kv_lock(
             .await
             .map_err(|error| ChatBusError::Payload(format!("read chat lock: {error}")))?;
         let Some(entry) = entry else {
-            let mut lock = ChatLock::requested(
-                tenant_id.to_owned(),
-                conversation_id.to_owned(),
-                turn_id.to_owned(),
-            );
-            lock.state = ChatLockState::Running;
-            lock.worker_id = Some(worker_id.to_owned());
-            let payload = serde_json::to_vec(&lock)
-                .map_err(|error| ChatBusError::Payload(error.to_string()))?;
-            return match locks.create(key.clone(), payload.into()).await {
-                Ok(_) => Ok(lock),
-                Err(error) if error.kind() == kv::CreateErrorKind::AlreadyExists => continue,
-                Err(error) => Err(ChatBusError::Payload(format!("create chat lock: {error}"))),
-            };
+            return Err(ChatBusError::Payload(
+                "chat lock payload missing before worker claim".to_owned(),
+            ));
         };
         if entry.operation != Operation::Put {
-            let mut lock = ChatLock::requested(
-                tenant_id.to_owned(),
-                conversation_id.to_owned(),
-                turn_id.to_owned(),
-            );
-            lock.state = ChatLockState::Running;
-            lock.worker_id = Some(worker_id.to_owned());
-            let payload = serde_json::to_vec(&lock)
-                .map_err(|error| ChatBusError::Payload(error.to_string()))?;
-            return match locks.create(key.clone(), payload.into()).await {
-                Ok(_) => Ok(lock),
-                Err(error) if error.kind() == kv::CreateErrorKind::AlreadyExists => continue,
-                Err(error) => Err(ChatBusError::Payload(format!("create chat lock: {error}"))),
-            };
+            return Err(ChatBusError::Payload(
+                "chat lock payload missing before worker claim".to_owned(),
+            ));
         }
         let mut lock = serde_json::from_slice::<ChatLock>(&entry.value)
             .map_err(|error| ChatBusError::Payload(format!("decode chat lock: {error}")))?;
+        if lock.turn_id == turn_id && lock.is_terminal() {
+            return Ok(lock);
+        }
         if lock.turn_id != turn_id && !lock.is_expired() {
             return Err(ChatBusError::InFlight);
         }
@@ -1062,12 +1219,13 @@ async fn claim_kv_lock(
         {
             return Err(ChatBusError::InFlight);
         }
-        if lock.turn_id != turn_id || lock.is_expired() {
-            lock = ChatLock::requested(
-                tenant_id.to_owned(),
-                conversation_id.to_owned(),
-                turn_id.to_owned(),
-            );
+        if lock.turn_id != turn_id {
+            return Err(ChatBusError::InFlight);
+        }
+        if lock.is_expired() {
+            return Err(ChatBusError::Payload(
+                "chat lock payload expired before worker claim".to_owned(),
+            ));
         }
         lock.state = ChatLockState::Running;
         lock.worker_id = Some(worker_id.to_owned());
@@ -1085,6 +1243,106 @@ async fn claim_kv_lock(
     }
     Err(ChatBusError::Payload(
         "claim chat lock CAS retry limit exceeded".to_owned(),
+    ))
+}
+
+async fn mark_kv_lock_terminal(
+    locks: &Store,
+    tenant_id: &str,
+    conversation_id: &str,
+    turn_id: &str,
+    worker_id: Option<&str>,
+    terminal: ChatTerminalUpdate,
+) -> Result<ChatLock, ChatBusError> {
+    let key = ChatSubjects::lock_key(tenant_id, conversation_id);
+    for _ in 0..8 {
+        let entry = locks
+            .entry(key.clone())
+            .await
+            .map_err(|error| ChatBusError::Payload(format!("read chat lock: {error}")))?;
+        let Some(entry) = entry else {
+            return Err(ChatBusError::InFlight);
+        };
+        if entry.operation != Operation::Put {
+            return Err(ChatBusError::InFlight);
+        }
+        let mut lock = serde_json::from_slice::<ChatLock>(&entry.value)
+            .map_err(|error| ChatBusError::Payload(format!("decode chat lock: {error}")))?;
+        if lock.turn_id != turn_id {
+            return Err(ChatBusError::InFlight);
+        }
+        if let Some(worker_id) = worker_id {
+            if lock.worker_id.as_deref() != Some(worker_id) {
+                return Err(ChatBusError::InFlight);
+            }
+        }
+        lock.state = terminal.state;
+        lock.assistant_message_id = terminal.assistant_message_id.clone();
+        lock.terminal_content = terminal.content.clone();
+        lock.terminal_error = terminal.error.clone();
+        lock.terminal_event_published = false;
+        lock.lease_expires_at = lock_expires_at();
+        let payload =
+            serde_json::to_vec(&lock).map_err(|error| ChatBusError::Payload(error.to_string()))?;
+        match locks
+            .update(key.clone(), payload.into(), entry.revision)
+            .await
+        {
+            Ok(_) => return Ok(lock),
+            Err(error) if error.kind() == UpdateErrorKind::WrongLastRevision => continue,
+            Err(error) => {
+                return Err(ChatBusError::Payload(format!(
+                    "mark terminal chat lock: {error}"
+                )))
+            }
+        }
+    }
+    Err(ChatBusError::Payload(
+        "mark terminal chat lock CAS retry limit exceeded".to_owned(),
+    ))
+}
+
+async fn mark_kv_terminal_event_published(
+    locks: &Store,
+    tenant_id: &str,
+    conversation_id: &str,
+    turn_id: &str,
+) -> Result<(), ChatBusError> {
+    let key = ChatSubjects::lock_key(tenant_id, conversation_id);
+    for _ in 0..8 {
+        let entry = locks
+            .entry(key.clone())
+            .await
+            .map_err(|error| ChatBusError::Payload(format!("read chat lock: {error}")))?;
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        if entry.operation != Operation::Put {
+            return Ok(());
+        }
+        let mut lock = serde_json::from_slice::<ChatLock>(&entry.value)
+            .map_err(|error| ChatBusError::Payload(format!("decode chat lock: {error}")))?;
+        if lock.turn_id != turn_id || !lock.is_terminal() {
+            return Ok(());
+        }
+        lock.terminal_event_published = true;
+        let payload =
+            serde_json::to_vec(&lock).map_err(|error| ChatBusError::Payload(error.to_string()))?;
+        match locks
+            .update(key.clone(), payload.into(), entry.revision)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == UpdateErrorKind::WrongLastRevision => continue,
+            Err(error) => {
+                return Err(ChatBusError::Payload(format!(
+                    "mark terminal event published: {error}"
+                )))
+            }
+        }
+    }
+    Err(ChatBusError::Payload(
+        "mark terminal event published CAS retry limit exceeded".to_owned(),
     ))
 }
 
@@ -1420,16 +1678,23 @@ fn command_stream_config() -> StreamConfig {
 mod tests {
     use super::*;
 
+    fn test_lock(turn_id: &str) -> ChatLock {
+        ChatLock::requested(
+            "tenant-a".to_owned(),
+            "user-a".to_owned(),
+            "conv-a".to_owned(),
+            turn_id.to_owned(),
+            format!("user-message-{turn_id}"),
+            "hello".to_owned(),
+            None,
+            "user-a".to_owned(),
+        )
+    }
+
     #[tokio::test]
     async fn in_memory_stop_before_worker_claim_is_preserved_on_claim() {
         let bus = InMemoryChatBus::default();
-        bus.acquire_lock(ChatLock::requested(
-            "tenant-a".to_owned(),
-            "conv-a".to_owned(),
-            "turn-a".to_owned(),
-        ))
-        .await
-        .unwrap();
+        bus.acquire_lock(test_lock("turn-a")).await.unwrap();
 
         let stopped = bus
             .request_stop("tenant-a", "conv-a", "user-a")
@@ -1444,6 +1709,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(claimed.worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(claimed.user_id, "user-a");
+        assert_eq!(claimed.user_message_id, "user-message-turn-a");
+        assert_eq!(claimed.text, "hello");
         assert!(claimed.stop_requested);
         assert!(bus
             .stop_requested("tenant-a", "conv-a", "turn-a")
@@ -1454,13 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_stop_after_worker_claim_routes_to_worker() {
         let bus = InMemoryChatBus::default();
-        bus.acquire_lock(ChatLock::requested(
-            "tenant-a".to_owned(),
-            "conv-a".to_owned(),
-            "turn-a".to_owned(),
-        ))
-        .await
-        .unwrap();
+        bus.acquire_lock(test_lock("turn-a")).await.unwrap();
         bus.claim_lock("tenant-a", "conv-a", "turn-a", "worker-a")
             .await
             .unwrap();
@@ -1477,13 +1739,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_renew_lock_requires_current_worker_owner() {
         let bus = InMemoryChatBus::default();
-        bus.acquire_lock(ChatLock::requested(
-            "tenant-a".to_owned(),
-            "conv-a".to_owned(),
-            "turn-a".to_owned(),
-        ))
-        .await
-        .unwrap();
+        bus.acquire_lock(test_lock("turn-a")).await.unwrap();
         bus.claim_lock("tenant-a", "conv-a", "turn-a", "worker-a")
             .await
             .unwrap();
@@ -1498,5 +1754,42 @@ mod tests {
             .renew_lock("tenant-a", "conv-a", "turn-a", "worker-b")
             .await;
         assert!(matches!(wrong_worker, Err(ChatBusError::InFlight)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_terminal_marker_is_loaded_and_marked_published() {
+        let bus = InMemoryChatBus::default();
+        bus.acquire_lock(test_lock("turn-a")).await.unwrap();
+        bus.claim_lock("tenant-a", "conv-a", "turn-a", "worker-a")
+            .await
+            .unwrap();
+
+        let terminal = bus
+            .mark_lock_terminal(
+                "tenant-a",
+                "conv-a",
+                "turn-a",
+                Some("worker-a"),
+                ChatTerminalUpdate {
+                    state: ChatLockState::Committed,
+                    assistant_message_id: Some("assistant-a".to_owned()),
+                    content: None,
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.state, ChatLockState::Committed);
+        assert_eq!(
+            terminal.assistant_message_id.as_deref(),
+            Some("assistant-a")
+        );
+        assert!(!terminal.terminal_event_published);
+
+        bus.mark_terminal_event_published("tenant-a", "conv-a", "turn-a")
+            .await
+            .unwrap();
+        let loaded = bus.load_lock("tenant-a", "conv-a").await.unwrap().unwrap();
+        assert!(loaded.terminal_event_published);
     }
 }

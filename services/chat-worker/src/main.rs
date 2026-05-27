@@ -5,7 +5,10 @@ use delphi_contracts::{
     TurnRequested, CONTRACT_VERSION,
 };
 use delphi_llm::{llm_from_env, LlmClient, LlmDelta, LlmMessage, Role};
-use delphi_nats::{ChatBus, NatsChatBus, NatsChatBusOptions, StopSignal};
+use delphi_nats::{
+    ChatBus, ChatLock, ChatLockState, ChatTerminalUpdate, NatsChatBus, NatsChatBusOptions,
+    StopSignal,
+};
 use delphi_storage::{ChatRepository, SurrealChatRepository};
 use futures::StreamExt;
 use std::sync::Arc;
@@ -69,6 +72,84 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_turn(state: WorkerState, command: TurnRequested) -> anyhow::Result<()> {
+    let existing = state
+        .bus
+        .load_lock(&command.tenant_id, &command.conversation_id)
+        .await?;
+    let Some(existing) = existing else {
+        publish_failed_turn(
+            &state,
+            &command,
+            &command.user_id,
+            "chat turn payload missing before worker claim".to_owned(),
+        )
+        .await?;
+        state.bus.ack_turn_requested(&command.turn_id).await?;
+        return Ok(());
+    };
+
+    if existing.turn_id != command.turn_id {
+        return Err(anyhow::anyhow!("conversation is owned by a different turn"));
+    }
+
+    if existing.is_terminal() {
+        publish_missing_terminal_event(&state, &command, &existing).await?;
+        state.bus.ack_turn_requested(&command.turn_id).await?;
+        state
+            .bus
+            .release_lock(
+                &command.tenant_id,
+                &command.conversation_id,
+                &command.turn_id,
+            )
+            .await;
+        return Ok(());
+    }
+
+    if existing.state == ChatLockState::Running {
+        if !existing.is_expired() {
+            return Err(anyhow::anyhow!(
+                "chat turn is already running with a fresh lease"
+            ));
+        }
+        let failed = state
+            .bus
+            .mark_lock_terminal(
+                &command.tenant_id,
+                &command.conversation_id,
+                &command.turn_id,
+                None,
+                ChatTerminalUpdate {
+                    state: ChatLockState::Failed,
+                    assistant_message_id: None,
+                    content: None,
+                    error: Some("chat worker lease expired before completion".to_owned()),
+                },
+            )
+            .await?;
+        state
+            .repo
+            .record_turn_failed(
+                &command.tenant_id,
+                &failed.user_id,
+                &command.conversation_id,
+                &command.turn_id,
+                "chat worker lease expired before completion",
+            )
+            .await?;
+        publish_missing_terminal_event(&state, &command, &failed).await?;
+        state.bus.ack_turn_requested(&command.turn_id).await?;
+        state
+            .bus
+            .release_lock(
+                &command.tenant_id,
+                &command.conversation_id,
+                &command.turn_id,
+            )
+            .await;
+        return Ok(());
+    }
+
     let lock = state
         .bus
         .claim_lock(
@@ -79,17 +160,15 @@ async fn run_turn(state: WorkerState, command: TurnRequested) -> anyhow::Result<
         )
         .await?;
 
-    if let Err(error) = state
-        .repo
-        .record_turn_running(
-            &command.tenant_id,
-            &command.user_id,
-            &command.conversation_id,
-            &command.turn_id,
-            &state.worker_id,
-        )
-        .await
-    {
+    let (shutdown_maintenance, maintenance_errors, maintenance_task) =
+        start_turn_maintenance(state.clone(), command.clone());
+
+    let result = drive_turn(state.clone(), command.clone(), lock, maintenance_errors).await;
+    let _ = shutdown_maintenance.send(true);
+    let _ = maintenance_task.await;
+
+    if result.is_ok() {
+        state.bus.ack_turn_requested(&command.turn_id).await?;
         state
             .bus
             .release_lock(
@@ -98,48 +177,91 @@ async fn run_turn(state: WorkerState, command: TurnRequested) -> anyhow::Result<
                 &command.turn_id,
             )
             .await;
-        return Err(error.into());
     }
+    result
+}
 
-    let (shutdown_maintenance, maintenance_errors, maintenance_task) =
-        start_turn_maintenance(state.clone(), command.clone());
-
-    let result = drive_turn(
-        state.clone(),
-        command.clone(),
-        lock.stop_requested,
-        maintenance_errors,
-    )
-    .await;
-    let _ = shutdown_maintenance.send(true);
-    let _ = maintenance_task.await;
-
+async fn publish_missing_terminal_event(
+    state: &WorkerState,
+    command: &TurnRequested,
+    lock: &ChatLock,
+) -> anyhow::Result<()> {
+    if lock.terminal_event_published {
+        return Ok(());
+    }
+    match lock.state {
+        ChatLockState::Committed => {
+            let assistant_message_id = lock
+                .assistant_message_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("committed turn missing assistant message id"))?;
+            publish_event(
+                state,
+                command,
+                ChatEvent::Finish {
+                    assistant_message_id,
+                    finish_reason: FinishReason::Stop,
+                },
+            )
+            .await?;
+        }
+        ChatLockState::Interrupted => {
+            let assistant_message_id = lock
+                .assistant_message_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("interrupted turn missing assistant message id"))?;
+            publish_event(
+                state,
+                command,
+                ChatEvent::Interrupted {
+                    assistant_message_id,
+                    content: lock.terminal_content.clone().unwrap_or_default(),
+                    finish_reason: InterruptReason::UserInterrupted,
+                },
+            )
+            .await?;
+        }
+        ChatLockState::Failed => {
+            publish_event(
+                state,
+                command,
+                ChatEvent::Error {
+                    message: "The assistant failed before the turn could be saved.".to_owned(),
+                },
+            )
+            .await?;
+            publish_event(
+                state,
+                command,
+                ChatEvent::Clear {
+                    reason: ClearReason::FailedBeforeCommit,
+                },
+            )
+            .await?;
+        }
+        ChatLockState::Requested | ChatLockState::Running => return Ok(()),
+    }
     state
         .bus
-        .release_lock(
+        .mark_terminal_event_published(
             &command.tenant_id,
             &command.conversation_id,
             &command.turn_id,
         )
-        .await;
-    state.bus.ack_turn_requested(&command.turn_id).await?;
-    result
+        .await?;
+    Ok(())
 }
 
 async fn drive_turn(
     state: WorkerState,
     command: TurnRequested,
-    initial_stop_requested: bool,
+    lock: ChatLock,
     mut maintenance_errors: watch::Receiver<Option<String>>,
 ) -> anyhow::Result<()> {
     let mut stops = state.bus.subscribe_stops();
     let conversation = state
         .repo
-        .get_conversation(
-            &command.tenant_id,
-            &command.user_id,
-            &command.conversation_id,
-        )
+        .get_conversation(&command.tenant_id, &lock.user_id, &command.conversation_id)
         .await?;
 
     publish_event(
@@ -154,27 +276,33 @@ async fn drive_turn(
         &state,
         &command,
         ChatEvent::UserMessage {
-            id: command.user_message_id.clone(),
-            content: command.text.clone(),
+            id: lock.user_message_id.clone(),
+            content: lock.text.clone(),
         },
     )
     .await?;
 
-    if initial_stop_requested || stop_requested(&state, &mut stops, &command).await? {
-        commit_interrupted_turn(&state, &command, String::new()).await?;
+    if lock.stop_requested || stop_requested(&state, &mut stops, &command).await? {
+        commit_interrupted_turn(&state, &command, &lock, String::new()).await?;
         return Ok(());
     }
 
     let mut assistant_text = String::new();
     let mut stream = match state
         .llm
-        .stream_chat(llm_messages(conversation.messages, &command))
+        .stream_chat(llm_messages(conversation.messages, &lock.text))
         .await
     {
         Ok(stream) => stream,
         Err(error) => {
-            publish_failed_turn(&state, &command, format!("LLM request failed: {error}")).await?;
-            return Err(error);
+            fail_owned_turn(
+                &state,
+                &command,
+                &lock,
+                format!("LLM request failed: {error}"),
+            )
+            .await?;
+            return Ok(());
         }
     };
 
@@ -190,21 +318,21 @@ async fn drive_turn(
                 if changed.is_ok() {
                     let message = { maintenance_errors.borrow().clone() };
                     if let Some(message) = message {
-                        publish_failed_turn(&state, &command, message.clone()).await?;
-                        return Err(anyhow::anyhow!(message));
+                        fail_owned_turn(&state, &command, &lock, message.clone()).await?;
+                        return Ok(());
                     }
                 }
             }
             _ = stop_poll.tick() => {
                 if lock_stop_requested(&state, &command).await? {
-                    commit_interrupted_turn(&state, &command, assistant_text).await?;
+                    commit_interrupted_turn(&state, &command, &lock, assistant_text).await?;
                     return Ok(());
                 }
             }
             signal = stops.recv() => {
                 match signal {
                     Ok(signal) if is_stop_for_turn(&signal, &command) => {
-                        commit_interrupted_turn(&state, &command, assistant_text).await?;
+                        commit_interrupted_turn(&state, &command, &lock, assistant_text).await?;
                         return Ok(());
                     }
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -222,9 +350,9 @@ async fn drive_turn(
                         publish_event(&state, &command, ChatEvent::TextDelta { delta: chunk }).await?;
                     }
                     Err(error) => {
-                        publish_failed_turn(&state, &command, format!("LLM stream failed: {error}"))
+                        fail_owned_turn(&state, &command, &lock, format!("LLM stream failed: {error}"))
                             .await?;
-                        return Err(error);
+                        return Ok(());
                     }
                 }
             }
@@ -236,26 +364,42 @@ async fn drive_turn(
         .repo
         .commit_turn(
             &command.tenant_id,
-            &command.user_id,
+            &lock.user_id,
             &command.conversation_id,
             &command.turn_id,
-            &command.user_message_id,
-            &command.text,
-            command.parent_message_id.as_deref(),
+            &lock.user_message_id,
+            &lock.text,
+            lock.parent_message_id.as_deref(),
             &assistant_message_id,
             &assistant_text,
             Vec::new(),
         )
         .await
     {
-        let _ = publish_failed_turn(
+        let _ = fail_owned_turn(
             &state,
             &command,
+            &lock,
             format!("failed to commit completed chat turn: {error}"),
         )
         .await;
-        return Err(error.into());
+        return Ok(());
     }
+    let terminal_lock = state
+        .bus
+        .mark_lock_terminal(
+            &command.tenant_id,
+            &command.conversation_id,
+            &command.turn_id,
+            Some(&state.worker_id),
+            ChatTerminalUpdate {
+                state: ChatLockState::Committed,
+                assistant_message_id: Some(assistant_message_id.clone()),
+                content: None,
+                error: None,
+            },
+        )
+        .await?;
     publish_event(
         &state,
         &command,
@@ -265,6 +409,14 @@ async fn drive_turn(
         },
     )
     .await?;
+    state
+        .bus
+        .mark_terminal_event_published(
+            &terminal_lock.tenant_id,
+            &terminal_lock.conversation_id,
+            &terminal_lock.turn_id,
+        )
+        .await?;
     Ok(())
 }
 
@@ -325,6 +477,7 @@ fn duration_from_env(name: &str, default_seconds: u64) -> Duration {
 async fn commit_interrupted_turn(
     state: &WorkerState,
     command: &TurnRequested,
+    lock: &ChatLock,
     assistant_text: String,
 ) -> anyhow::Result<()> {
     let assistant_message_id = ulid::Ulid::new().to_string();
@@ -332,26 +485,42 @@ async fn commit_interrupted_turn(
         .repo
         .commit_interrupted_turn(
             &command.tenant_id,
-            &command.user_id,
+            &lock.user_id,
             &command.conversation_id,
             &command.turn_id,
-            &command.user_message_id,
-            &command.text,
-            command.parent_message_id.as_deref(),
+            &lock.user_message_id,
+            &lock.text,
+            lock.parent_message_id.as_deref(),
             &assistant_message_id,
             &assistant_text,
             Vec::new(),
         )
         .await
     {
-        let _ = publish_failed_turn(
+        let _ = fail_owned_turn(
             state,
             command,
+            lock,
             format!("failed to commit interrupted chat turn: {error}"),
         )
         .await;
-        return Err(error.into());
+        return Ok(());
     }
+    let terminal_lock = state
+        .bus
+        .mark_lock_terminal(
+            &command.tenant_id,
+            &command.conversation_id,
+            &command.turn_id,
+            Some(&state.worker_id),
+            ChatTerminalUpdate {
+                state: ChatLockState::Interrupted,
+                assistant_message_id: Some(assistant_message_id.clone()),
+                content: Some(assistant_text.clone()),
+                error: None,
+            },
+        )
+        .await?;
     publish_event(
         state,
         command,
@@ -362,13 +531,18 @@ async fn commit_interrupted_turn(
         },
     )
     .await?;
+    state
+        .bus
+        .mark_terminal_event_published(
+            &terminal_lock.tenant_id,
+            &terminal_lock.conversation_id,
+            &terminal_lock.turn_id,
+        )
+        .await?;
     Ok(())
 }
 
-fn llm_messages(
-    history: Vec<delphi_contracts::MessageDto>,
-    command: &TurnRequested,
-) -> Vec<LlmMessage> {
+fn llm_messages(history: Vec<delphi_contracts::MessageDto>, user_text: &str) -> Vec<LlmMessage> {
     let mut messages = Vec::with_capacity(history.len() + 1);
     let last_history_message_id = history.last().map(|message| message.id.clone());
     for message in history {
@@ -392,21 +566,51 @@ fn llm_messages(
     }
     messages.push(LlmMessage {
         role: Role::User,
-        content: command.text.clone(),
+        content: user_text.to_owned(),
     });
     messages
+}
+
+async fn fail_owned_turn(
+    state: &WorkerState,
+    command: &TurnRequested,
+    lock: &ChatLock,
+    message: String,
+) -> anyhow::Result<()> {
+    let failed = state
+        .bus
+        .mark_lock_terminal(
+            &command.tenant_id,
+            &command.conversation_id,
+            &command.turn_id,
+            Some(&state.worker_id),
+            ChatTerminalUpdate {
+                state: ChatLockState::Failed,
+                assistant_message_id: None,
+                content: None,
+                error: Some(message.clone()),
+            },
+        )
+        .await?;
+    publish_failed_turn(state, command, &lock.user_id, message).await?;
+    state
+        .bus
+        .mark_terminal_event_published(&failed.tenant_id, &failed.conversation_id, &failed.turn_id)
+        .await?;
+    Ok(())
 }
 
 async fn publish_failed_turn(
     state: &WorkerState,
     command: &TurnRequested,
+    user_id: &str,
     message: String,
 ) -> anyhow::Result<()> {
     let _ = state
         .repo
         .record_turn_failed(
             &command.tenant_id,
-            &command.user_id,
+            user_id,
             &command.conversation_id,
             &command.turn_id,
             &message,
@@ -501,22 +705,6 @@ mod tests {
     use chrono::Utc;
     use delphi_contracts::MessageDto;
 
-    fn command() -> TurnRequested {
-        TurnRequested {
-            v: CONTRACT_VERSION,
-            command_id: "01HX0000000000000000000001".to_owned(),
-            tenant_id: "tenant-a".to_owned(),
-            user_id: "user-a".to_owned(),
-            conversation_id: "conversation-a".to_owned(),
-            turn_id: "01HX0000000000000000000002".to_owned(),
-            user_message_id: "01HX0000000000000000000003".to_owned(),
-            text: "continue from there".to_owned(),
-            parent_message_id: Some("01HX0000000000000000000005".to_owned()),
-            bearer_subject: "user-a".to_owned(),
-            ts: Utc::now(),
-        }
-    }
-
     fn message(id: &str, role: MessageRole, content: &str, interrupted: bool) -> MessageDto {
         MessageDto {
             id: id.to_owned(),
@@ -548,7 +736,7 @@ mod tests {
             ),
         ];
 
-        let messages = llm_messages(history, &command());
+        let messages = llm_messages(history, "continue from there");
 
         assert!(messages.iter().any(|message| {
             message.role == Role::System
@@ -576,7 +764,7 @@ mod tests {
             ),
         ];
 
-        let messages = llm_messages(history, &command());
+        let messages = llm_messages(history, "continue from there");
 
         assert!(!messages
             .iter()

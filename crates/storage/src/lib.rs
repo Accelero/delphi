@@ -70,25 +70,6 @@ pub trait ChatRepository: Clone + Send + Sync + 'static {
         parent_message_id: Option<&str>,
     ) -> Result<(), StorageError>;
 
-    async fn record_turn_requested(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-        user_message_id: &str,
-        parent_message_id: Option<&str>,
-    ) -> Result<(), StorageError>;
-
-    async fn record_turn_running(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-        worker_id: &str,
-    ) -> Result<(), StorageError>;
-
     async fn record_turn_failed(
         &self,
         tenant_id: &str,
@@ -258,7 +239,7 @@ impl SurrealChatRepository {
                 DEFINE FIELD OVERWRITE user_message_id ON chat_turn TYPE option<string> DEFAULT NONE;
                 DEFINE FIELD OVERWRITE assistant_message_id ON chat_turn TYPE option<string> DEFAULT NONE;
                 DEFINE FIELD OVERWRITE parent_message_id ON chat_turn TYPE option<string> DEFAULT NONE;
-                DEFINE FIELD OVERWRITE status ON chat_turn TYPE string ASSERT $value INSIDE ['requested', 'running', 'committed', 'interrupted', 'failed'];
+                DEFINE FIELD OVERWRITE status ON chat_turn TYPE string ASSERT $value INSIDE ['committed', 'interrupted', 'failed'];
                 DEFINE FIELD OVERWRITE worker_id ON chat_turn TYPE option<string> DEFAULT NONE;
                 DEFINE FIELD OVERWRITE error ON chat_turn TYPE option<string> DEFAULT NONE;
                 DEFINE FIELD OVERWRITE created_at ON chat_turn TYPE datetime DEFAULT time::now();
@@ -568,69 +549,6 @@ impl ChatRepository for SurrealChatRepository {
         }
     }
 
-    async fn record_turn_requested(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-        user_message_id: &str,
-        parent_message_id: Option<&str>,
-    ) -> Result<(), StorageError> {
-        self.get_visible_conversation(tenant_id, user_id, conversation_id)
-            .await?;
-        self.upsert_turn(DbChatTurn {
-            turn_id: turn_id.to_owned(),
-            tenant_id: tenant_id.to_owned(),
-            user_id: user_id.to_owned(),
-            conversation_id: conversation_id.to_owned(),
-            user_message_id: Some(user_message_id.to_owned()),
-            assistant_message_id: None,
-            parent_message_id: parent_message_id.map(str::to_owned),
-            status: "requested".to_owned(),
-            worker_id: None,
-            error: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        })
-        .await
-    }
-
-    async fn record_turn_running(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        conversation_id: &str,
-        turn_id: &str,
-        worker_id: &str,
-    ) -> Result<(), StorageError> {
-        self.get_visible_conversation(tenant_id, user_id, conversation_id)
-            .await?;
-        let now = Utc::now();
-        self.db
-            .query(
-                "
-                UPDATE chat_turn
-                SET status = 'running', worker_id = $worker_id, error = NONE, updated_at = $updated_at
-                WHERE tenant_id = $tenant_id
-                  AND user_id = $user_id
-                  AND conversation_id = $conversation_id
-                  AND turn_id = $turn_id
-                ",
-            )
-            .bind(("tenant_id", tenant_id.to_owned()))
-            .bind(("user_id", user_id.to_owned()))
-            .bind(("conversation_id", conversation_id.to_owned()))
-            .bind(("turn_id", turn_id.to_owned()))
-            .bind(("worker_id", worker_id.to_owned()))
-            .bind(("updated_at", now))
-            .await
-            .map_err(storage_internal)?
-            .check()
-            .map_err(storage_internal)?;
-        Ok(())
-    }
-
     async fn record_turn_failed(
         &self,
         tenant_id: &str,
@@ -642,28 +560,21 @@ impl ChatRepository for SurrealChatRepository {
         self.get_visible_conversation(tenant_id, user_id, conversation_id)
             .await?;
         let now = Utc::now();
-        self.db
-            .query(
-                "
-                UPDATE chat_turn
-                SET status = 'failed', error = $error, updated_at = $updated_at
-                WHERE tenant_id = $tenant_id
-                  AND user_id = $user_id
-                  AND conversation_id = $conversation_id
-                  AND turn_id = $turn_id
-                ",
-            )
-            .bind(("tenant_id", tenant_id.to_owned()))
-            .bind(("user_id", user_id.to_owned()))
-            .bind(("conversation_id", conversation_id.to_owned()))
-            .bind(("turn_id", turn_id.to_owned()))
-            .bind(("error", error.to_owned()))
-            .bind(("updated_at", now))
-            .await
-            .map_err(storage_internal)?
-            .check()
-            .map_err(storage_internal)?;
-        Ok(())
+        self.upsert_turn(DbChatTurn {
+            turn_id: turn_id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            user_id: user_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            user_message_id: None,
+            assistant_message_id: None,
+            parent_message_id: None,
+            status: "failed".to_owned(),
+            worker_id: None,
+            error: Some(error.to_owned()),
+            created_at: now,
+            updated_at: now,
+        })
+        .await
     }
 
     async fn commit_turn(
@@ -789,6 +700,20 @@ impl SurrealChatRepository {
         } else {
             "committed"
         };
+        let terminal_turn = DbChatTurn {
+            turn_id: turn_id.to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            user_id: user_id.to_owned(),
+            conversation_id: conversation_id.to_owned(),
+            user_message_id: Some(user_message_id.to_owned()),
+            assistant_message_id: Some(assistant_message_id.to_owned()),
+            parent_message_id: parent_message_id.map(str::to_owned),
+            status: turn_status.to_owned(),
+            worker_id: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+        };
 
         self.db
             .query(
@@ -810,17 +735,8 @@ impl SurrealChatRepository {
                   AND user_id = $user_id
                   AND conversation_id = $conversation_id
                   AND deleted_at = NONE;
-                UPDATE chat_turn
-                SET
-                    status = $turn_status,
-                    user_message_id = $user_message_id,
-                    assistant_message_id = $assistant_message_id,
-                    parent_message_id = $parent_message_id,
-                    error = NONE,
-                    updated_at = $updated_at
+                UPSERT chat_turn CONTENT $terminal_turn
                 WHERE tenant_id = $tenant_id
-                  AND user_id = $user_id
-                  AND conversation_id = $conversation_id
                   AND turn_id = $turn_id;
                 COMMIT;
                 ",
@@ -833,12 +749,9 @@ impl SurrealChatRepository {
             .bind(("tenant_id", tenant_id.to_owned()))
             .bind(("user_id", user_id.to_owned()))
             .bind(("conversation_id", conversation_id.to_owned()))
-            .bind(("parent_message_id", parent_message_id.map(str::to_owned)))
             .bind(("parent_ordinal", parent_ordinal))
-            .bind(("turn_status", turn_status.to_owned()))
+            .bind(("terminal_turn", terminal_turn))
             .bind(("turn_id", turn_id.to_owned()))
-            .bind(("user_message_id", user_message_id.to_owned()))
-            .bind(("assistant_message_id", assistant_message_id.to_owned()))
             .await
             .map_err(storage_internal)?
             .check()
@@ -1357,39 +1270,6 @@ impl ChatRepository for MemoryChatRepository {
         } else {
             Err(StorageError::StaleParent)
         }
-    }
-
-    async fn record_turn_requested(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        conversation_id: &str,
-        _turn_id: &str,
-        _user_message_id: &str,
-        _parent_message_id: Option<&str>,
-    ) -> Result<(), StorageError> {
-        let state = self.inner.lock().await;
-        let row = state
-            .conversations
-            .get(conversation_id)
-            .ok_or(StorageError::NotFound)?;
-        ensure_visible(row, tenant_id, user_id)
-    }
-
-    async fn record_turn_running(
-        &self,
-        tenant_id: &str,
-        user_id: &str,
-        conversation_id: &str,
-        _turn_id: &str,
-        _worker_id: &str,
-    ) -> Result<(), StorageError> {
-        let state = self.inner.lock().await;
-        let row = state
-            .conversations
-            .get(conversation_id)
-            .ok_or(StorageError::NotFound)?;
-        ensure_visible(row, tenant_id, user_id)
     }
 
     async fn record_turn_failed(

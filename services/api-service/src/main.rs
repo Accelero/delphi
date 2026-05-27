@@ -242,29 +242,15 @@ async fn enqueue_turn(
         .bus
         .acquire_lock(ChatLock::requested(
             auth.tenant_id.clone(),
+            auth.user_id.clone(),
             conversation_id.clone(),
             turn_id.clone(),
+            user_message_id.clone(),
+            text.clone(),
+            parent_message_id.clone(),
+            auth.bearer_subject.clone(),
         ))
         .await?;
-
-    if let Err(error) = state
-        .repo
-        .record_turn_requested(
-            &auth.tenant_id,
-            &auth.user_id,
-            &conversation_id,
-            &turn_id,
-            &user_message_id,
-            parent_message_id.as_deref(),
-        )
-        .await
-    {
-        state
-            .bus
-            .release_lock(&auth.tenant_id, &conversation_id, &turn_id)
-            .await;
-        return Err(error.into());
-    }
 
     let command = TurnRequested {
         v: CONTRACT_VERSION,
@@ -273,10 +259,6 @@ async fn enqueue_turn(
         user_id: auth.user_id.clone(),
         conversation_id: conversation_id.clone(),
         turn_id: turn_id.clone(),
-        user_message_id,
-        text,
-        parent_message_id,
-        bearer_subject: auth.bearer_subject.clone(),
         ts: Utc::now(),
     };
 

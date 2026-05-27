@@ -118,10 +118,6 @@ pub struct TurnRequested {
     pub user_id: String,
     pub conversation_id: String,
     pub turn_id: String,
-    pub user_message_id: String,
-    pub text: String,
-    pub parent_message_id: Option<String>,
-    pub bearer_subject: String,
     pub ts: DateTime<Utc>,
 }
 
