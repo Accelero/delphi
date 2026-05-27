@@ -6,7 +6,7 @@ import { defineConfig, devices } from "@playwright/test";
  *
  * Tests assume the stack is already running. Locally:
  *   make rebuild-up
- *   cd tests && npm test
+ *   cd tests && bun run test
  */
 export default defineConfig({
   testDir: "./e2e",

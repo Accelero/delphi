@@ -235,6 +235,25 @@ pub fn llm_from_env() -> Result<Arc<dyn LlmClient>> {
     }
 }
 
+pub fn title_llm_from_env(chat_llm: &Arc<dyn LlmClient>) -> Result<Arc<dyn LlmClient>> {
+    if !env_flag("DELPHI_TITLE_ENABLED", true) {
+        return Ok(chat_llm.clone());
+    }
+
+    match env_or("DELPHI_TITLE_PROVIDER", "openai")
+        .to_lowercase()
+        .as_str()
+    {
+        "openai" | "openai-compatible" => {
+            let base_url = env_or("DELPHI_TITLE_BASE_URL", "http://title-llm:80/v1");
+            let model = env_or("DELPHI_TITLE_MODEL", "Qwen2.5-0.5B-Instruct");
+            let api_key = env_or("DELPHI_TITLE_API_KEY", "sk-noauth");
+            Ok(Arc::new(OpenAiCompatLlm::new(&model, api_key, base_url)?))
+        }
+        other => bail!("unknown DELPHI_TITLE_PROVIDER={other}"),
+    }
+}
+
 fn require_env(key: &str) -> Result<String> {
     std::env::var(key)
         .ok()
@@ -251,9 +270,28 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_owned())
 }
 
+fn env_flag(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
+
+    struct StubLlm;
+
+    #[async_trait]
+    impl LlmClient for StubLlm {
+        async fn stream_chat(&self, _messages: Vec<LlmMessage>) -> Result<DeltaStream> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
 
     #[test]
     fn split_history_uses_trailing_user_as_prompt() {
@@ -304,5 +342,14 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(matches!(history[0], Message::User { .. }));
         assert!(matches!(history[1], Message::System { .. }));
+    }
+
+    #[test]
+    fn title_llm_disabled_reuses_chat_client() {
+        std::env::set_var("DELPHI_TITLE_ENABLED", "false");
+        let chat: Arc<dyn LlmClient> = Arc::new(StubLlm);
+        let title = title_llm_from_env(&chat).expect("disabled path is infallible");
+        assert!(Arc::ptr_eq(&chat, &title));
+        std::env::remove_var("DELPHI_TITLE_ENABLED");
     }
 }

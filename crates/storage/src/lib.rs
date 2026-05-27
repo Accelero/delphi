@@ -55,6 +55,14 @@ pub trait ChatRepository: Clone + Send + Sync + 'static {
         title: String,
     ) -> Result<ConversationDetail, StorageError>;
 
+    async fn rename_conversation_if_default(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        title: String,
+    ) -> Result<Option<ConversationDetail>, StorageError>;
+
     async fn delete_conversation(
         &self,
         tenant_id: &str,
@@ -475,6 +483,52 @@ impl ChatRepository for SurrealChatRepository {
         Ok(to_surreal_detail(conversation, messages))
     }
 
+    async fn rename_conversation_if_default(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        title: String,
+    ) -> Result<Option<ConversationDetail>, StorageError> {
+        let now = Utc::now();
+        let mut response = self
+            .db
+            .query(
+                "
+                UPDATE chat_conversation
+                SET title = $title, updated_at = $updated_at
+                WHERE tenant_id = $tenant_id
+                  AND user_id = $user_id
+                  AND conversation_id = $conversation_id
+                  AND deleted_at = NONE
+                  AND title = 'New chat'
+                RETURN conversation_id, tenant_id, user_id, title, updated_at, deleted_at
+                ",
+            )
+            .bind(("tenant_id", tenant_id.to_owned()))
+            .bind(("user_id", user_id.to_owned()))
+            .bind(("conversation_id", conversation_id.to_owned()))
+            .bind(("title", title))
+            .bind(("updated_at", now))
+            .await
+            .map_err(storage_internal)?
+            .check()
+            .map_err(storage_internal)?;
+        let rows: Vec<DbConversation> = response.take(0).map_err(storage_internal)?;
+        let Some(conversation) = rows.into_iter().next() else {
+            self.get_visible_conversation(tenant_id, user_id, conversation_id)
+                .await?;
+            return Ok(None);
+        };
+        let messages = self
+            .list_messages(tenant_id, user_id, conversation_id)
+            .await?
+            .into_iter()
+            .map(db_message_to_dto)
+            .collect();
+        Ok(Some(to_surreal_detail(conversation, messages)))
+    }
+
     async fn delete_conversation(
         &self,
         tenant_id: &str,
@@ -694,7 +748,6 @@ impl SurrealChatRepository {
             ordinal: assistant_ordinal,
             created_at: assistant_created_at,
         };
-        let title: String = user_text.chars().take(48).collect();
         let turn_status = if interrupted {
             "interrupted"
         } else {
@@ -729,7 +782,6 @@ impl SurrealChatRepository {
                 UPDATE chat_conversation
                 SET
                     updated_at = $updated_at,
-                    title = IF title = 'New chat' THEN $title ELSE title END,
                     next_message_ordinal = $next_message_ordinal
                 WHERE tenant_id = $tenant_id
                   AND user_id = $user_id
@@ -744,7 +796,6 @@ impl SurrealChatRepository {
             .bind(("user_message", user))
             .bind(("assistant_message", assistant))
             .bind(("updated_at", now))
-            .bind(("title", title))
             .bind(("next_message_ordinal", assistant_ordinal + 1))
             .bind(("tenant_id", tenant_id.to_owned()))
             .bind(("user_id", user_id.to_owned()))
@@ -1235,6 +1286,27 @@ impl ChatRepository for MemoryChatRepository {
         Ok(to_detail(row))
     }
 
+    async fn rename_conversation_if_default(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        conversation_id: &str,
+        title: String,
+    ) -> Result<Option<ConversationDetail>, StorageError> {
+        let mut state = self.inner.lock().await;
+        let row = state
+            .conversations
+            .get_mut(conversation_id)
+            .ok_or(StorageError::NotFound)?;
+        ensure_visible(row, tenant_id, user_id)?;
+        if row.title != "New chat" {
+            return Ok(None);
+        }
+        row.title = title;
+        row.updated_at = Utc::now();
+        Ok(Some(to_detail(row)))
+    }
+
     async fn delete_conversation(
         &self,
         tenant_id: &str,
@@ -1406,9 +1478,6 @@ impl MemoryChatRepository {
             created_at: now,
         });
         row.updated_at = now;
-        if row.title == "New chat" {
-            row.title = user_text.chars().take(48).collect();
-        }
         row.next_message_ordinal = row.messages.len() as i64 + 1;
 
         Ok(to_detail(row))

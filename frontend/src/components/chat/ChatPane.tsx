@@ -10,10 +10,12 @@ import { MessageBody } from "./MessageBody";
 
 export function ChatPane({
   conversation,
-  onRefresh
+  onRefresh,
+  onTitleUpdated
 }: {
   conversation: ConversationDetail | null;
   onRefresh: () => void;
+  onTitleUpdated: (title: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const viewportRef = useRef<HTMLDivElement | null>(null);
@@ -25,7 +27,8 @@ export function ChatPane({
     conversation?.messages ?? [],
     {
       onResync: onRefresh,
-      onTerminalRefresh: onRefresh
+      onTerminalRefresh: onRefresh,
+      onTitleUpdated
     }
   );
   const turns = useMemo(() => groupTurns(messages), [messages]);

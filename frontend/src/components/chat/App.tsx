@@ -11,18 +11,49 @@ export function App() {
 
   const refreshList = useCallback(async () => {
     const rows = await api.listConversations();
-    setConversations(rows);
+    setConversations((current) => {
+      const existingTitleById = new Map(
+        current.map((conversation) => [conversation.id, conversation.title])
+      );
+      return rows.map((row) => {
+        const existingTitle = existingTitleById.get(row.id);
+        return row.title === "New chat" && existingTitle && existingTitle !== "New chat"
+          ? { ...row, title: existingTitle }
+          : row;
+      });
+    });
     if (!activeId && rows[0]) setActiveId(rows[0].id);
   }, [activeId]);
 
   const refreshActive = useCallback(async () => {
     if (!activeId) return;
-    setActive(await api.getConversation(activeId));
+    const detail = await api.getConversation(activeId);
+    setActive((current) =>
+      detail.title === "New chat" &&
+      current &&
+      current.id === detail.id &&
+      current.title !== "New chat"
+        ? { ...detail, title: current.title }
+        : detail
+    );
   }, [activeId]);
 
   const refreshChatState = useCallback(async () => {
     await Promise.all([refreshActive(), refreshList()]);
   }, [refreshActive, refreshList]);
+
+  const applyTitleUpdate = useCallback(
+    (title: string) => {
+      if (!activeId) return;
+      setConversations((current) =>
+        current.map((conversation) =>
+          conversation.id === activeId ? { ...conversation, title } : conversation
+        )
+      );
+      setActive((current) => (current && current.id === activeId ? { ...current, title } : current));
+    },
+    [activeId]
+  );
 
   useEffect(() => {
     api.me().then(refreshList).catch(() => undefined);
@@ -57,7 +88,11 @@ export function App() {
         onSelect={setActiveId}
         onDelete={remove}
       />
-      <ChatPane conversation={active} onRefresh={refreshChatState} />
+      <ChatPane
+        conversation={active}
+        onRefresh={refreshChatState}
+        onTitleUpdated={applyTitleUpdate}
+      />
     </div>
   );
 }

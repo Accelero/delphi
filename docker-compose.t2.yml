@@ -149,9 +149,33 @@ services:
       CHAT_COMMAND_ACK_WAIT_SECONDS: "120"
       CHAT_COMMAND_ACK_PROGRESS_SECONDS: "30"
       CHAT_STOP_POLL_SECONDS: "1"
+      DELPHI_TITLE_ENABLED: ${DELPHI_TITLE_ENABLED:-true}
+      DELPHI_TITLE_PROVIDER: ${DELPHI_TITLE_PROVIDER:-openai-compatible}
+      DELPHI_TITLE_BASE_URL: ${DELPHI_TITLE_BASE_URL:-http://title-llm:80/v1}
+      DELPHI_TITLE_MODEL: ${DELPHI_TITLE_MODEL:-Qwen2.5-0.5B-Instruct}
+      DELPHI_TITLE_API_KEY: ${DELPHI_TITLE_API_KEY:-sk-noauth}
     depends_on:
       - nats
       - surrealdb
+      - title-llm
+
+  title-llm:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    command:
+      - "-hf"
+      - "Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "80"
+      - "--ctx-size"
+      - "4096"
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - title-llm-models:/models
+    ports:
+      - "8084:80"
 
   frontend:
     build:
@@ -165,3 +189,4 @@ volumes:
   nats-data:
   redis-data:
   surreal-data:
+  title-llm-models:

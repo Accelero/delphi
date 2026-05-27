@@ -4,7 +4,7 @@ use delphi_contracts::{
     ChatEvent, ChatEventEnvelope, ClearReason, FinishReason, InterruptReason, MessageRole,
     TurnRequested, CONTRACT_VERSION,
 };
-use delphi_llm::{llm_from_env, LlmClient, LlmDelta, LlmMessage, Role};
+use delphi_llm::{llm_from_env, title_llm_from_env, LlmClient, LlmDelta, LlmMessage, Role};
 use delphi_nats::{
     ChatBus, ChatLock, ChatLockState, ChatTerminalUpdate, NatsChatBus, NatsChatBusOptions,
     StopSignal,
@@ -24,6 +24,7 @@ struct WorkerState {
     repo: SurrealChatRepository,
     bus: NatsChatBus,
     llm: Arc<dyn LlmClient>,
+    title_llm: Arc<dyn LlmClient>,
     worker_id: String,
 }
 
@@ -37,6 +38,8 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| format!("chat-worker-{}", uuid::Uuid::new_v4()));
     tracing::info!(addr = %config.bind_addr, worker_id = %worker_id, "starting chat-worker");
 
+    let llm = llm_from_env()?;
+    let title_llm = title_llm_from_env(&llm)?;
     let state = WorkerState {
         repo: SurrealChatRepository::connect(
             &config.surreal_url,
@@ -55,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
             },
         )
         .await?,
-        llm: llm_from_env()?,
+        llm,
+        title_llm,
         worker_id,
     };
     let mut commands = state.bus.subscribe_commands();
@@ -263,6 +267,8 @@ async fn drive_turn(
         .repo
         .get_conversation(&command.tenant_id, &lock.user_id, &command.conversation_id)
         .await?;
+    let should_generate_title =
+        conversation.title == "New chat" && conversation.messages.is_empty();
 
     publish_event(
         &state,
@@ -417,6 +423,9 @@ async fn drive_turn(
             &terminal_lock.turn_id,
         )
         .await?;
+    if should_generate_title && !assistant_text.trim().is_empty() {
+        spawn_title_generation(state, command, lock, assistant_text);
+    }
     Ok(())
 }
 
@@ -569,6 +578,100 @@ fn llm_messages(history: Vec<delphi_contracts::MessageDto>, user_text: &str) -> 
         content: user_text.to_owned(),
     });
     messages
+}
+
+fn spawn_title_generation(
+    state: WorkerState,
+    command: TurnRequested,
+    lock: ChatLock,
+    assistant_text: String,
+) {
+    tokio::spawn(async move {
+        let Some(title) =
+            generate_title(state.title_llm.as_ref(), &lock.text, &assistant_text).await
+        else {
+            return;
+        };
+        match state
+            .repo
+            .rename_conversation_if_default(
+                &command.tenant_id,
+                &lock.user_id,
+                &command.conversation_id,
+                title.clone(),
+            )
+            .await
+        {
+            Ok(Some(_)) => {
+                if let Err(error) =
+                    publish_event(&state, &command, ChatEvent::TitleUpdated { title }).await
+                {
+                    tracing::warn!(?error, "failed to publish generated chat title");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(?error, "failed to persist generated chat title"),
+        }
+    });
+}
+
+async fn generate_title(
+    llm: &dyn LlmClient,
+    user_msg: &str,
+    assistant_msg: &str,
+) -> Option<String> {
+    let prompt = vec![
+        LlmMessage {
+            role: Role::System,
+            content: "You produce concise chat titles. Respond with ONLY the title (no quotes, no preamble), 60 characters or less, summarising the user's question."
+                .to_owned(),
+        },
+        LlmMessage {
+            role: Role::User,
+            content: format!("User: {user_msg}\n\nAssistant: {assistant_msg}\n\nTitle:"),
+        },
+    ];
+    let mut stream = match llm.stream_chat(prompt).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            tracing::warn!(?error, "title llm call failed");
+            return None;
+        }
+    };
+    let mut output = String::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(LlmDelta::Text(text)) => output.push_str(&text),
+            Err(error) => {
+                tracing::warn!(?error, "title llm stream failed");
+                return None;
+            }
+        }
+    }
+    let title = clean_title(&output);
+    (!title.is_empty()).then_some(title)
+}
+
+fn clean_title(raw: &str) -> String {
+    let mut title = raw.trim().to_owned();
+    let quotes = ['"', '\'', '“', '”', '‘', '’'];
+    if title.chars().count() >= 2 {
+        if let (Some(first), Some(last)) = (title.chars().next(), title.chars().last()) {
+            if quotes.contains(&first) && quotes.contains(&last) {
+                title = title
+                    .chars()
+                    .skip(1)
+                    .take(title.chars().count().saturating_sub(2))
+                    .collect::<String>()
+                    .trim()
+                    .to_owned();
+            }
+        }
+    }
+    if title.chars().count() > 60 {
+        title = title.chars().take(60).collect();
+    }
+    title
 }
 
 async fn fail_owned_turn(

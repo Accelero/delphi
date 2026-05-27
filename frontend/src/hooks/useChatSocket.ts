@@ -8,6 +8,7 @@ export type RealtimeStatus = "idle" | "connecting" | "connected" | "reconnecting
 type ChatSocketOptions = {
   onResync?: () => void | Promise<void>;
   onTerminalRefresh?: () => void | Promise<void>;
+  onTitleUpdated?: (title: string) => void | Promise<void>;
 };
 
 const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 5000];
@@ -29,6 +30,7 @@ export function useChatSocket(
   const liveCitationsRef = useRef<CitationEntry[]>([]);
   const onResyncRef = useRef(options.onResync);
   const onTerminalRefreshRef = useRef(options.onTerminalRefresh);
+  const onTitleUpdatedRef = useRef(options.onTitleUpdated);
   const seedSignature = useMemo(() => messagesSignature(seedMessages), [seedMessages]);
 
   useEffect(() => {
@@ -38,7 +40,8 @@ export function useChatSocket(
   useEffect(() => {
     onResyncRef.current = options.onResync;
     onTerminalRefreshRef.current = options.onTerminalRefresh;
-  }, [options.onResync, options.onTerminalRefresh]);
+    onTitleUpdatedRef.current = options.onTitleUpdated;
+  }, [options.onResync, options.onTerminalRefresh, options.onTitleUpdated]);
 
   useEffect(() => {
     seedSignatureRef.current = seedSignature;
@@ -140,6 +143,7 @@ export function useChatSocket(
         setError(event.message);
         return;
       case "title_updated":
+        void onTitleUpdatedRef.current?.(event.title);
         return;
     }
   }, []);
