@@ -1,12 +1,12 @@
-import { ArrowDown, LoaderCircle, Send, Square } from "lucide-react";
-import { FormEvent, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowUp, LoaderCircle, Square } from "lucide-react";
+import { type CSSProperties, FormEvent, useLayoutEffect, useRef, useState } from "react";
 import { ulid } from "ulid";
 import { useChatSocket } from "../../hooks/useChatSocket";
 import { api } from "../../lib/api";
-import type { ConversationDetail, MessageDto } from "../../lib/types";
+import type { ConversationDetail } from "../../lib/types";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
-import { MessageBody } from "./MessageBody";
+import { ChatFeed } from "./ChatFeed";
 
 export function ChatPane({
   conversation,
@@ -18,61 +18,63 @@ export function ChatPane({
   onTitleUpdated: (title: string) => void;
 }) {
   const [draft, setDraft] = useState("");
-  const viewportRef = useRef<HTMLDivElement | null>(null);
-  const sentinelRef = useRef<HTMLDivElement | null>(null);
-  const lastScrollTopRef = useRef(0);
-  const [follow, setFollow] = useState(true);
-  const { messages, status, realtimeStatus, error, lastMessageId, setStatus } = useChatSocket(
-    conversation?.id ?? null,
-    conversation?.messages ?? [],
-    {
-      onResync: onRefresh,
-      onTerminalRefresh: onRefresh,
-      onTitleUpdated
-    }
-  );
-  const turns = useMemo(() => groupTurns(messages), [messages]);
+  const shellRef = useRef<HTMLElement | null>(null);
+  const composerRef = useRef<HTMLDivElement | null>(null);
+  const {
+    messages,
+    status,
+    realtimeStatus,
+    error,
+    lastMessageId,
+    setStatus
+  } = useChatSocket(conversation?.id ?? null, conversation?.messages ?? [], {
+    onResync: onRefresh,
+    onTerminalRefresh: onRefresh,
+    onTitleUpdated
+  });
   const busy = status === "submitted" || status === "streaming" || status === "stopping";
   const stopping = status === "stopping";
-
-  useEffect(() => {
-    const viewport = viewportRef.current;
-    const sentinel = sentinelRef.current;
-    if (!viewport || !sentinel) return;
-    const observer = new IntersectionObserver(
-      ([entry]) => setFollow(entry.isIntersecting),
-      { root: viewport, threshold: 0 }
-    );
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, []);
+  const showThinking = busy && messages.at(-1)?.role === "user";
+  const statusNotice =
+    realtimeStatus === "reconnecting" || realtimeStatus === "disconnected"
+      ? "Reconnecting..."
+      : error;
 
   useLayoutEffect(() => {
-    const viewport = viewportRef.current;
-    if (viewport && follow) {
-      viewport.scrollTop = viewport.scrollHeight - viewport.clientHeight;
-    }
-  });
+    const shell = shellRef.current;
+    const composer = composerRef.current;
+    if (!shell || !composer) return;
 
-  const onScroll = () => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    if (viewport.scrollTop < lastScrollTopRef.current - 1) {
-      setFollow(false);
-    }
-    lastScrollTopRef.current = viewport.scrollTop;
-  };
+    const sync = () => {
+      const shellRect = shell.getBoundingClientRect();
+      const composerRect = composer.getBoundingClientRect();
+      const composerCenterFromBottom =
+        shellRect.bottom - (composerRect.top + composerRect.height / 2);
+      shell.style.setProperty(
+        "--chat-composer-center-offset",
+        `${Math.max(0, composerCenterFromBottom)}px`
+      );
+    };
+
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(shell);
+    observer.observe(composer);
+    return () => observer.disconnect();
+  }, []);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!conversation || !draft.trim() || busy) return;
     const text = draft.trim();
+    const userMessageId = ulid();
+    const turnId = ulid();
     setDraft("");
     setStatus("submitted");
     try {
       await api.submitTurn(conversation.id, {
-        user_message_id: ulid(),
-        turn_id: ulid(),
+        user_message_id: userMessageId,
+        turn_id: turnId,
         text,
         parent_message_id: lastMessageId
       });
@@ -100,56 +102,27 @@ export function ChatPane({
   }
 
   return (
-    <main className="flex h-full min-w-0 flex-1 flex-col bg-[var(--color-surface)]">
-      <div className="flex h-14 items-center border-b border-[var(--color-border)] px-5">
-        <h1 className="truncate text-sm font-semibold">{conversation.title}</h1>
-      </div>
-      <div className="relative min-h-0 flex-1">
+    <main
+      ref={shellRef}
+      style={{ "--chat-composer-center-offset": "4rem" } as CSSProperties}
+      className="relative flex h-full min-w-0 flex-1 flex-col bg-[var(--color-surface)]"
+    >
+      <ChatFeed
+        messages={messages}
+        busy={busy}
+        showThinking={showThinking}
+        notice={statusNotice}
+        noticeTone={error ? "danger" : "muted"}
+        className="absolute inset-x-0 top-0 bottom-[var(--chat-composer-center-offset)]"
+      />
+      <form
+        onSubmit={submit}
+        className="pointer-events-none absolute inset-x-0 bottom-0 z-20 px-5 pb-4"
+      >
         <div
-          ref={viewportRef}
-          onScroll={onScroll}
-          className="absolute inset-0 overflow-y-auto outline-none [overflow-anchor:none]"
+          ref={composerRef}
+          className="pointer-events-auto mx-auto flex max-w-3xl items-end rounded-3xl bg-[var(--color-object)] p-2"
         >
-          <div className="mx-auto max-w-3xl px-5 pt-8">
-            {turns.map((turn, index) => (
-              <section
-                key={turn.id}
-                data-turn-id={turn.id}
-                className={index === turns.length - 1 ? "min-h-[calc(100vh-12rem)] pb-6" : "pb-8"}
-              >
-                {turn.messages.map((message) => (
-                  <MessageRow
-                    key={message.id}
-                    message={message}
-                    streaming={message.id === "assistant-live" && busy}
-                  />
-                ))}
-              </section>
-            ))}
-            {busy && messages.at(-1)?.role === "user" ? (
-              <div className="pb-8 text-sm text-[var(--color-text-muted)]">Thinking...</div>
-            ) : null}
-            {realtimeStatus === "reconnecting" || realtimeStatus === "disconnected" ? (
-              <div className="pb-8 text-sm text-[var(--color-text-muted)]">Reconnecting...</div>
-            ) : null}
-            {error ? <div className="pb-8 text-sm text-[var(--color-danger)]">{error}</div> : null}
-            <div ref={sentinelRef} aria-hidden className="h-px" />
-          </div>
-        </div>
-        {!follow ? (
-          <Button
-            size="icon"
-            variant="outline"
-            className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full"
-            onClick={() => sentinelRef.current?.scrollIntoView({ block: "end", behavior: "smooth" })}
-            aria-label="Scroll to bottom"
-          >
-            <ArrowDown className="h-4 w-4" />
-          </Button>
-        ) : null}
-      </div>
-      <form onSubmit={submit} className="border-t border-[var(--color-border)] p-4">
-        <div className="mx-auto flex max-w-3xl gap-2">
           <Textarea
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
@@ -160,6 +133,7 @@ export function ChatPane({
                 event.currentTarget.form?.requestSubmit();
               }
             }}
+            className="min-h-20 rounded-none bg-transparent px-3 py-2 focus:ring-0"
           />
           {busy ? (
             <Button
@@ -169,6 +143,7 @@ export function ChatPane({
               onClick={stop}
               disabled={stopping}
               aria-label={stopping ? "Stopping" : "Stop"}
+              className="mb-1 shrink-0 rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-primary-hover)] disabled:opacity-100"
             >
               {stopping ? (
                 <LoaderCircle className="h-4 w-4 animate-spin" />
@@ -177,49 +152,18 @@ export function ChatPane({
               )}
             </Button>
           ) : (
-            <Button type="submit" size="icon" disabled={!draft.trim()} aria-label="Send">
-              <Send className="h-4 w-4" />
+            <Button
+              type="submit"
+              size="icon"
+              disabled={!draft.trim()}
+              aria-label="Send"
+              className="mb-1 shrink-0 rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-primary-hover)] disabled:opacity-100"
+            >
+              <ArrowUp className="h-4 w-4" />
             </Button>
           )}
         </div>
       </form>
     </main>
   );
-}
-
-function MessageRow({ message, streaming }: { message: MessageDto; streaming: boolean }) {
-  return (
-    <div className={message.role === "user" ? "mb-5 flex justify-end" : "mb-5"}>
-      <div
-        className={
-          message.role === "user"
-            ? "max-w-[80%] rounded-lg bg-[var(--color-primary)] px-4 py-3 text-sm leading-6 text-[var(--color-primary-text)]"
-            : "max-w-none text-[var(--color-text)]"
-        }
-      >
-        {message.role === "assistant" ? (
-          <>
-            <MessageBody content={message.content} streaming={streaming} />
-            {message.interrupted ? (
-              <div className="mt-2 text-xs text-[var(--color-text-muted)]">Interrupted</div>
-            ) : null}
-          </>
-        ) : (
-          message.content
-        )}
-      </div>
-    </div>
-  );
-}
-
-function groupTurns(messages: MessageDto[]) {
-  const turns: { id: string; messages: MessageDto[] }[] = [];
-  for (const message of messages) {
-    if (message.role === "user" || turns.length === 0) {
-      turns.push({ id: message.turn_id ?? message.id, messages: [message] });
-    } else {
-      turns[turns.length - 1].messages.push(message);
-    }
-  }
-  return turns;
 }

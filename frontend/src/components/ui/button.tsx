@@ -20,7 +20,7 @@ export function Button({
           "bg-[var(--color-primary)] text-[var(--color-primary-text)] hover:bg-[var(--color-primary-hover)]",
         variant === "ghost" && "hover:bg-[var(--color-surface-hover)]",
         variant === "outline" &&
-          "border border-[var(--color-border-strong)] bg-[var(--color-surface)] hover:bg-[var(--color-surface-hover)]",
+          "border border-[var(--color-object-border)] bg-[var(--color-object)] text-[var(--color-object-text)] hover:bg-[var(--color-object-hover)]",
         variant === "destructive" &&
           "bg-[var(--color-danger)] text-[var(--color-danger-text)] hover:bg-[var(--color-danger-hover)]",
         size === "default" && "h-10 px-4 py-2",
