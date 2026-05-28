@@ -6,9 +6,9 @@ type LiveStatus = "submitted" | "streaming" | "stopping";
 export type RealtimeStatus = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
 
 type ChatSocketOptions = {
-  onResync?: () => void | Promise<void>;
-  onTerminalRefresh?: () => void | Promise<void>;
-  onTitleUpdated?: (title: string) => void | Promise<void>;
+  onResync?: (conversationId: string) => void | Promise<void>;
+  onTerminalRefresh?: (conversationId: string) => void | Promise<void>;
+  onTitleUpdated?: (conversationId: string, title: string) => void | Promise<void>;
 };
 
 const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 5000];
@@ -119,7 +119,7 @@ export function useChatSocket(
         overlayTextRef.current = "";
         inFlightUserIdRef.current = null;
         inFlightTurnIdRef.current = null;
-        void onTerminalRefreshRef.current?.();
+        if (conversationId) void onTerminalRefreshRef.current?.(conversationId);
         return;
       case "interrupted":
         setStatus("ready");
@@ -137,7 +137,7 @@ export function useChatSocket(
         inFlightUserIdRef.current = null;
         inFlightTurnIdRef.current = null;
         liveCitationsRef.current = [];
-        void onTerminalRefreshRef.current?.();
+        if (conversationId) void onTerminalRefreshRef.current?.(conversationId);
         return;
       case "clear":
         setStatus("ready");
@@ -150,17 +150,17 @@ export function useChatSocket(
         inFlightUserIdRef.current = null;
         inFlightTurnIdRef.current = null;
         liveCitationsRef.current = [];
-        void onTerminalRefreshRef.current?.();
+        if (conversationId) void onTerminalRefreshRef.current?.(conversationId);
         return;
       case "error":
         setStatus("error");
         setError(event.message);
         return;
       case "title_updated":
-        void onTitleUpdatedRef.current?.(event.title);
+        if (conversationId) void onTitleUpdatedRef.current?.(conversationId, event.title);
         return;
     }
-  }, []);
+  }, [conversationId]);
 
   useEffect(() => {
     if (!conversationId) {
@@ -224,7 +224,7 @@ export function useChatSocket(
       } else if (msg.type === "resync_required" && msg.conversation_id === conversationId) {
         lastEventIdByConversationRef.current.delete(conversationId);
         resetTransientState();
-        void Promise.resolve(onResyncRef.current?.()).finally(() => {
+        void Promise.resolve(onResyncRef.current?.(conversationId)).finally(() => {
           if (socket?.readyState === WebSocket.OPEN) {
             subscribe(socket);
           }

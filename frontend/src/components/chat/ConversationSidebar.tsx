@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import { MessageSquarePlus, Monitor, Moon, Sun, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import type { ThemeMode } from "../../hooks/useThemeMode";
@@ -8,7 +9,6 @@ export function ConversationSidebar({
   conversations,
   activeId,
   onCreate,
-  onSelect,
   onDelete,
   themeMode,
   onThemeModeChange
@@ -16,7 +16,6 @@ export function ConversationSidebar({
   conversations: ConversationSummary[];
   activeId: string | null;
   onCreate: () => void;
-  onSelect: (id: string) => void;
   onDelete: (id: string) => void;
   themeMode: ThemeMode;
   onThemeModeChange: (mode: ThemeMode) => void;
@@ -39,12 +38,13 @@ export function ConversationSidebar({
                 : "group flex items-center rounded-md hover:bg-[var(--color-surface-hover)]"
             }
           >
-            <button
+            <Link
+              to="/chat/$conversationId"
+              params={{ conversationId: conversation.id }}
               className="min-w-0 flex-1 truncate px-3 py-2 text-left text-sm"
-              onClick={() => onSelect(conversation.id)}
             >
               {conversation.title}
-            </button>
+            </Link>
             <Button
               size="icon"
               variant="ghost"

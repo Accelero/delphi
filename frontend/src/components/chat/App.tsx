@@ -1,112 +1,163 @@
-import { useCallback, useEffect, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate, useParams, useRouterState } from "@tanstack/react-router";
+import { useCallback, useEffect } from "react";
 import { useThemeMode } from "../../hooks/useThemeMode";
 import { api } from "../../lib/api";
+import { conversationListQueryKey, conversationQueryKey } from "../../lib/chatQueries";
 import type { ConversationDetail, ConversationSummary } from "../../lib/types";
 import { ChatPane } from "./ChatPane";
 import { ConversationSidebar } from "./ConversationSidebar";
 
 export function App() {
-  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(() => routeConversationId());
-  const [active, setActive] = useState<ConversationDetail | null>(null);
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const pathname = useRouterState({ select: (state) => state.location.pathname });
+  const activeId = useParams({
+    strict: false,
+    select: (params) =>
+      typeof params.conversationId === "string" ? params.conversationId : null
+  });
   const theme = useThemeMode();
 
-  const navigateToConversation = useCallback((id: string, mode: "push" | "replace" = "push") => {
-    setActiveId(id);
-    writeConversationRoute(id, mode);
-  }, []);
+  const conversationsQuery = useQuery({
+    queryKey: conversationListQueryKey,
+    queryFn: api.listConversations
+  });
 
-  const navigateToChatRoot = useCallback((mode: "push" | "replace" = "push") => {
-    setActiveId(null);
-    writeChatRootRoute(mode);
-  }, []);
+  const conversations = conversationsQuery.data ?? [];
+  const activeConversationQuery = useQuery({
+    queryKey: activeId ? conversationQueryKey(activeId) : ["chat", "conversation", "none"],
+    queryFn: () => api.getConversation(activeId!),
+    enabled: activeId !== null
+  });
+  const active = activeId ? activeConversationQuery.data ?? null : null;
 
-  const refreshList = useCallback(async () => {
-    const rows = await api.listConversations();
-    setConversations((current) => {
-      const existingTitleById = new Map(
-        current.map((conversation) => [conversation.id, conversation.title])
-      );
-      return rows.map((row) => {
-        const existingTitle = existingTitleById.get(row.id);
-        return row.title === "New chat" && existingTitle && existingTitle !== "New chat"
-          ? { ...row, title: existingTitle }
-          : row;
-      });
-    });
-    if (!activeId && rows[0]) navigateToConversation(rows[0].id, "replace");
-  }, [activeId, navigateToConversation]);
+  const navigateToConversation = useCallback(
+    (conversationId: string, replace = false) =>
+      navigate({
+        to: "/chat/$conversationId",
+        params: { conversationId },
+        replace
+      }),
+    [navigate]
+  );
 
-  const refreshActive = useCallback(async () => {
-    if (!activeId) return;
-    const detail = await api.getConversation(activeId);
-    setActive((current) =>
-      detail.title === "New chat" &&
-      current &&
-      current.id === detail.id &&
-      current.title !== "New chat"
-        ? { ...detail, title: current.title }
-        : detail
-    );
-  }, [activeId]);
-
-  const refreshChatState = useCallback(async () => {
-    await Promise.all([refreshActive(), refreshList()]);
-  }, [refreshActive, refreshList]);
-
-  const applyTitleUpdate = useCallback(
-    (title: string) => {
-      if (!activeId) return;
-      setConversations((current) =>
-        current.map((conversation) =>
-          conversation.id === activeId ? { ...conversation, title } : conversation
-        )
-      );
-      setActive((current) => (current && current.id === activeId ? { ...current, title } : current));
-    },
-    [activeId]
+  const navigateToChatRoot = useCallback(
+    (replace = false) => navigate({ to: "/chat", replace }),
+    [navigate]
   );
 
   useEffect(() => {
-    const onPopState = () => {
-      setActiveId(routeConversationId());
-    };
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+    if (activeId || pathname !== "/chat" || conversations.length === 0) return;
+    void navigateToConversation(conversations[0].id, true);
+  }, [activeId, conversations, navigateToConversation, pathname]);
 
   useEffect(() => {
-    api.me().then(refreshList).catch(() => undefined);
-  }, []);
+    if (!activeId || activeConversationQuery.status !== "error") return;
+    const error = activeConversationQuery.error as Error & { status?: number };
+    if (error.status !== 404) return;
 
-  useEffect(() => {
-    if (activeId) {
-      refreshActive().catch(() => setActive(null));
+    const remaining = conversations.filter((conversation) => conversation.id !== activeId);
+    queryClient.setQueryData(conversationListQueryKey, remaining);
+    queryClient.removeQueries({ queryKey: conversationQueryKey(activeId) });
+    if (remaining[0]) {
+      void navigateToConversation(remaining[0].id, true);
     } else {
-      setActive(null);
+      void navigateToChatRoot(true);
     }
-  }, [activeId]);
+  }, [
+    activeConversationQuery.error,
+    activeConversationQuery.status,
+    activeId,
+    conversations,
+    navigateToChatRoot,
+    navigateToConversation,
+    queryClient
+  ]);
 
-  const create = async () => {
-    const conversation = await api.createConversation();
-    setConversations((current) => [conversation, ...current]);
-    navigateToConversation(conversation.id);
-    setActive(conversation);
-  };
+  const createMutation = useMutation({
+    mutationFn: () => api.createConversation(),
+    onSuccess: (conversation) => {
+      queryClient.setQueryData<ConversationSummary[]>(conversationListQueryKey, (current = []) => [
+        toConversationSummary(conversation),
+        ...current.filter((row) => row.id !== conversation.id)
+      ]);
+      queryClient.setQueryData(conversationQueryKey(conversation.id), conversation);
+      void navigateToConversation(conversation.id);
+    }
+  });
 
-  const remove = async (id: string) => {
-    await api.deleteConversation(id);
-    const remaining = conversations.filter((row) => row.id !== id);
-    setConversations(remaining);
-    if (activeId === id) {
-      setActive(null);
-      if (remaining[0]) {
-        navigateToConversation(remaining[0].id, "replace");
-      } else {
-        navigateToChatRoot("replace");
+  const deleteMutation = useMutation({
+    mutationFn: api.deleteConversation,
+    onMutate: async (conversationId) => {
+      await queryClient.cancelQueries({ queryKey: conversationListQueryKey });
+      const previous = queryClient.getQueryData<ConversationSummary[]>(conversationListQueryKey);
+      queryClient.setQueryData<ConversationSummary[]>(conversationListQueryKey, (current = []) =>
+        current.filter((conversation) => conversation.id !== conversationId)
+      );
+      queryClient.removeQueries({ queryKey: conversationQueryKey(conversationId) });
+      return { previous };
+    },
+    onError: (_error, _conversationId, context) => {
+      if (context?.previous) {
+        queryClient.setQueryData(conversationListQueryKey, context.previous);
       }
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: conversationListQueryKey });
     }
-  };
+  });
+
+  const create = useCallback(() => {
+    createMutation.mutate();
+  }, [createMutation]);
+
+  const remove = useCallback(
+    async (conversationId: string) => {
+      const rows = queryClient.getQueryData<ConversationSummary[]>(conversationListQueryKey) ?? conversations;
+      const remaining = rows.filter((conversation) => conversation.id !== conversationId);
+      await deleteMutation.mutateAsync(conversationId);
+      if (activeId !== conversationId) return;
+      if (remaining[0]) {
+        void navigateToConversation(remaining[0].id, true);
+      } else {
+        void navigateToChatRoot(true);
+      }
+    },
+    [
+      activeId,
+      conversations,
+      deleteMutation,
+      navigateToChatRoot,
+      navigateToConversation,
+      queryClient
+    ]
+  );
+
+  const refreshConversation = useCallback(
+    async (conversationId: string) => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: conversationListQueryKey }),
+        queryClient.invalidateQueries({ queryKey: conversationQueryKey(conversationId) })
+      ]);
+    },
+    [queryClient]
+  );
+
+  const applyTitleUpdate = useCallback(
+    (conversationId: string, title: string) => {
+      queryClient.setQueryData<ConversationSummary[]>(conversationListQueryKey, (current = []) =>
+        current.map((conversation) =>
+          conversation.id === conversationId ? { ...conversation, title } : conversation
+        )
+      );
+      queryClient.setQueryData<ConversationDetail | undefined>(
+        conversationQueryKey(conversationId),
+        (current) => (current ? { ...current, title } : current)
+      );
+    },
+    [queryClient]
+  );
 
   return (
     <div className="flex h-screen min-h-0 bg-[var(--color-background)] text-[var(--color-foreground)]">
@@ -114,39 +165,23 @@ export function App() {
         conversations={conversations}
         activeId={activeId}
         onCreate={create}
-        onSelect={navigateToConversation}
         onDelete={remove}
         themeMode={theme.mode}
         onThemeModeChange={theme.setMode}
       />
       <ChatPane
         conversation={active}
-        onRefresh={refreshChatState}
+        onRefresh={refreshConversation}
         onTitleUpdated={applyTitleUpdate}
       />
     </div>
   );
 }
 
-function routeConversationId() {
-  const [, segment, conversationId] = window.location.pathname.split("/");
-  if (segment !== "chat" || !conversationId) return null;
-  try {
-    return decodeURIComponent(conversationId);
-  } catch {
-    return null;
-  }
-}
-
-function writeConversationRoute(id: string, mode: "push" | "replace") {
-  const path = `/chat/${encodeURIComponent(id)}`;
-  if (window.location.pathname === path) return;
-  const method = mode === "replace" ? "replaceState" : "pushState";
-  window.history[method](null, "", path);
-}
-
-function writeChatRootRoute(mode: "push" | "replace") {
-  if (window.location.pathname === "/chat") return;
-  const method = mode === "replace" ? "replaceState" : "pushState";
-  window.history[method](null, "", "/chat");
+function toConversationSummary(conversation: ConversationDetail): ConversationSummary {
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    updated_at: conversation.updated_at
+  };
 }

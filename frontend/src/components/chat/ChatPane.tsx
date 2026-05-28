@@ -14,8 +14,8 @@ export function ChatPane({
   onTitleUpdated
 }: {
   conversation: ConversationDetail | null;
-  onRefresh: () => void;
-  onTitleUpdated: (title: string) => void;
+  onRefresh: (conversationId: string) => void | Promise<void>;
+  onTitleUpdated: (conversationId: string, title: string) => void | Promise<void>;
 }) {
   const [draft, setDraft] = useState("");
   const shellRef = useRef<HTMLElement | null>(null);
@@ -85,7 +85,7 @@ export function ChatPane({
     } catch (err) {
       setDraft(text);
       setStatus("error");
-      onRefresh();
+      void onRefresh(conversation.id);
     }
   };
 
