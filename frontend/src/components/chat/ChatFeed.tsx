@@ -1,6 +1,7 @@
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, CheckIcon, CopyIcon } from "lucide-react";
 import {
   CSSProperties,
+  Fragment,
   ReactNode,
   Ref,
   useEffect,
@@ -30,6 +31,7 @@ export type ChatFeedProps = {
   showThinking?: boolean;
   notice?: string | null;
   noticeTone?: "muted" | "danger";
+  noticeAction?: ReactNode;
   className?: string;
   contentClassName?: string;
   renderMessage?: (message: MessageDto, context: ChatMessageRenderContext) => ReactNode;
@@ -45,6 +47,7 @@ export function ChatFeed({
   showThinking = false,
   notice,
   noticeTone = "muted",
+  noticeAction,
   className,
   contentClassName,
   renderMessage = defaultRenderMessage
@@ -156,19 +159,21 @@ export function ChatFeed({
               </ChatTurnContainer>
             );
           })}
+          <div aria-hidden className="h-[var(--chat-composer-half-height)] shrink-0" />
           <div ref={sentinelRef} aria-hidden className="h-px" />
         </div>
       </div>
       {notice ? (
         <div
           className={cn(
-            "absolute bottom-4 left-5 text-sm",
+            "absolute bottom-4 left-5 flex max-w-[min(42rem,calc(100%-2.5rem))] items-center gap-2 text-sm",
             noticeTone === "danger"
               ? "text-[var(--color-danger)]"
               : "text-[var(--color-text-muted)]"
           )}
         >
-          {notice}
+          <span>{notice}</span>
+          {noticeAction}
         </div>
       ) : null}
       {escaped ? (
@@ -204,16 +209,16 @@ function ChatTurnContainer({
   return (
     <div
       ref={ref}
-      className="flex flex-col gap-6 pb-6 scroll-mt-0"
+      className="flex flex-col scroll-mt-0"
       style={isLastTurn ? LAST_TURN_STYLE : undefined}
     >
       {turn.messages.map((message) => (
-        <div key={message.id} className="flex items-center py-2">
+        <Fragment key={message.id}>
           {renderMessage(message, {
             isStreaming: message.id === "assistant-live" && busy,
             isLastTurn
           })}
-        </div>
+        </Fragment>
       ))}
       {isLastTurn ? children : null}
     </div>
@@ -227,32 +232,96 @@ export function ChatMessageRow({
   message: MessageDto;
   streaming: boolean;
 }) {
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | undefined>(undefined);
+  const isUser = message.role === "user";
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
+
+  const copyMessage = async () => {
+    await copyText(message.content);
+    setCopied(true);
+    if (copyTimerRef.current) {
+      window.clearTimeout(copyTimerRef.current);
+    }
+    copyTimerRef.current = window.setTimeout(() => setCopied(false), 1400);
+  };
+
   return (
-    <div className={message.role === "user" ? "flex w-full justify-end" : "w-full"}>
+    <div className={isUser ? "group my-3 flex w-full justify-end" : "group my-3 w-full"}>
       <div
         className={
-          message.role === "user"
-            ? "max-w-[80%] rounded-lg bg-[var(--color-primary)] px-4 py-3 text-sm leading-6 text-[var(--color-primary-text)]"
-            : "max-w-none text-[var(--color-text)]"
+          isUser
+            ? "flex max-w-[80%] flex-col items-end"
+            : "flex w-full max-w-none flex-col items-start"
         }
       >
-        {message.role === "assistant" ? (
-          <>
-            <MessageBody
-              content={message.content}
-              streaming={streaming}
-              citations={message.citations}
-            />
-            {message.interrupted ? (
-              <div className="mt-2 text-xs text-[var(--color-text-muted)]">Interrupted</div>
-            ) : null}
-          </>
-        ) : (
-          message.content
-        )}
+        <div
+          className={
+            isUser
+              ? "rounded-lg bg-[var(--color-primary)] px-4 py-3 text-sm leading-6 text-[var(--color-primary-text)]"
+              : "w-full text-[var(--color-text)]"
+          }
+        >
+          {message.role === "assistant" ? (
+            <>
+              <MessageBody
+                content={message.content}
+                streaming={streaming}
+                citations={message.citations}
+              />
+              {message.interrupted ? (
+                <div className="mt-2 text-xs text-[var(--color-text-muted)]">Interrupted</div>
+              ) : null}
+            </>
+          ) : (
+            message.content
+          )}
+        </div>
+        <div
+          className={
+            isUser
+              ? "mt-1 flex h-7 items-center justify-end"
+              : "mt-1 flex h-7 items-center justify-start"
+          }
+        >
+          <button
+            type="button"
+            className="flex h-7 w-7 items-center justify-center rounded-full border-0 bg-transparent p-0 text-[var(--color-text-muted)] opacity-0 shadow-none transition-opacity hover:text-[var(--color-text)] focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-focus)] group-hover:opacity-100"
+            onClick={copyMessage}
+            aria-label={copied ? "Copied message" : "Copy message"}
+            title={copied ? "Copied" : "Copy"}
+          >
+            {copied ? <CheckIcon className="h-4 w-4" /> : <CopyIcon className="h-4 w-4" />}
+          </button>
+        </div>
       </div>
     </div>
   );
+}
+
+async function copyText(value: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.top = "-1000px";
+  textarea.style.left = "-1000px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
 }
 
 export function groupMessagesIntoTurns(messages: MessageDto[]): ChatTurn[] {

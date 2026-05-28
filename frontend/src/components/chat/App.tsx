@@ -144,6 +144,20 @@ export function App() {
     [queryClient]
   );
 
+  const resyncConversation = useCallback(
+    async (conversationId: string) => {
+      const [detail] = await Promise.all([
+        queryClient.fetchQuery({
+          queryKey: conversationQueryKey(conversationId),
+          queryFn: () => api.getConversation(conversationId)
+        }),
+        queryClient.invalidateQueries({ queryKey: conversationListQueryKey })
+      ]);
+      return detail.messages;
+    },
+    [queryClient]
+  );
+
   const applyTitleUpdate = useCallback(
     (conversationId: string, title: string) => {
       queryClient.setQueryData<ConversationSummary[]>(conversationListQueryKey, (current = []) =>
@@ -172,6 +186,7 @@ export function App() {
       <ChatPane
         conversation={active}
         onRefresh={refreshConversation}
+        onResync={resyncConversation}
         onTitleUpdated={applyTitleUpdate}
       />
     </div>

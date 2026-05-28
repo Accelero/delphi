@@ -1,17 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChatEvent, CitationEntry, MessageDto, ServerWsMessage } from "../lib/types";
 
-type ChatStatus = "ready" | "submitted" | "streaming" | "error";
+type ChatStatus = "ready" | "submitted" | "streaming" | "stopping" | "error";
 type LiveStatus = "submitted" | "streaming" | "stopping";
-export type RealtimeStatus = "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
+export type RealtimeConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected";
+export type RealtimeRecoveryStatus = "idle" | "resyncing" | "retrying" | "failed";
 
 type ChatSocketOptions = {
-  onResync?: (conversationId: string) => void | Promise<void>;
+  onResync?: (conversationId: string) => MessageDto[] | void | Promise<MessageDto[] | void>;
   onTerminalRefresh?: (conversationId: string) => void | Promise<void>;
   onTitleUpdated?: (conversationId: string, title: string) => void | Promise<void>;
 };
 
 const RECONNECT_DELAYS_MS = [250, 500, 1000, 2000, 5000];
+const RESYNC_DELAYS_MS = [500, 1000, 2000, 5000, 10000];
 
 export function useChatSocket(
   conversationId: string | null,
@@ -19,10 +26,14 @@ export function useChatSocket(
   options: ChatSocketOptions = {}
 ) {
   const [messages, setMessages] = useState<MessageDto[]>(seedMessages);
-  const [status, setStatus] = useState<ChatStatus | LiveStatus>("ready");
-  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>("idle");
+  const [status, setStatus] = useState<ChatStatus>("ready");
+  const [connectionStatus, setConnectionStatus] = useState<RealtimeConnectionStatus>("idle");
+  const [recoveryStatus, setRecoveryStatus] = useState<RealtimeRecoveryStatus>("idle");
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [recoveryAttempt, setRecoveryAttempt] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const statusRef = useRef<ChatStatus | LiveStatus>("ready");
+  const statusRef = useRef<ChatStatus>("ready");
+  const recoveryStatusRef = useRef<RealtimeRecoveryStatus>("idle");
   const seedSignatureRef = useRef("");
   const lastEventIdByConversationRef = useRef(new Map<string, string>());
   const inFlightUserIdRef = useRef<string | null>(null);
@@ -32,11 +43,17 @@ export function useChatSocket(
   const onResyncRef = useRef(options.onResync);
   const onTerminalRefreshRef = useRef(options.onTerminalRefresh);
   const onTitleUpdatedRef = useRef(options.onTitleUpdated);
+  const reconnectNowRef = useRef<() => void>(() => undefined);
+  const retryRecoveryRef = useRef<() => void>(() => undefined);
   const seedSignature = useMemo(() => messagesSignature(seedMessages), [seedMessages]);
 
   useEffect(() => {
     statusRef.current = status;
   }, [status]);
+
+  useEffect(() => {
+    recoveryStatusRef.current = recoveryStatus;
+  }, [recoveryStatus]);
 
   useEffect(() => {
     onResyncRef.current = options.onResync;
@@ -49,6 +66,10 @@ export function useChatSocket(
     setMessages(seedMessages);
     setStatus("ready");
     setError(null);
+    recoveryStatusRef.current = "idle";
+    setRecoveryStatus("idle");
+    setRecoveryError(null);
+    setRecoveryAttempt(0);
     inFlightUserIdRef.current = null;
     inFlightTurnIdRef.current = null;
     overlayTextRef.current = "";
@@ -164,7 +185,7 @@ export function useChatSocket(
 
   useEffect(() => {
     if (!conversationId) {
-      setRealtimeStatus("idle");
+      setConnectionStatus("idle");
       return;
     }
 
@@ -172,8 +193,11 @@ export function useChatSocket(
     let closedByEffect = false;
     let socket: WebSocket | null = null;
     let reconnectTimer: number | undefined;
+    let resyncTimer: number | undefined;
     let pingTimer: number | undefined;
     let reconnectAttempt = 0;
+    let resyncAttempt = 0;
+    let resyncInFlight = false;
 
     const clearTimers = () => {
       if (reconnectTimer) {
@@ -184,18 +208,27 @@ export function useChatSocket(
         window.clearInterval(pingTimer);
         pingTimer = undefined;
       }
+      if (resyncTimer) {
+        window.clearTimeout(resyncTimer);
+        resyncTimer = undefined;
+      }
     };
 
-    const resetTransientState = () => {
-      const inFlightUserId = inFlightUserIdRef.current;
+    const resetLiveState = () => {
       setStatus("ready");
       overlayTextRef.current = "";
       inFlightUserIdRef.current = null;
       inFlightTurnIdRef.current = null;
       liveCitationsRef.current = [];
-      setMessages((current) =>
-        current.filter((message) => message.id !== "assistant-live" && message.id !== inFlightUserId)
-      );
+    };
+
+    const replaceWithAuthoritativeMessages = (nextMessages: MessageDto[]) => {
+      setStatus("ready");
+      overlayTextRef.current = "";
+      inFlightUserIdRef.current = null;
+      inFlightTurnIdRef.current = null;
+      liveCitationsRef.current = [];
+      setMessages(nextMessages);
     };
 
     const subscribe = (target: WebSocket) => {
@@ -206,6 +239,60 @@ export function useChatSocket(
           last_event_id: lastEventIdByConversationRef.current.get(conversationId) ?? null
         })
       );
+    };
+
+    const finishRecovery = (nextMessages?: MessageDto[] | void) => {
+      if (Array.isArray(nextMessages)) {
+        replaceWithAuthoritativeMessages(nextMessages);
+      } else {
+        resetLiveState();
+      }
+      recoveryStatusRef.current = "idle";
+      setRecoveryStatus("idle");
+      setRecoveryError(null);
+      setRecoveryAttempt(0);
+      resyncAttempt = 0;
+      if (socket?.readyState === WebSocket.OPEN) {
+        subscribe(socket);
+      }
+    };
+
+    const runResync = () => {
+      if (closedByEffect) return;
+      if (resyncInFlight) return;
+      if (resyncTimer) {
+        window.clearTimeout(resyncTimer);
+        resyncTimer = undefined;
+      }
+
+      resyncInFlight = true;
+      const attempt = resyncAttempt;
+      recoveryStatusRef.current = attempt === 0 ? "resyncing" : "retrying";
+      setRecoveryAttempt(attempt + 1);
+      setRecoveryStatus(attempt === 0 ? "resyncing" : "retrying");
+      setRecoveryError(null);
+
+      void Promise.resolve(onResyncRef.current?.(conversationId))
+        .then(finishRecovery)
+        .catch((err) => {
+          if (closedByEffect) return;
+          const message = err instanceof Error ? err.message : "Unable to resync chat state.";
+          recoveryStatusRef.current = "retrying";
+          setRecoveryStatus("retrying");
+          setRecoveryError(message);
+          const baseDelay = RESYNC_DELAYS_MS[Math.min(attempt, RESYNC_DELAYS_MS.length - 1)];
+          const jitter = Math.floor(Math.random() * 250);
+          resyncAttempt += 1;
+          resyncTimer = window.setTimeout(runResync, baseDelay + jitter);
+        })
+        .finally(() => {
+          resyncInFlight = false;
+        });
+    };
+
+    retryRecoveryRef.current = () => {
+      resyncAttempt = 0;
+      runResync();
     };
 
     const handleMessage = (raw: MessageEvent<string>) => {
@@ -223,12 +310,7 @@ export function useChatSocket(
         lastEventIdByConversationRef.current.set(conversationId, msg.event_id);
       } else if (msg.type === "resync_required" && msg.conversation_id === conversationId) {
         lastEventIdByConversationRef.current.delete(conversationId);
-        resetTransientState();
-        void Promise.resolve(onResyncRef.current?.(conversationId)).finally(() => {
-          if (socket?.readyState === WebSocket.OPEN) {
-            subscribe(socket);
-          }
-        });
+        runResync();
       } else if (msg.type === "error") {
         setStatus("error");
         setError(msg.message);
@@ -237,7 +319,7 @@ export function useChatSocket(
 
     const scheduleReconnect = () => {
       if (closedByEffect) return;
-      setRealtimeStatus(reconnectAttempt === 0 ? "disconnected" : "reconnecting");
+      setConnectionStatus(reconnectAttempt === 0 ? "disconnected" : "reconnecting");
       const baseDelay = RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
       const jitter = Math.floor(Math.random() * 150);
       reconnectAttempt += 1;
@@ -246,17 +328,26 @@ export function useChatSocket(
 
     const connect = () => {
       if (closedByEffect) return;
-      clearTimers();
+      if (reconnectTimer) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
+      if (pingTimer) {
+        window.clearInterval(pingTimer);
+        pingTimer = undefined;
+      }
       socket?.close();
-      setRealtimeStatus(reconnectAttempt === 0 ? "connecting" : "reconnecting");
+      setConnectionStatus(reconnectAttempt === 0 ? "connecting" : "reconnecting");
       const nextSocket = new WebSocket(`${protocol}://${window.location.host}/ws/chat`);
       socket = nextSocket;
 
       nextSocket.addEventListener("open", () => {
         reconnectAttempt = 0;
-        setRealtimeStatus("connected");
+        setConnectionStatus("connected");
         setError(null);
-        subscribe(nextSocket);
+        if (recoveryStatusRef.current === "idle") {
+          subscribe(nextSocket);
+        }
         pingTimer = window.setInterval(() => {
           if (nextSocket.readyState === WebSocket.OPEN) {
             nextSocket.send(JSON.stringify({ type: "ping" }));
@@ -274,6 +365,11 @@ export function useChatSocket(
       });
     };
 
+    reconnectNowRef.current = () => {
+      reconnectAttempt = 0;
+      connect();
+    };
+
     connect();
 
     return () => {
@@ -283,7 +379,9 @@ export function useChatSocket(
         socket.close();
         socket = null;
       }
-      setRealtimeStatus("idle");
+      setConnectionStatus("idle");
+      retryRecoveryRef.current = () => undefined;
+      reconnectNowRef.current = () => undefined;
     };
   }, [conversationId, applyEvent]);
 
@@ -295,14 +393,19 @@ export function useChatSocket(
   return {
     messages,
     status,
-    realtimeStatus,
+    connectionStatus,
+    recoveryStatus,
+    recoveryError,
+    recoveryAttempt,
     error,
     lastMessageId,
+    reconnectNow: () => reconnectNowRef.current(),
+    retryRecovery: () => retryRecoveryRef.current(),
     setStatus
   };
 }
 
-function isLiveStatus(status: ChatStatus | LiveStatus): status is LiveStatus {
+function isLiveStatus(status: ChatStatus): status is LiveStatus {
   return status === "submitted" || status === "streaming" || status === "stopping";
 }
 

@@ -3,7 +3,7 @@ import { type CSSProperties, FormEvent, useLayoutEffect, useRef, useState } from
 import { ulid } from "ulid";
 import { useChatSocket } from "../../hooks/useChatSocket";
 import { api } from "../../lib/api";
-import type { ConversationDetail } from "../../lib/types";
+import type { ConversationDetail, MessageDto } from "../../lib/types";
 import { Button } from "../ui/button";
 import { Textarea } from "../ui/textarea";
 import { ChatFeed } from "./ChatFeed";
@@ -11,10 +11,12 @@ import { ChatFeed } from "./ChatFeed";
 export function ChatPane({
   conversation,
   onRefresh,
+  onResync,
   onTitleUpdated
 }: {
   conversation: ConversationDetail | null;
   onRefresh: (conversationId: string) => void | Promise<void>;
+  onResync: (conversationId: string) => MessageDto[] | void | Promise<MessageDto[] | void>;
   onTitleUpdated: (conversationId: string, title: string) => void | Promise<void>;
 }) {
   const [draft, setDraft] = useState("");
@@ -23,22 +25,30 @@ export function ChatPane({
   const {
     messages,
     status,
-    realtimeStatus,
+    connectionStatus,
+    recoveryStatus,
+    recoveryError,
+    recoveryAttempt,
     error,
     lastMessageId,
+    reconnectNow,
+    retryRecovery,
     setStatus
   } = useChatSocket(conversation?.id ?? null, conversation?.messages ?? [], {
-    onResync: onRefresh,
+    onResync,
     onTerminalRefresh: onRefresh,
     onTitleUpdated
   });
   const busy = status === "submitted" || status === "streaming" || status === "stopping";
   const stopping = status === "stopping";
   const showThinking = busy && messages.at(-1)?.role === "user";
-  const statusNotice =
-    realtimeStatus === "reconnecting" || realtimeStatus === "disconnected"
-      ? "Reconnecting..."
-      : error;
+  const notice = buildRealtimeNotice({
+    connectionStatus,
+    recoveryStatus,
+    recoveryAttempt,
+    recoveryError,
+    error
+  });
 
   useLayoutEffect(() => {
     const shell = shellRef.current;
@@ -58,6 +68,10 @@ export function ChatPane({
         "--chat-scroll-button-offset",
         `calc(${Math.max(0, composerRect.height / 2)}px + 0.75rem)`
       );
+      shell.style.setProperty(
+        "--chat-composer-half-height",
+        `${Math.max(0, composerRect.height / 2)}px`
+      );
     };
 
     sync();
@@ -65,7 +79,7 @@ export function ChatPane({
     observer.observe(shell);
     observer.observe(composer);
     return () => observer.disconnect();
-  }, []);
+  }, [conversation?.id]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -111,7 +125,8 @@ export function ChatPane({
       style={
         {
           "--chat-composer-center-offset": "4rem",
-          "--chat-scroll-button-offset": "4.75rem"
+          "--chat-scroll-button-offset": "4.75rem",
+          "--chat-composer-half-height": "3rem"
         } as CSSProperties
       }
       className="relative flex h-full min-w-0 flex-1 flex-col bg-[var(--color-surface)]"
@@ -120,8 +135,19 @@ export function ChatPane({
         messages={messages}
         busy={busy}
         showThinking={showThinking}
-        notice={statusNotice}
-        noticeTone={error ? "danger" : "muted"}
+        notice={notice.message}
+        noticeTone={notice.tone}
+        noticeAction={
+          notice.action === "retry-recovery" ? (
+            <Button type="button" size="sm" variant="outline" onClick={retryRecovery}>
+              Retry now
+            </Button>
+          ) : notice.action === "reconnect" ? (
+            <Button type="button" size="sm" variant="outline" onClick={reconnectNow}>
+              Reconnect now
+            </Button>
+          ) : null
+        }
         className="absolute inset-x-0 top-0 bottom-[var(--chat-composer-center-offset)]"
       />
       <form
@@ -152,7 +178,7 @@ export function ChatPane({
               onClick={stop}
               disabled={stopping}
               aria-label={stopping ? "Stopping" : "Stop"}
-              className="mb-1 shrink-0 cursor-pointer rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-chat-submit-hover)] disabled:cursor-default disabled:opacity-100"
+              className="shrink-0 cursor-pointer rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-chat-submit-hover)] disabled:cursor-default disabled:opacity-100"
             >
               {stopping ? (
                 <LoaderCircle className="h-5 w-5 animate-spin" />
@@ -166,7 +192,7 @@ export function ChatPane({
               size="icon"
               disabled={!draft.trim()}
               aria-label="Send"
-              className="mb-1 shrink-0 cursor-pointer rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-chat-submit-hover)] disabled:cursor-default disabled:opacity-100"
+              className="shrink-0 cursor-pointer rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-chat-submit-hover)] disabled:cursor-default disabled:opacity-100"
             >
               <ArrowUp className="h-5 w-5" />
             </Button>
@@ -175,4 +201,65 @@ export function ChatPane({
       </form>
     </main>
   );
+}
+
+function buildRealtimeNotice({
+  connectionStatus,
+  recoveryStatus,
+  recoveryAttempt,
+  recoveryError,
+  error
+}: {
+  connectionStatus: "idle" | "connecting" | "connected" | "reconnecting" | "disconnected";
+  recoveryStatus: "idle" | "resyncing" | "retrying" | "failed";
+  recoveryAttempt: number;
+  recoveryError: string | null;
+  error: string | null;
+}): {
+  message: string | null;
+  tone: "muted" | "danger";
+  action: "retry-recovery" | "reconnect" | null;
+} {
+  if (recoveryStatus === "resyncing") {
+    return {
+      message: "Syncing the latest messages...",
+      tone: "muted",
+      action: null
+    };
+  }
+  if (recoveryStatus === "retrying" || recoveryStatus === "failed") {
+    const retryText =
+      recoveryAttempt > 1 ? ` Retrying automatically (${recoveryAttempt}).` : " Retrying automatically.";
+    return {
+      message: `${recoveryError ?? "Unable to sync the latest messages."}${retryText}`,
+      tone: "danger",
+      action: "retry-recovery"
+    };
+  }
+  if (connectionStatus === "connecting") {
+    return {
+      message: "Connecting to realtime...",
+      tone: "muted",
+      action: null
+    };
+  }
+  if (connectionStatus === "reconnecting" || connectionStatus === "disconnected") {
+    return {
+      message: "Connection interrupted. Reconnecting automatically...",
+      tone: "muted",
+      action: "reconnect"
+    };
+  }
+  if (error) {
+    return {
+      message: error,
+      tone: "danger",
+      action: null
+    };
+  }
+  return {
+    message: null,
+    tone: "muted",
+    action: null
+  };
 }

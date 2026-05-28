@@ -11,7 +11,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (response.status === 401) {
-    window.location.assign("/oauth2/sign_in");
+    window.location.assign(`/oauth2/start?rd=${encodeURIComponent(window.location.href)}`);
     throw new Error("unauthorized");
   }
 
