@@ -1,4 +1,6 @@
-import { MessageSquarePlus, Trash2 } from "lucide-react";
+import { MessageSquarePlus, Monitor, Moon, Sun, Trash2 } from "lucide-react";
+import type { ReactNode } from "react";
+import type { ThemeMode } from "../../hooks/useThemeMode";
 import type { ConversationSummary } from "../../lib/types";
 import { Button } from "../ui/button";
 
@@ -7,17 +9,21 @@ export function ConversationSidebar({
   activeId,
   onCreate,
   onSelect,
-  onDelete
+  onDelete,
+  themeMode,
+  onThemeModeChange
 }: {
   conversations: ConversationSummary[];
   activeId: string | null;
   onCreate: () => void;
   onSelect: (id: string) => void;
   onDelete: (id: string) => void;
+  themeMode: ThemeMode;
+  onThemeModeChange: (mode: ThemeMode) => void;
 }) {
   return (
-    <aside className="flex h-full w-72 shrink-0 flex-col border-r border-stone-200 bg-stone-50">
-      <div className="flex h-14 items-center justify-between border-b border-stone-200 px-3">
+    <aside className="flex h-full w-72 shrink-0 flex-col border-r border-[var(--color-border)] bg-[var(--color-surface-muted)]">
+      <div className="flex h-14 items-center justify-between border-b border-[var(--color-border)] px-3">
         <div className="text-sm font-semibold">Delphi</div>
         <Button size="icon" variant="ghost" onClick={onCreate} aria-label="New chat">
           <MessageSquarePlus className="h-4 w-4" />
@@ -29,8 +35,8 @@ export function ConversationSidebar({
             key={conversation.id}
             className={
               conversation.id === activeId
-                ? "group flex items-center rounded-md bg-white shadow-sm"
-                : "group flex items-center rounded-md hover:bg-white"
+                ? "group flex items-center rounded-md bg-[var(--color-surface-raised)] shadow-[var(--shadow-raised)]"
+                : "group flex items-center rounded-md hover:bg-[var(--color-surface-hover)]"
             }
           >
             <button
@@ -51,6 +57,64 @@ export function ConversationSidebar({
           </div>
         ))}
       </div>
+      <div className="border-t border-[var(--color-border)] p-2">
+        <div className="grid grid-cols-3 gap-1 rounded-md bg-[var(--color-surface)] p-1">
+          <ThemeButton
+            mode="system"
+            active={themeMode === "system"}
+            onClick={onThemeModeChange}
+            label="System theme"
+          >
+            <Monitor className="h-4 w-4" />
+          </ThemeButton>
+          <ThemeButton
+            mode="light"
+            active={themeMode === "light"}
+            onClick={onThemeModeChange}
+            label="Light theme"
+          >
+            <Sun className="h-4 w-4" />
+          </ThemeButton>
+          <ThemeButton
+            mode="dark"
+            active={themeMode === "dark"}
+            onClick={onThemeModeChange}
+            label="Dark theme"
+          >
+            <Moon className="h-4 w-4" />
+          </ThemeButton>
+        </div>
+      </div>
     </aside>
+  );
+}
+
+function ThemeButton({
+  mode,
+  active,
+  onClick,
+  label,
+  children
+}: {
+  mode: ThemeMode;
+  active: boolean;
+  onClick: (mode: ThemeMode) => void;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      className={
+        active
+          ? "flex h-8 items-center justify-center rounded bg-[var(--color-surface-raised)] text-[var(--color-text)] shadow-[var(--shadow-raised)]"
+          : "flex h-8 items-center justify-center rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+      }
+      onClick={() => onClick(mode)}
+      aria-label={label}
+      title={label}
+    >
+      {children}
+    </button>
   );
 }

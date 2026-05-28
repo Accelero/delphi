@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useThemeMode } from "../../hooks/useThemeMode";
 import { api } from "../../lib/api";
 import type { ConversationDetail, ConversationSummary } from "../../lib/types";
 import { ChatPane } from "./ChatPane";
@@ -8,6 +9,7 @@ export function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [active, setActive] = useState<ConversationDetail | null>(null);
+  const theme = useThemeMode();
 
   const refreshList = useCallback(async () => {
     const rows = await api.listConversations();
@@ -80,13 +82,15 @@ export function App() {
   };
 
   return (
-    <div className="flex h-screen min-h-0 bg-white text-stone-950">
+    <div className="flex h-screen min-h-0 bg-[var(--color-app)] text-[var(--color-text)]">
       <ConversationSidebar
         conversations={conversations}
         activeId={activeId}
         onCreate={create}
         onSelect={setActiveId}
         onDelete={remove}
+        themeMode={theme.mode}
+        onThemeModeChange={theme.setMode}
       />
       <ChatPane
         conversation={active}

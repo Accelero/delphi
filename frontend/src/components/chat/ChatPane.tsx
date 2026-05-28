@@ -94,12 +94,14 @@ export function ChatPane({
   };
 
   if (!conversation) {
-    return <main className="flex flex-1 items-center justify-center text-sm text-stone-500" />;
+    return (
+      <main className="flex flex-1 items-center justify-center text-sm text-[var(--color-text-muted)]" />
+    );
   }
 
   return (
-    <main className="flex h-full min-w-0 flex-1 flex-col bg-white">
-      <div className="flex h-14 items-center border-b border-stone-200 px-5">
+    <main className="flex h-full min-w-0 flex-1 flex-col bg-[var(--color-surface)]">
+      <div className="flex h-14 items-center border-b border-[var(--color-border)] px-5">
         <h1 className="truncate text-sm font-semibold">{conversation.title}</h1>
       </div>
       <div className="relative min-h-0 flex-1">
@@ -125,12 +127,12 @@ export function ChatPane({
               </section>
             ))}
             {busy && messages.at(-1)?.role === "user" ? (
-              <div className="pb-8 text-sm text-stone-500">Thinking...</div>
+              <div className="pb-8 text-sm text-[var(--color-text-muted)]">Thinking...</div>
             ) : null}
             {realtimeStatus === "reconnecting" || realtimeStatus === "disconnected" ? (
-              <div className="pb-8 text-sm text-stone-500">Reconnecting...</div>
+              <div className="pb-8 text-sm text-[var(--color-text-muted)]">Reconnecting...</div>
             ) : null}
-            {error ? <div className="pb-8 text-sm text-red-600">{error}</div> : null}
+            {error ? <div className="pb-8 text-sm text-[var(--color-danger)]">{error}</div> : null}
             <div ref={sentinelRef} aria-hidden className="h-px" />
           </div>
         </div>
@@ -138,7 +140,7 @@ export function ChatPane({
           <Button
             size="icon"
             variant="outline"
-            className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full bg-white"
+            className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full"
             onClick={() => sentinelRef.current?.scrollIntoView({ block: "end", behavior: "smooth" })}
             aria-label="Scroll to bottom"
           >
@@ -146,7 +148,7 @@ export function ChatPane({
           </Button>
         ) : null}
       </div>
-      <form onSubmit={submit} className="border-t border-stone-200 p-4">
+      <form onSubmit={submit} className="border-t border-[var(--color-border)] p-4">
         <div className="mx-auto flex max-w-3xl gap-2">
           <Textarea
             value={draft}
@@ -191,15 +193,15 @@ function MessageRow({ message, streaming }: { message: MessageDto; streaming: bo
       <div
         className={
           message.role === "user"
-            ? "max-w-[80%] rounded-lg bg-stone-950 px-4 py-3 text-sm leading-6 text-white"
-            : "max-w-none text-stone-900"
+            ? "max-w-[80%] rounded-lg bg-[var(--color-primary)] px-4 py-3 text-sm leading-6 text-[var(--color-primary-text)]"
+            : "max-w-none text-[var(--color-text)]"
         }
       >
         {message.role === "assistant" ? (
           <>
             <MessageBody content={message.content} streaming={streaming} />
             {message.interrupted ? (
-              <div className="mt-2 text-xs text-stone-500">Interrupted</div>
+              <div className="mt-2 text-xs text-[var(--color-text-muted)]">Interrupted</div>
             ) : null}
           </>
         ) : (

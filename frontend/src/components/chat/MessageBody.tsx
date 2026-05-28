@@ -12,7 +12,7 @@ export function MessageBody({
   const shown = useSmoothedContent(content, streaming);
 
   return (
-    <div className="prose prose-stone max-w-none text-[15px] leading-7">
+    <div className="prose max-w-none text-[15px] leading-7 text-[var(--color-text)]">
       <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
     </div>
   );
