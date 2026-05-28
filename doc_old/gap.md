@@ -167,48 +167,73 @@ Open points:
 - Add query layer or explicitly keep the simpler local state for v1.
 - Invalidate/refetch conversation and list on `finish`, `interrupted`, `clear`,
   and `title_updated`.
-- Add route state for `/chat` and `/chat/:conversationId`.
+- ~~Add route state for `/chat` and `/chat/:conversationId`.~~
 - Make deletes, navigation, terminal events, title updates, and resyncs
   converge without manual refresh.
 
 ### Frontend Rendering
 
-Current rendering is React Markdown plus GFM and smoothing. The plan and old
-frontend include richer behavior.
+~~Current rendering is React Markdown plus GFM and smoothing. The plan and old
+frontend include richer behavior.~~
+
+Implemented: assistant messages now lazy-load the same streaming-oriented
+rendering stack used by the old frontend: Streamdown with CJK handling, Shiki
+code blocks, KaTeX math, Mermaid diagrams, and incomplete-markdown streaming
+support. `<think>...</think>` blocks are split into a collapsible reasoning
+section. Direct `react-markdown`/`remark-gfm` dependencies were removed because
+Streamdown owns the GFM path.
 
 Open points:
 
-- Streaming-safe markdown renderer.
-- Math, mermaid, CJK/code handling.
-- `<think>...</think>` reasoning block parsing.
-- Citation marker rewrite from `[N]` to source links.
+- ~~Streaming-safe markdown renderer.~~
+- ~~Math, mermaid, CJK/code handling.~~
+- ~~`<think>...</think>` reasoning block parsing.~~
+- ~~Citation marker rewrite from `[N]` to source links.~~ Frontend support
+  exists for current `CitationEntry` URLs; backend RAG/citation population
+  remains under RAG And Citations.
 - Copy message action.
 
 ### Scroll Behavior
 
-The current UI has the sentinel and bottom-follow pattern. It does not fully
-match the old scroll model.
+~~The current UI has the sentinel and bottom-follow pattern. It does not fully
+match the old scroll model.~~
+
+Implemented: the chat pane now uses the old ref-driven scroll model. A new
+turn re-engages follow mode and pins the turn top into view, the last turn uses
+the measured scroll viewport height for its minimum height, and the sentinel
+observer remains as a post-paint layout-shift backup.
 
 Open points:
 
-- Re-enable follow mode when a new turn starts.
-- Pin the new turn to the top with `scrollIntoView({ block: "start" })`.
-- Base last-turn min-height on the scroll viewport rather than a fixed viewport
-  expression.
-- Preserve the old post-paint layout-shift backup behavior.
+- ~~Re-enable follow mode when a new turn starts.~~
+- ~~Pin the new turn to the top with `scrollIntoView({ block: "start" })`.~~
+- ~~Base last-turn min-height on the scroll viewport rather than a fixed
+  viewport expression.~~
+- ~~Preserve the old post-paint layout-shift backup behavior.~~
+- Add browser coverage for new-turn pinning, follow escape, follow re-entry,
+  and late layout shifts.
 
 ### Title Generation
 
-Current storage sets the title to the first 48 user-message characters when the
-title is `New chat`. Old chat generated a title after the first assistant
-response, persisted it, and pushed a live title event.
+~~Current storage sets the title to the first 48 user-message characters when
+the title is `New chat`. Old chat generated a title after the first assistant
+response, persisted it, and pushed a live title event.~~
+
+Implemented: the first successful assistant commit now starts a best-effort
+title generation task using the configurable title LLM client. The default
+points at the bundled OpenAI-compatible `title-llm` llama.cpp sidecar running
+`Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M`. Generated titles are persisted only if
+the conversation is still `New chat`, then `title_updated` is published for
+live frontend updates. The first-48-user-character fallback was removed.
 
 Open points:
 
-- Add title generation after first successful assistant commit.
-- Persist the generated title durably.
-- Publish `title_updated`.
-- Patch the sidebar and active conversation title on the frontend.
+- ~~Add title generation after first successful assistant commit.~~
+- ~~Persist the generated title durably.~~
+- ~~Publish `title_updated`.~~
+- ~~Patch the sidebar and active conversation title on the frontend.~~
+- Add full-stack coverage for first-turn title generation and live title
+  refresh.
 
 ### RAG And Citations
 
@@ -248,7 +273,14 @@ The service split is in place, but production hardening is thin.
 
 Open points:
 
-- Add readiness checks that include NATS and SurrealDB dependencies.
+- ~~Add readiness checks and Compose startup ordering for local stack
+  services.~~ API, realtime, chat-worker, frontend, Keycloak, Redis, and
+  title-llm now have Compose healthchecks, and Compose waits on health where
+  the images expose usable checks. NATS and SurrealDB still use restart policy
+  plus dependent service readiness because their images are effectively
+  distroless in this stack.
+- Add deeper readiness checks that actively verify NATS and SurrealDB
+  dependency operations from each service, not just process HTTP health.
 - Add metrics for command lag, lock age, replay failures, socket counts,
   reconnects, worker errors, and redeliveries.
 - Add structured tracing across API command id, turn id, worker id, NATS
@@ -263,9 +295,9 @@ Old behavior not yet ported:
 
 - RAG retrieval and citation prompt construction.
 - Citation persistence and citation marker rendering.
-- First-turn title generation and live title push.
-- Rich markdown/rendering behavior including reasoning block support.
-- More complete scroll pinning/follow behavior.
+- ~~First-turn title generation and live title push.~~
+- ~~Rich markdown/rendering behavior including reasoning block support.~~
+- ~~More complete scroll pinning/follow behavior.~~
 - Broader chat behavior test suite:
   - stop
   - late subscribe
@@ -295,13 +327,20 @@ Intentional difference:
    work is integration coverage.
 4. ~~Decide and implement turn lifecycle ownership.~~ Done: `requested` and
    `running` live in NATS KV, while terminal outcomes live in SurrealDB.
-5. Port old frontend scroll pinning and richer markdown/citation rendering.
-6. Add RAG/citations and title generation after the transport path is stable.
-7. Harden operations with dependency readiness, metrics, tracing, NATS auth
-   policy documentation, and stuck-turn runbooks.
-8. Add Playwright e2e for streaming, stop, late join, reconnect, and two-tab
+5. ~~Add first-turn title generation and live title push.~~ Done via the
+   title-llm sidecar path; remaining work is full-stack coverage.
+6. ~~Add Compose healthchecks and local startup ordering.~~ Done for local
+   stack services where the images support checks; deeper dependency
+   readiness remains under Operations.
+7. Add RAG/citations.
+8. ~~Port richer markdown rendering.~~ Done via Streamdown, CJK, Shiki, KaTeX,
+   Mermaid, and reasoning blocks; citation source population remains under
+   RAG/citations.
+9. Harden operations with metrics, tracing, NATS auth policy documentation,
+   deeper dependency readiness, and stuck-turn runbooks.
+10. Add Playwright e2e for streaming, stop, late join, reconnect, and two-tab
    fanout.
-9. Add backend integration tests for NATS/SurrealDB stop, replay, redelivery,
+11. Add backend integration tests for NATS/SurrealDB stop, replay, redelivery,
    crash recovery, and multi-replica behavior.
 
 ## Highest Risks
@@ -313,7 +352,7 @@ Intentional difference:
   behavior and consumer-count limits still need load testing.
 - `chat_turn` is terminal-only; active-turn recovery now lives in NATS KV but
   still needs full-stack crash tests.
-- Frontend parity is incomplete for citations, titles, rich rendering, and
-  route/query behavior.
-- RAG citations, source grounding, and title updates are still absent, so the
-  current chat is functionally below the old product surface.
+- Frontend parity is incomplete for citations, message copy, scroll behavior
+  test coverage, and route/query convergence.
+- RAG citations and source grounding are still absent, so the current chat is
+  functionally below the old product surface.

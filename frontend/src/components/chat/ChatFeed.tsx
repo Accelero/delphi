@@ -175,7 +175,7 @@ export function ChatFeed({
         <Button
           size="icon"
           variant="outline"
-          className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-full"
+          className="absolute bottom-[var(--chat-scroll-button-offset)] left-1/2 -translate-x-1/2 rounded-full"
           onClick={scrollToBottom}
           aria-label="Scroll to bottom"
         >
@@ -238,7 +238,11 @@ export function ChatMessageRow({
       >
         {message.role === "assistant" ? (
           <>
-            <MessageBody content={message.content} streaming={streaming} />
+            <MessageBody
+              content={message.content}
+              streaming={streaming}
+              citations={message.citations}
+            />
             {message.interrupted ? (
               <div className="mt-2 text-xs text-[var(--color-text-muted)]">Interrupted</div>
             ) : null}

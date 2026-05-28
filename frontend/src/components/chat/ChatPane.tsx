@@ -54,6 +54,10 @@ export function ChatPane({
         "--chat-composer-center-offset",
         `${Math.max(0, composerCenterFromBottom)}px`
       );
+      shell.style.setProperty(
+        "--chat-scroll-button-offset",
+        `calc(${Math.max(0, composerRect.height / 2)}px + 0.75rem)`
+      );
     };
 
     sync();
@@ -104,7 +108,12 @@ export function ChatPane({
   return (
     <main
       ref={shellRef}
-      style={{ "--chat-composer-center-offset": "4rem" } as CSSProperties}
+      style={
+        {
+          "--chat-composer-center-offset": "4rem",
+          "--chat-scroll-button-offset": "4.75rem"
+        } as CSSProperties
+      }
       className="relative flex h-full min-w-0 flex-1 flex-col bg-[var(--color-surface)]"
     >
       <ChatFeed

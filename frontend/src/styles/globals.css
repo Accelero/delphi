@@ -1,6 +1,24 @@
 @import "tailwindcss";
 
+@source "../../node_modules/streamdown/dist/*.js";
+@source "../../node_modules/@streamdown/code/dist/*.js";
+@source "../../node_modules/@streamdown/cjk/dist/*.js";
+@source "../../node_modules/@streamdown/math/dist/*.js";
+@source "../../node_modules/@streamdown/mermaid/dist/*.js";
+
 @custom-variant dark (&:where(.dark, .dark *, [data-theme="dark"], [data-theme="dark"] *));
+
+@theme inline {
+  --color-background: var(--color-background);
+  --color-foreground: var(--color-foreground);
+  --color-muted: var(--color-surface-muted);
+  --color-muted-foreground: var(--color-text-muted);
+  --color-border: var(--color-border);
+  --color-sidebar: var(--color-surface-raised);
+  --color-primary: var(--color-primary);
+  --color-primary-foreground: var(--color-primary-text);
+  --radius-xl: 0.75rem;
+}
 
 :root {
   --color-background: oklch(100% 0 0);

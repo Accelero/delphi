@@ -1,19 +1,25 @@
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { useSmoothedContent } from "../../hooks/useSmoothedContent";
+import { lazy, Suspense } from "react";
+import type { CitationEntry } from "../../lib/types";
+
+const RichMessageBody = lazy(() => import("./RichMessageBody"));
 
 export function MessageBody({
   content,
-  streaming
+  streaming,
+  citations = []
 }: {
   content: string;
   streaming: boolean;
+  citations?: CitationEntry[];
 }) {
-  const shown = useSmoothedContent(content, streaming);
-
   return (
-    <div className="prose max-w-none text-[15px] leading-7 text-[var(--color-text)]">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{shown}</ReactMarkdown>
-    </div>
+    <Suspense fallback={<PlainMessageBody content={content} />}>
+      <RichMessageBody content={content} streaming={streaming} citations={citations} />
+    </Suspense>
   );
+}
+
+function PlainMessageBody({ content }: { content: string }) {
+  if (!content.trim()) return null;
+  return <div className="whitespace-pre-wrap text-[15px] leading-7">{content}</div>;
 }
