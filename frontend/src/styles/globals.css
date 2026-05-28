@@ -23,7 +23,7 @@
 :root {
   --color-background: oklch(100% 0 0);
   --color-foreground: oklch(14.7% 0.004 49.25);
-  --color-object: oklch(89% 0.004 67.8);
+  --color-object: oklch(86% 0.004 67.8);
   --color-object-hover: oklch(86.4% 0.005 67.8);
   --color-object-border: oklch(84.8% 0.005 67.8);
   --color-object-text: oklch(14.7% 0.004 49.25);
@@ -52,7 +52,7 @@
 :root[data-theme="dark"] {
   --color-background: oklch(0% 0 0);
   --color-foreground: oklch(92.8% 0.002 106.42);
-  --color-object: oklch(24.6% 0 0);
+  --color-object: oklch(28% 0 0);
   --color-object-hover: oklch(29.4% 0 0);
   --color-object-border: oklch(36.8% 0 0);
   --color-object-text: oklch(92.8% 0.002 106.42);

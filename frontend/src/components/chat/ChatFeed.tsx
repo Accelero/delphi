@@ -156,10 +156,10 @@ export function ChatFeed({
                 renderMessage={renderMessage}
               >
                 {showThinking ? <ThinkingRow /> : null}
+                <div aria-hidden className="h-[var(--chat-composer-half-height)] shrink-0" />
               </ChatTurnContainer>
             );
           })}
-          <div aria-hidden className="h-[var(--chat-composer-half-height)] shrink-0" />
           <div ref={sentinelRef} aria-hidden className="h-px" />
         </div>
       </div>
@@ -180,11 +180,11 @@ export function ChatFeed({
         <Button
           size="icon"
           variant="outline"
-          className="absolute bottom-[var(--chat-scroll-button-offset)] left-1/2 -translate-x-1/2 rounded-full"
+          className="absolute bottom-[var(--chat-scroll-button-offset)] left-1/2 -translate-x-1/2 rounded-full border-0"
           onClick={scrollToBottom}
           aria-label="Scroll to bottom"
         >
-          <ArrowDown className="h-4 w-4" />
+          <ArrowDown className="h-5 w-5" />
         </Button>
       ) : null}
     </section>
@@ -265,7 +265,7 @@ export function ChatMessageRow({
         <div
           className={
             isUser
-              ? "rounded-lg bg-[var(--color-primary)] px-4 py-3 text-sm leading-6 text-[var(--color-primary-text)]"
+              ? "rounded-xl bg-[var(--color-object)] px-4 py-3 text-sm leading-6 text-[var(--color-text)]"
               : "w-full text-[var(--color-text)]"
           }
         >
