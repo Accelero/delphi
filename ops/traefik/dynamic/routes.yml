@@ -1,7 +1,7 @@
 http:
   routers:
     api:
-      rule: PathPrefix(`/api`) || PathPrefix(`/chat`)
+      rule: PathPrefix(`/api`)
       service: api-service
       entryPoints: [web]
       middlewares: [auth]
