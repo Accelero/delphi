@@ -295,6 +295,7 @@ async fn drive_turn(
         &command,
         ChatEvent::UserMessage {
             id: lock.user_message_id.clone(),
+            turn_id: Some(command.turn_id.clone()),
             content: lock.text.clone(),
         },
     )

@@ -26,6 +26,7 @@ export function useChatSocket(
   const seedSignatureRef = useRef("");
   const lastEventIdByConversationRef = useRef(new Map<string, string>());
   const inFlightUserIdRef = useRef<string | null>(null);
+  const inFlightTurnIdRef = useRef<string | null>(null);
   const overlayTextRef = useRef("");
   const liveCitationsRef = useRef<CitationEntry[]>([]);
   const onResyncRef = useRef(options.onResync);
@@ -49,6 +50,7 @@ export function useChatSocket(
     setStatus("ready");
     setError(null);
     inFlightUserIdRef.current = null;
+    inFlightTurnIdRef.current = null;
     overlayTextRef.current = "";
     liveCitationsRef.current = [];
   }, [conversationId]);
@@ -68,6 +70,7 @@ export function useChatSocket(
         return;
       case "user_message":
         inFlightUserIdRef.current = event.id;
+        inFlightTurnIdRef.current = event.turn_id ?? null;
         overlayTextRef.current = "";
         liveCitationsRef.current = [];
         setStatus((current) => (current === "stopping" ? current : "streaming"));
@@ -79,7 +82,7 @@ export function useChatSocket(
             content: event.content,
             parent_message_id: null,
             citations: [],
-            turn_id: null,
+            turn_id: event.turn_id ?? null,
             created_at: new Date().toISOString()
           }
         ]);
@@ -95,7 +98,14 @@ export function useChatSocket(
       case "text_delta":
         overlayTextRef.current += event.delta;
         setStatus((current) => (current === "stopping" ? current : "streaming"));
-        setMessages((current) => upsertAssistantOverlay(current, overlayTextRef.current, liveCitationsRef.current));
+        setMessages((current) =>
+          upsertAssistantOverlay(
+            current,
+            overlayTextRef.current,
+            liveCitationsRef.current,
+            inFlightTurnIdRef.current
+          )
+        );
         return;
       case "finish":
         setStatus("ready");
@@ -108,6 +118,7 @@ export function useChatSocket(
         );
         overlayTextRef.current = "";
         inFlightUserIdRef.current = null;
+        inFlightTurnIdRef.current = null;
         void onTerminalRefreshRef.current?.();
         return;
       case "interrupted":
@@ -118,11 +129,13 @@ export function useChatSocket(
             event.assistant_message_id,
             event.content,
             liveCitationsRef.current,
-            event.finish_reason
+            event.finish_reason,
+            inFlightTurnIdRef.current
           )
         );
         overlayTextRef.current = "";
         inFlightUserIdRef.current = null;
+        inFlightTurnIdRef.current = null;
         liveCitationsRef.current = [];
         void onTerminalRefreshRef.current?.();
         return;
@@ -135,6 +148,7 @@ export function useChatSocket(
         );
         overlayTextRef.current = "";
         inFlightUserIdRef.current = null;
+        inFlightTurnIdRef.current = null;
         liveCitationsRef.current = [];
         void onTerminalRefreshRef.current?.();
         return;
@@ -177,6 +191,7 @@ export function useChatSocket(
       setStatus("ready");
       overlayTextRef.current = "";
       inFlightUserIdRef.current = null;
+      inFlightTurnIdRef.current = null;
       liveCitationsRef.current = [];
       setMessages((current) =>
         current.filter((message) => message.id !== "assistant-live" && message.id !== inFlightUserId)
@@ -277,7 +292,14 @@ export function useChatSocket(
     return committed.at(-1)?.id ?? null;
   }, [messages]);
 
-  return { messages, status, realtimeStatus, error, lastMessageId, setStatus };
+  return {
+    messages,
+    status,
+    realtimeStatus,
+    error,
+    lastMessageId,
+    setStatus
+  };
 }
 
 function isLiveStatus(status: ChatStatus | LiveStatus): status is LiveStatus {
@@ -296,7 +318,8 @@ function messagesSignature(messages: MessageDto[]): string {
 function upsertAssistantOverlay(
   messages: MessageDto[],
   content: string,
-  citations: CitationEntry[]
+  citations: CitationEntry[],
+  turnId: string | null
 ): MessageDto[] {
   const overlay = {
     id: "assistant-live",
@@ -304,7 +327,7 @@ function upsertAssistantOverlay(
     content,
     parent_message_id: null,
     citations,
-    turn_id: null,
+    turn_id: turnId,
     interrupted: false,
     finish_reason: null,
     created_at: new Date().toISOString()
@@ -321,7 +344,8 @@ function upsertInterruptedAssistant(
   assistantMessageId: string,
   content: string,
   citations: CitationEntry[],
-  finishReason: string
+  finishReason: string,
+  turnId: string | null
 ): MessageDto[] {
   const next = messages.filter((message) => message.id !== "assistant-live");
   const assistant = {
@@ -330,7 +354,7 @@ function upsertInterruptedAssistant(
     content,
     parent_message_id: null,
     citations,
-    turn_id: null,
+    turn_id: turnId,
     interrupted: true,
     finish_reason: finishReason,
     created_at: new Date().toISOString()

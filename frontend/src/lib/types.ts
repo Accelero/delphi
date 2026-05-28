@@ -30,7 +30,7 @@ export type ConversationDetail = ConversationSummary & {
 
 export type ChatEvent =
   | { type: "turn_started"; turn_id: string }
-  | { type: "user_message"; id: string; content: string }
+  | { type: "user_message"; id: string; turn_id?: string | null; content: string }
   | { type: "citations"; citations: CitationEntry[] }
   | { type: "text_delta"; delta: string }
   | { type: "finish"; assistant_message_id: string; finish_reason: "stop" | "error" }

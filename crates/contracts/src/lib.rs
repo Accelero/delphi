@@ -140,6 +140,8 @@ pub enum ChatEvent {
     },
     UserMessage {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
         content: String,
     },
     Citations {
