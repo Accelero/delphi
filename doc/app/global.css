@@ -6,6 +6,66 @@
   color-scheme: dark;
 }
 
+.d2-diagram-light {
+  --d2-token-page-background: color-mix(
+    in oklch,
+    var(--color-fd-background) 100%,
+    transparent
+  );
+  --d2-token-text-color: color-mix(
+    in oklch,
+    var(--color-fd-foreground) 100%,
+    transparent
+  );
+  --d2-token-label-fill: var(--d2-token-page-background);
+  --d2-token-diagram-background: var(--d2-token-page-background);
+  --d2-token-shape-fill: color-mix(
+    in oklch,
+    var(--d2-token-page-background) 92%,
+    var(--d2-token-text-color)
+  );
+  --d2-token-shape-stroke: color-mix(
+    in oklch,
+    var(--d2-token-text-color) 44%,
+    var(--d2-token-page-background)
+  );
+  --d2-token-shape-primary-accent: var(--d2-token-shape-stroke);
+  --d2-token-shape-secondary-accent: var(--d2-token-shape-fill);
+  --d2-token-shape-neutral-accent: var(--d2-token-shape-stroke);
+  --d2-token-connection-stroke: var(--d2-token-shape-stroke);
+  --d2-token-connection-fill: var(--d2-token-connection-stroke);
+}
+
+.d2-diagram-dark {
+  --d2-token-page-background: color-mix(
+    in oklch,
+    var(--color-fd-background) 100%,
+    transparent
+  );
+  --d2-token-text-color: color-mix(
+    in oklch,
+    var(--color-fd-foreground) 100%,
+    transparent
+  );
+  --d2-token-label-fill: var(--d2-token-page-background);
+  --d2-token-diagram-background: var(--d2-token-page-background);
+  --d2-token-shape-fill: color-mix(
+    in oklch,
+    var(--d2-token-page-background) 88%,
+    var(--d2-token-text-color)
+  );
+  --d2-token-shape-stroke: color-mix(
+    in oklch,
+    var(--d2-token-text-color) 44%,
+    var(--d2-token-page-background)
+  );
+  --d2-token-shape-primary-accent: var(--d2-token-shape-stroke);
+  --d2-token-shape-secondary-accent: var(--d2-token-shape-fill);
+  --d2-token-shape-neutral-accent: var(--d2-token-shape-stroke);
+  --d2-token-connection-stroke: var(--d2-token-shape-stroke);
+  --d2-token-connection-fill: var(--d2-token-connection-stroke);
+}
+
 body {
   min-height: 100vh;
   background: var(--color-fd-background);
@@ -61,6 +121,10 @@ a {
   display: block;
   width: 100%;
   height: auto;
+}
+
+.d2-diagram svg > svg > rect:first-child {
+  fill: var(--d2-token-diagram-background) !important;
 }
 
 .d2-diagram-error {
