@@ -152,12 +152,12 @@ export function ChatPane({
               onClick={stop}
               disabled={stopping}
               aria-label={stopping ? "Stopping" : "Stop"}
-              className="mb-1 shrink-0 rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-primary-hover)] disabled:opacity-100"
+              className="mb-1 shrink-0 cursor-pointer rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-chat-submit-hover)] disabled:cursor-default disabled:opacity-100"
             >
               {stopping ? (
-                <LoaderCircle className="h-4 w-4 animate-spin" />
+                <LoaderCircle className="h-5 w-5 animate-spin" />
               ) : (
-                <Square className="h-4 w-4" />
+                <Square className="h-5 w-5" />
               )}
             </Button>
           ) : (
@@ -166,9 +166,9 @@ export function ChatPane({
               size="icon"
               disabled={!draft.trim()}
               aria-label="Send"
-              className="mb-1 shrink-0 rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-primary-hover)] disabled:opacity-100"
+              className="mb-1 shrink-0 cursor-pointer rounded-full bg-[var(--color-primary)] text-[var(--color-primary-text)] opacity-100 hover:bg-[var(--color-chat-submit-hover)] disabled:cursor-default disabled:opacity-100"
             >
-              <ArrowUp className="h-4 w-4" />
+              <ArrowUp className="h-5 w-5" />
             </Button>
           )}
         </div>

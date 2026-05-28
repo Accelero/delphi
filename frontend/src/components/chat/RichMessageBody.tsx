@@ -2,6 +2,7 @@ import { cjk } from "@streamdown/cjk";
 import { code } from "@streamdown/code";
 import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "@streamdown/mermaid";
+import { CheckIcon, CopyIcon } from "lucide-react";
 import { useMemo } from "react";
 import { Streamdown } from "streamdown";
 import { useSmoothedContent } from "../../hooks/useSmoothedContent";
@@ -13,6 +14,11 @@ const markdownPlugins = {
   code,
   math: createMathPlugin({ singleDollarTextMath: true }),
   mermaid
+};
+
+const streamdownIcons = {
+  CheckIcon,
+  CopyIcon
 };
 
 type Segment =
@@ -63,8 +69,9 @@ export default function RichMessageBody({
               table: { copy: true, download: true, fullscreen: false }
             }}
             dir="auto"
-            lineNumbers
+            lineNumbers={false}
             caret="block"
+            icons={streamdownIcons}
           >
             {rendered}
           </Streamdown>
