@@ -2,6 +2,7 @@
   "title": "Architecture",
   "pages": [
     "chat-system",
+    "pg-cutover-upload-pipeline-plan",
     "chat-request-flow",
     "chat-failure-analysis",
     "alteration"
