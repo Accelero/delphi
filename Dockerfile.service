@@ -9,6 +9,7 @@ COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
 COPY services ./services
+COPY migrations ./migrations
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
@@ -21,13 +22,15 @@ COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY crates ./crates
 COPY services ./services
+COPY migrations ./migrations
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
     cargo build --release --workspace --bins \
     && cp /app/target/release/api-service /usr/local/bin/api-service \
     && cp /app/target/release/realtime-service /usr/local/bin/realtime-service \
-    && cp /app/target/release/chat-worker /usr/local/bin/chat-worker
+    && cp /app/target/release/chat-worker /usr/local/bin/chat-worker \
+    && cp /app/target/release/document-worker /usr/local/bin/document-worker
 
 FROM debian:bookworm-slim
 ENV RUST_LOG=info
@@ -37,3 +40,4 @@ RUN apt-get update \
 COPY --from=build /usr/local/bin/api-service /usr/local/bin/api-service
 COPY --from=build /usr/local/bin/realtime-service /usr/local/bin/realtime-service
 COPY --from=build /usr/local/bin/chat-worker /usr/local/bin/chat-worker
+COPY --from=build /usr/local/bin/document-worker /usr/local/bin/document-worker

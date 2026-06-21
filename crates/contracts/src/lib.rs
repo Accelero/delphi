@@ -122,6 +122,158 @@ pub struct TurnRequested {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentState {
+    Staging,
+    Validating,
+    Indexing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionStage {
+    Validate,
+    Extract,
+    Chunk,
+    Embed,
+    Publish,
+    Reconcile,
+}
+
+impl IngestionStage {
+    pub fn as_subject_token(&self) -> &'static str {
+        match self {
+            Self::Validate => "validate",
+            Self::Extract => "extract",
+            Self::Chunk => "chunk",
+            Self::Embed => "embed",
+            Self::Publish => "publish",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionJobStatus {
+    Validating,
+    Extracting,
+    Chunking,
+    Embedding,
+    Publishing,
+    Ready,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateIngestionDocument {
+    pub document_id: Option<String>,
+    pub job_id: Option<String>,
+    pub title: Option<String>,
+    pub source_type: String,
+    pub source_uri: Option<String>,
+    pub storage_key: String,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub declared_size: u64,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngestionJobDto {
+    pub id: String,
+    pub document_id: String,
+    pub state: DocumentState,
+    pub status: IngestionJobStatus,
+    pub current_stage: Option<IngestionStage>,
+    pub pipeline_version: u32,
+    pub attempt: u32,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartIngestionResponse {
+    pub document_id: String,
+    pub job_id: String,
+    pub state: DocumentState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateUploadRequest {
+    pub filename: String,
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub title: Option<String>,
+    pub source_uri: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateUploadResponse {
+    pub upload_id: String,
+    pub key: String,
+    pub multipart_upload_id: String,
+    pub part_size_bytes: u64,
+    pub part_url_ttl_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignUploadPartRequest {
+    pub part_number: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignUploadPartResponse {
+    pub url: String,
+    pub method: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletedUploadPart {
+    pub part_number: u16,
+    pub etag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompleteUploadRequest {
+    pub parts: Vec<CompletedUploadPart>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum CompleteUploadResponse {
+    Accepted { document_id: String, job_id: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum UploadStatusResponse {
+    Uploading,
+    Accepted { document_id: String, job_id: String },
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IngestStageRequested {
+    pub v: u16,
+    pub command_id: String,
+    pub tenant_id: String,
+    pub user_id: String,
+    pub job_id: String,
+    pub document_id: String,
+    pub stage: IngestionStage,
+    pub pipeline_version: u32,
+    pub attempt: u32,
+    pub causation_id: String,
+    pub ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatEventEnvelope {
     pub v: u16,
     pub tenant_id: String,

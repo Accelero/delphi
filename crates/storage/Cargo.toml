@@ -9,6 +9,8 @@ async-trait.workspace = true
 chrono.workspace = true
 delphi-contracts.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
 surrealdb = { version = "3", default-features = false, features = ["protocol-ws", "protocol-http", "rustls"] }
 thiserror.workspace = true
 tokio.workspace = true

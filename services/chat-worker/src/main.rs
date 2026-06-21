@@ -10,7 +10,7 @@ use delphi_nats::{
     ChatBus, ChatLock, ChatLockState, ChatTerminalUpdate, NatsChatBus, NatsChatBusOptions,
     StopSignal,
 };
-use delphi_storage::{ChatRepository, SurrealChatRepository};
+use delphi_storage::{ChatRepository, PgRepository};
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +22,7 @@ const DEFAULT_CHAT_STOP_POLL_SECONDS: u64 = 1;
 
 #[derive(Clone)]
 struct WorkerState {
-    repo: SurrealChatRepository,
+    repo: PgRepository,
     bus: NatsChatBus,
     llm: Arc<dyn LlmClient>,
     title_llm: Arc<dyn LlmClient>,
@@ -42,14 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let llm = llm_from_env()?;
     let title_llm = title_llm_from_env(&llm)?;
     let state = WorkerState {
-        repo: SurrealChatRepository::connect(
-            &config.surreal_url,
-            &config.surreal_namespace,
-            &config.surreal_database,
-            &config.surreal_user,
-            &config.surreal_password,
-        )
-        .await?,
+        repo: PgRepository::connect(&config.database_url, config.pg_max_connections).await?,
         bus: NatsChatBus::connect(
             &config.nats_url,
             NatsChatBusOptions {

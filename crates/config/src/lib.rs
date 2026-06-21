@@ -7,11 +7,8 @@ pub struct ServiceConfig {
     pub bind_addr: SocketAddr,
     pub public_base_url: String,
     pub nats_url: String,
-    pub surreal_url: String,
-    pub surreal_namespace: String,
-    pub surreal_database: String,
-    pub surreal_user: String,
-    pub surreal_password: String,
+    pub database_url: String,
+    pub pg_max_connections: u32,
 }
 
 impl ServiceConfig {
@@ -25,11 +22,8 @@ impl ServiceConfig {
             bind_addr,
             public_base_url: env_or("PUBLIC_BASE_URL", "http://localhost:8080"),
             nats_url: env_or("NATS_URL", "nats://127.0.0.1:4222"),
-            surreal_url: env_or("SURREAL_URL", "ws://127.0.0.1:8000"),
-            surreal_namespace: env_or("SURREAL_NAMESPACE", "delphi"),
-            surreal_database: env_or("SURREAL_DATABASE", "delphi"),
-            surreal_user: env_or("SURREAL_USER", "root"),
-            surreal_password: env_or("SURREAL_PASSWORD", "root"),
+            database_url: env_or("DATABASE_URL", "postgres://delphi:delphi@127.0.0.1:5432/delphi"),
+            pg_max_connections: env_u32("PG_MAX_CONNECTIONS", 10),
         })
     }
 }
@@ -45,4 +39,12 @@ pub fn init_tracing() {
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }

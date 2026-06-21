@@ -7,8 +7,10 @@ use async_nats::jetstream::AckKind;
 use async_nats::jetstream::{self, Context};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use delphi_contracts::{ChatEvent, ChatEventEnvelope, TurnRequested};
-use futures::StreamExt;
+use delphi_contracts::{
+    ChatEvent, ChatEventEnvelope, CompletedUploadPart, IngestStageRequested, TurnRequested,
+};
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,13 +20,18 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 const CHAT_COMMANDS_STREAM: &str = "CHAT_COMMANDS";
 const CHAT_EVENTS_STREAM: &str = "CHAT_EVENTS";
+const INGEST_STREAM: &str = "INGEST";
 const CHAT_LOCKS_BUCKET: &str = "CHAT_LOCKS";
 const CHAT_REPLAY_BUCKET: &str = "CHAT_REPLAY";
+const UPLOAD_SAGAS_BUCKET: &str = "UPLOAD_SAGAS";
 const CHAT_WORKER_CONSUMER: &str = "chat-worker-turns";
 const DEFAULT_CHAT_LOCK_TTL_SECONDS: u64 = 15 * 60;
 const DEFAULT_CHAT_EVENTS_MAX_AGE_SECONDS: u64 = 30 * 60;
 const DEFAULT_CHAT_REPLAY_TTL_SECONDS: u64 = 25 * 60;
 const DEFAULT_CHAT_COMMAND_ACK_WAIT_SECONDS: u64 = 120;
+const DEFAULT_UPLOAD_SAGA_KV_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+const DEFAULT_UPLOAD_SAGA_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
+const DEFAULT_UPLOAD_CLEANUP_RETRY_SECONDS: u64 = 15 * 60;
 
 #[derive(Debug, Error)]
 pub enum ChatBusError {
@@ -133,6 +140,92 @@ pub struct ReplayTurn {
     pub end_seq: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UploadSaga {
+    pub tenant_id: String,
+    pub user_id: String,
+    pub upload_id: String,
+    pub storage_key: String,
+    pub multipart_upload_id: String,
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub declared_size: u64,
+    pub title: Option<String>,
+    pub source_uri: Option<String>,
+    #[serde(default = "default_upload_metadata")]
+    pub metadata: serde_json::Value,
+    pub state: UploadSagaState,
+    pub parts: Vec<CompletedUploadPart>,
+    pub object_completed: bool,
+    pub document_id: Option<String>,
+    pub job_id: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_upload_saga_expires_at")]
+    pub expires_at: DateTime<Utc>,
+}
+
+impl UploadSaga {
+    pub fn uploading(
+        tenant_id: String,
+        user_id: String,
+        upload_id: String,
+        storage_key: String,
+        multipart_upload_id: String,
+        filename: String,
+        content_type: Option<String>,
+        declared_size: u64,
+        title: Option<String>,
+        source_uri: Option<String>,
+        metadata: serde_json::Value,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            tenant_id,
+            user_id,
+            upload_id,
+            storage_key,
+            multipart_upload_id,
+            filename,
+            content_type,
+            declared_size,
+            title,
+            source_uri,
+            metadata: default_object_metadata(metadata),
+            state: UploadSagaState::Uploading,
+            parts: Vec::new(),
+            object_completed: false,
+            document_id: None,
+            job_id: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: now
+                + ChronoDuration::from_std(upload_saga_timeout())
+                    .expect("upload saga timeout fits chrono"),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            UploadSagaState::Accepted | UploadSagaState::Failed | UploadSagaState::Aborted
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UploadSagaState {
+    Uploading,
+    Completing,
+    Aborting,
+    Accepted,
+    Failed,
+    Aborted,
+}
+
 #[async_trait]
 pub trait ChatBus: Clone + Send + Sync + 'static {
     async fn acquire_lock(&self, lock: ChatLock) -> Result<(), ChatBusError>;
@@ -216,6 +309,70 @@ pub trait ChatBus: Clone + Send + Sync + 'static {
     fn subscribe_stops(&self) -> broadcast::Receiver<StopSignal>;
 }
 
+#[async_trait]
+pub trait IngestionBus: Clone + Send + Sync + 'static {
+    async fn list_upload_sagas(&self) -> Result<Vec<UploadSaga>, ChatBusError>;
+    async fn start_upload_saga(&self, saga: UploadSaga) -> Result<(), ChatBusError>;
+    async fn load_upload_saga(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+    ) -> Result<Option<UploadSaga>, ChatBusError>;
+    async fn claim_upload_completion(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        parts: Vec<CompletedUploadPart>,
+    ) -> Result<UploadSaga, ChatBusError>;
+    async fn mark_upload_object_completed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+    ) -> Result<UploadSaga, ChatBusError>;
+    async fn mark_upload_accepted(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        document_id: &str,
+        job_id: &str,
+    ) -> Result<UploadSaga, ChatBusError>;
+    async fn mark_upload_failed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        error: &str,
+    ) -> Result<UploadSaga, ChatBusError>;
+    async fn claim_upload_cleanup(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UploadSaga>, ChatBusError>;
+    async fn mark_upload_aborted(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        reason: &str,
+    ) -> Result<UploadSaga, ChatBusError>;
+    async fn defer_upload_cleanup(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        error: &str,
+    ) -> Result<UploadSaga, ChatBusError>;
+    async fn publish_ingest_stage(&self, command: IngestStageRequested)
+        -> Result<(), ChatBusError>;
+    fn subscribe_ingest_stages(&self) -> broadcast::Receiver<IngestStageRequested>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatTerminalUpdate {
     pub state: ChatLockState,
@@ -228,6 +385,22 @@ pub struct ChatTerminalUpdate {
 pub struct SequencedChatEvent {
     pub event_id: String,
     pub envelope: ChatEventEnvelope,
+}
+
+fn default_upload_saga_expires_at() -> DateTime<Utc> {
+    Utc::now()
+}
+
+fn default_upload_metadata() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn default_object_metadata(value: serde_json::Value) -> serde_json::Value {
+    if value.is_object() {
+        value
+    } else {
+        default_upload_metadata()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +424,19 @@ impl ChatSubjects {
     }
 }
 
+fn upload_saga_key(tenant_id: &str, upload_id: &str) -> String {
+    format!("{tenant_id}/{upload_id}")
+}
+
+#[derive(Debug, Clone)]
+pub struct IngestSubjects;
+
+impl IngestSubjects {
+    pub fn stage_requested(command: &IngestStageRequested) -> String {
+        format!("ingest.{}.requested", command.stage.as_subject_token())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NatsChatBusOptions {
     pub subscribe_commands: bool,
@@ -264,6 +450,7 @@ pub struct NatsChatBus {
     js: Context,
     locks: Store,
     replay: Store,
+    uploads: Store,
     inner: Arc<Inner>,
 }
 
@@ -298,11 +485,25 @@ impl NatsChatBus {
             .map_err(|error| {
                 ChatBusError::Payload(format!("create chat replay bucket: {error}"))
             })?;
+        let uploads = js
+            .create_or_update_key_value(kv::Config {
+                bucket: UPLOAD_SAGAS_BUCKET.to_owned(),
+                description: "delphi upload saga state".to_owned(),
+                history: 1,
+                max_age: upload_saga_kv_ttl(),
+                storage: StorageType::File,
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| {
+                ChatBusError::Payload(format!("create upload saga bucket: {error}"))
+            })?;
         let bus = Self {
             client,
             js,
             locks,
             replay,
+            uploads,
             inner: Arc::new(Inner::default()),
         };
         bus.start_subscribers(options).await?;
@@ -781,6 +982,201 @@ impl ChatBus for NatsChatBus {
     }
 }
 
+#[async_trait]
+impl IngestionBus for NatsChatBus {
+    async fn list_upload_sagas(&self) -> Result<Vec<UploadSaga>, ChatBusError> {
+        list_kv_upload_sagas(&self.uploads).await
+    }
+
+    async fn start_upload_saga(&self, saga: UploadSaga) -> Result<(), ChatBusError> {
+        create_kv_upload_saga(&self.uploads, saga).await
+    }
+
+    async fn load_upload_saga(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+    ) -> Result<Option<UploadSaga>, ChatBusError> {
+        load_kv_upload_saga(&self.uploads, tenant_id, user_id, upload_id).await
+    }
+
+    async fn claim_upload_completion(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        parts: Vec<CompletedUploadPart>,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_kv_upload_saga(
+            &self.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| match saga.state {
+                UploadSagaState::Uploading => {
+                    saga.state = UploadSagaState::Completing;
+                    saga.parts = parts.clone();
+                    saga.updated_at = Utc::now();
+                    saga.expires_at = saga.updated_at
+                        + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                            .expect("upload cleanup retry delay fits chrono");
+                    Ok(saga)
+                }
+                UploadSagaState::Completing if saga.parts == parts => Ok(saga),
+                UploadSagaState::Accepted => Ok(saga),
+                UploadSagaState::Completing | UploadSagaState::Aborting => {
+                    Err(ChatBusError::InFlight)
+                }
+                UploadSagaState::Failed | UploadSagaState::Aborted => {
+                    Err(ChatBusError::Payload("upload saga is terminal".to_owned()))
+                }
+            },
+        )
+        .await
+    }
+
+    async fn mark_upload_object_completed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_kv_upload_saga(&self.uploads, tenant_id, user_id, upload_id, |mut saga| {
+            if saga.state != UploadSagaState::Completing
+                && saga.state != UploadSagaState::Aborting
+                && saga.state != UploadSagaState::Accepted
+            {
+                return Err(ChatBusError::InFlight);
+            }
+            saga.object_completed = true;
+            saga.updated_at = Utc::now();
+            saga.expires_at = saga.updated_at
+                + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                    .expect("upload cleanup retry delay fits chrono");
+            Ok(saga)
+        })
+        .await
+    }
+
+    async fn mark_upload_accepted(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        document_id: &str,
+        job_id: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_kv_upload_saga(&self.uploads, tenant_id, user_id, upload_id, |mut saga| {
+            saga.state = UploadSagaState::Accepted;
+            saga.object_completed = true;
+            saga.document_id = Some(document_id.to_owned());
+            saga.job_id = Some(job_id.to_owned());
+            saga.error = None;
+            saga.updated_at = Utc::now();
+            saga.expires_at = saga.updated_at
+                + ChronoDuration::from_std(upload_saga_kv_ttl())
+                    .expect("upload saga kv ttl fits chrono");
+            Ok(saga)
+        })
+        .await
+    }
+
+    async fn mark_upload_failed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        error: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_kv_upload_saga(&self.uploads, tenant_id, user_id, upload_id, |mut saga| {
+            saga.state = UploadSagaState::Failed;
+            saga.error = Some(error.to_owned());
+            saga.updated_at = Utc::now();
+            saga.expires_at = saga.updated_at
+                + ChronoDuration::from_std(upload_saga_kv_ttl())
+                    .expect("upload saga kv ttl fits chrono");
+            Ok(saga)
+        })
+        .await
+    }
+
+    async fn claim_upload_cleanup(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UploadSaga>, ChatBusError> {
+        claim_kv_upload_cleanup(&self.uploads, tenant_id, user_id, upload_id, now).await
+    }
+
+    async fn mark_upload_aborted(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        reason: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_kv_upload_saga(&self.uploads, tenant_id, user_id, upload_id, |mut saga| {
+            saga.state = UploadSagaState::Aborted;
+            saga.error = Some(reason.to_owned());
+            saga.updated_at = Utc::now();
+            saga.expires_at = saga.updated_at
+                + ChronoDuration::from_std(upload_saga_kv_ttl())
+                    .expect("upload saga kv ttl fits chrono");
+            Ok(saga)
+        })
+        .await
+    }
+
+    async fn defer_upload_cleanup(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        error: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_kv_upload_saga(&self.uploads, tenant_id, user_id, upload_id, |mut saga| {
+            saga.state = UploadSagaState::Aborting;
+            saga.error = Some(error.to_owned());
+            saga.updated_at = Utc::now();
+            saga.expires_at = saga.updated_at
+                + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                    .expect("upload cleanup retry delay fits chrono");
+            Ok(saga)
+        })
+        .await
+    }
+
+    async fn publish_ingest_stage(
+        &self,
+        command: IngestStageRequested,
+    ) -> Result<(), ChatBusError> {
+        let subject = IngestSubjects::stage_requested(&command);
+        let payload = serde_json::to_vec(&command)
+            .map_err(|error| ChatBusError::Payload(error.to_string()))?;
+        let ack = self
+            .js
+            .send_publish(
+                subject,
+                PublishMessage::build()
+                    .payload(payload.into())
+                    .message_id(&command.command_id)
+                    .expected_stream(INGEST_STREAM),
+            )
+            .await
+            .map_err(|error| ChatBusError::Payload(format!("publish ingest stage: {error}")))?;
+        ack.await
+            .map_err(|error| ChatBusError::Payload(format!("ack ingest stage publish: {error}")))?;
+        Ok(())
+    }
+
+    fn subscribe_ingest_stages(&self) -> broadcast::Receiver<IngestStageRequested> {
+        self.inner.ingest_stages.subscribe()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InMemoryChatBus {
     inner: Arc<Inner>,
@@ -791,7 +1187,9 @@ struct Inner {
     commands: broadcast::Sender<TurnRequested>,
     events: broadcast::Sender<SequencedChatEvent>,
     stops: broadcast::Sender<StopSignal>,
+    ingest_stages: broadcast::Sender<IngestStageRequested>,
     locks: Mutex<HashMap<String, ChatLock>>,
+    uploads: Mutex<HashMap<String, UploadSaga>>,
     replay: Mutex<HashMap<String, ReplayIndex>>,
     event_log: Mutex<Vec<SequencedChatEvent>>,
     next_event_sequence: Mutex<u64>,
@@ -803,11 +1201,14 @@ impl Default for Inner {
         let (commands, _) = broadcast::channel(256);
         let (events, _) = broadcast::channel(1024);
         let (stops, _) = broadcast::channel(256);
+        let (ingest_stages, _) = broadcast::channel(256);
         Self {
             commands,
             events,
             stops,
+            ingest_stages,
             locks: Mutex::new(HashMap::new()),
+            uploads: Mutex::new(HashMap::new()),
             replay: Mutex::new(HashMap::new()),
             event_log: Mutex::new(Vec::new()),
             next_event_sequence: Mutex::new(0),
@@ -1124,6 +1525,242 @@ impl ChatBus for InMemoryChatBus {
     }
 }
 
+#[async_trait]
+impl IngestionBus for InMemoryChatBus {
+    async fn list_upload_sagas(&self) -> Result<Vec<UploadSaga>, ChatBusError> {
+        Ok(self.inner.uploads.lock().await.values().cloned().collect())
+    }
+
+    async fn start_upload_saga(&self, saga: UploadSaga) -> Result<(), ChatBusError> {
+        let key = upload_saga_key(&saga.tenant_id, &saga.upload_id);
+        let mut uploads = self.inner.uploads.lock().await;
+        if uploads.contains_key(&key) {
+            return Err(ChatBusError::InFlight);
+        }
+        uploads.insert(key, saga);
+        Ok(())
+    }
+
+    async fn load_upload_saga(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+    ) -> Result<Option<UploadSaga>, ChatBusError> {
+        let key = upload_saga_key(tenant_id, upload_id);
+        Ok(self
+            .inner
+            .uploads
+            .lock()
+            .await
+            .get(&key)
+            .filter(|saga| saga.user_id == user_id)
+            .cloned())
+    }
+
+    async fn claim_upload_completion(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        parts: Vec<CompletedUploadPart>,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| match saga.state {
+                UploadSagaState::Uploading => {
+                    saga.state = UploadSagaState::Completing;
+                    saga.parts = parts.clone();
+                    saga.updated_at = Utc::now();
+                    saga.expires_at = saga.updated_at
+                        + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                            .expect("upload cleanup retry delay fits chrono");
+                    Ok(saga)
+                }
+                UploadSagaState::Completing if saga.parts == parts => Ok(saga),
+                UploadSagaState::Accepted => Ok(saga),
+                UploadSagaState::Completing | UploadSagaState::Aborting => {
+                    Err(ChatBusError::InFlight)
+                }
+                UploadSagaState::Failed | UploadSagaState::Aborted => {
+                    Err(ChatBusError::Payload("upload saga is terminal".to_owned()))
+                }
+            },
+        )
+        .await
+    }
+
+    async fn mark_upload_object_completed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| {
+                if saga.state != UploadSagaState::Completing
+                    && saga.state != UploadSagaState::Aborting
+                    && saga.state != UploadSagaState::Accepted
+                {
+                    return Err(ChatBusError::InFlight);
+                }
+                saga.object_completed = true;
+                saga.updated_at = Utc::now();
+                saga.expires_at = saga.updated_at
+                    + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                        .expect("upload cleanup retry delay fits chrono");
+                Ok(saga)
+            },
+        )
+        .await
+    }
+
+    async fn mark_upload_accepted(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        document_id: &str,
+        job_id: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| {
+                saga.state = UploadSagaState::Accepted;
+                saga.object_completed = true;
+                saga.document_id = Some(document_id.to_owned());
+                saga.job_id = Some(job_id.to_owned());
+                saga.error = None;
+                saga.updated_at = Utc::now();
+                saga.expires_at = saga.updated_at
+                    + ChronoDuration::from_std(upload_saga_kv_ttl())
+                        .expect("upload saga kv ttl fits chrono");
+                Ok(saga)
+            },
+        )
+        .await
+    }
+
+    async fn mark_upload_failed(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        error: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| {
+                saga.state = UploadSagaState::Failed;
+                saga.error = Some(error.to_owned());
+                saga.updated_at = Utc::now();
+                saga.expires_at = saga.updated_at
+                    + ChronoDuration::from_std(upload_saga_kv_ttl())
+                        .expect("upload saga kv ttl fits chrono");
+                Ok(saga)
+            },
+        )
+        .await
+    }
+
+    async fn claim_upload_cleanup(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<UploadSaga>, ChatBusError> {
+        let maybe = update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| claim_cleanup_update(&mut saga, now),
+        )
+        .await;
+        match maybe {
+            Ok(saga) => Ok(Some(saga)),
+            Err(ChatBusError::InFlight) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn mark_upload_aborted(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        reason: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| {
+                saga.state = UploadSagaState::Aborted;
+                saga.error = Some(reason.to_owned());
+                saga.updated_at = Utc::now();
+                saga.expires_at = saga.updated_at
+                    + ChronoDuration::from_std(upload_saga_kv_ttl())
+                        .expect("upload saga kv ttl fits chrono");
+                Ok(saga)
+            },
+        )
+        .await
+    }
+
+    async fn defer_upload_cleanup(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        upload_id: &str,
+        error: &str,
+    ) -> Result<UploadSaga, ChatBusError> {
+        update_in_memory_upload_saga(
+            &self.inner.uploads,
+            tenant_id,
+            user_id,
+            upload_id,
+            |mut saga| {
+                saga.state = UploadSagaState::Aborting;
+                saga.error = Some(error.to_owned());
+                saga.updated_at = Utc::now();
+                saga.expires_at = saga.updated_at
+                    + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                        .expect("upload cleanup retry delay fits chrono");
+                Ok(saga)
+            },
+        )
+        .await
+    }
+
+    async fn publish_ingest_stage(
+        &self,
+        command: IngestStageRequested,
+    ) -> Result<(), ChatBusError> {
+        let _ = self.inner.ingest_stages.send(command);
+        Ok(())
+    }
+
+    fn subscribe_ingest_stages(&self) -> broadcast::Receiver<IngestStageRequested> {
+        self.inner.ingest_stages.subscribe()
+    }
+}
+
 async fn acquire_kv_lock(locks: &Store, lock: ChatLock) -> Result<(), ChatBusError> {
     let key = ChatSubjects::lock_key(&lock.tenant_id, &lock.conversation_id);
     if let Some(entry) = locks
@@ -1167,6 +1804,186 @@ async fn load_kv_lock(
     serde_json::from_slice::<ChatLock>(&entry.value)
         .map(Some)
         .map_err(|error| ChatBusError::Payload(format!("decode chat lock: {error}")))
+}
+
+async fn create_kv_upload_saga(uploads: &Store, saga: UploadSaga) -> Result<(), ChatBusError> {
+    let key = upload_saga_key(&saga.tenant_id, &saga.upload_id);
+    let payload =
+        serde_json::to_vec(&saga).map_err(|error| ChatBusError::Payload(error.to_string()))?;
+    match uploads.create(key, payload.into()).await {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == kv::CreateErrorKind::AlreadyExists => {
+            Err(ChatBusError::InFlight)
+        }
+        Err(error) => Err(ChatBusError::Payload(format!(
+            "create upload saga: {error}"
+        ))),
+    }
+}
+
+async fn load_kv_upload_saga(
+    uploads: &Store,
+    tenant_id: &str,
+    user_id: &str,
+    upload_id: &str,
+) -> Result<Option<UploadSaga>, ChatBusError> {
+    let key = upload_saga_key(tenant_id, upload_id);
+    let entry = uploads
+        .entry(key)
+        .await
+        .map_err(|error| ChatBusError::Payload(format!("read upload saga: {error}")))?;
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    if entry.operation != Operation::Put {
+        return Ok(None);
+    }
+    let saga = serde_json::from_slice::<UploadSaga>(&entry.value)
+        .map_err(|error| ChatBusError::Payload(format!("decode upload saga: {error}")))?;
+    if saga.tenant_id != tenant_id || saga.user_id != user_id {
+        return Ok(None);
+    }
+    Ok(Some(saga))
+}
+
+async fn list_kv_upload_sagas(uploads: &Store) -> Result<Vec<UploadSaga>, ChatBusError> {
+    let keys = uploads
+        .keys()
+        .await
+        .map_err(|error| ChatBusError::Payload(format!("list upload saga keys: {error}")))?
+        .try_collect::<Vec<String>>()
+        .await
+        .map_err(|error| ChatBusError::Payload(format!("collect upload saga keys: {error}")))?;
+    let mut sagas = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(entry) = uploads
+            .entry(key.clone())
+            .await
+            .map_err(|error| ChatBusError::Payload(format!("read upload saga {key}: {error}")))?
+        else {
+            continue;
+        };
+        if entry.operation != Operation::Put {
+            continue;
+        }
+        let saga = serde_json::from_slice::<UploadSaga>(&entry.value)
+            .map_err(|error| ChatBusError::Payload(format!("decode upload saga {key}: {error}")))?;
+        sagas.push(saga);
+    }
+    Ok(sagas)
+}
+
+async fn claim_kv_upload_cleanup(
+    uploads: &Store,
+    tenant_id: &str,
+    user_id: &str,
+    upload_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<UploadSaga>, ChatBusError> {
+    let maybe = update_kv_upload_saga(uploads, tenant_id, user_id, upload_id, |mut saga| {
+        claim_cleanup_update(&mut saga, now)
+    })
+    .await;
+    match maybe {
+        Ok(saga) => Ok(Some(saga)),
+        Err(ChatBusError::InFlight) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn claim_cleanup_update(
+    saga: &mut UploadSaga,
+    now: DateTime<Utc>,
+) -> Result<UploadSaga, ChatBusError> {
+    if saga.is_terminal() || saga.expires_at > now {
+        return Err(ChatBusError::InFlight);
+    }
+    match saga.state {
+        UploadSagaState::Uploading | UploadSagaState::Completing | UploadSagaState::Aborting => {
+            saga.state = UploadSagaState::Aborting;
+            saga.error = Some("upload saga expired; aborting multipart upload".to_owned());
+            saga.updated_at = now;
+            saga.expires_at = now
+                + ChronoDuration::from_std(upload_cleanup_retry_delay())
+                    .expect("upload cleanup retry delay fits chrono");
+            Ok(saga.clone())
+        }
+        UploadSagaState::Accepted | UploadSagaState::Failed | UploadSagaState::Aborted => {
+            Err(ChatBusError::InFlight)
+        }
+    }
+}
+
+async fn update_kv_upload_saga<F>(
+    uploads: &Store,
+    tenant_id: &str,
+    user_id: &str,
+    upload_id: &str,
+    mut update: F,
+) -> Result<UploadSaga, ChatBusError>
+where
+    F: FnMut(UploadSaga) -> Result<UploadSaga, ChatBusError>,
+{
+    let key = upload_saga_key(tenant_id, upload_id);
+    for _ in 0..8 {
+        let entry = uploads
+            .entry(key.clone())
+            .await
+            .map_err(|error| ChatBusError::Payload(format!("read upload saga: {error}")))?;
+        let Some(entry) = entry else {
+            return Err(ChatBusError::Payload("upload saga missing".to_owned()));
+        };
+        if entry.operation != Operation::Put {
+            return Err(ChatBusError::Payload("upload saga missing".to_owned()));
+        }
+        let saga = serde_json::from_slice::<UploadSaga>(&entry.value)
+            .map_err(|error| ChatBusError::Payload(format!("decode upload saga: {error}")))?;
+        if saga.tenant_id != tenant_id || saga.user_id != user_id {
+            return Err(ChatBusError::Payload("upload saga not found".to_owned()));
+        }
+        let updated = update(saga)?;
+        let payload = serde_json::to_vec(&updated)
+            .map_err(|error| ChatBusError::Payload(error.to_string()))?;
+        match uploads
+            .update(key.clone(), payload.into(), entry.revision)
+            .await
+        {
+            Ok(_) => return Ok(updated),
+            Err(error) if error.kind() == UpdateErrorKind::WrongLastRevision => continue,
+            Err(error) => {
+                return Err(ChatBusError::Payload(format!(
+                    "update upload saga: {error}"
+                )))
+            }
+        }
+    }
+    Err(ChatBusError::Payload(
+        "update upload saga CAS retry limit exceeded".to_owned(),
+    ))
+}
+
+async fn update_in_memory_upload_saga<F>(
+    uploads: &Mutex<HashMap<String, UploadSaga>>,
+    tenant_id: &str,
+    user_id: &str,
+    upload_id: &str,
+    update: F,
+) -> Result<UploadSaga, ChatBusError>
+where
+    F: FnOnce(UploadSaga) -> Result<UploadSaga, ChatBusError>,
+{
+    let key = upload_saga_key(tenant_id, upload_id);
+    let mut uploads = uploads.lock().await;
+    let saga = uploads
+        .get(&key)
+        .cloned()
+        .ok_or_else(|| ChatBusError::Payload("upload saga missing".to_owned()))?;
+    if saga.tenant_id != tenant_id || saga.user_id != user_id {
+        return Err(ChatBusError::Payload("upload saga not found".to_owned()));
+    }
+    let updated = update(saga)?;
+    uploads.insert(key, updated.clone());
+    Ok(updated)
 }
 
 async fn create_kv_lock(locks: &Store, key: String, lock: ChatLock) -> Result<(), ChatBusError> {
@@ -1633,6 +2450,27 @@ fn chat_command_ack_wait() -> Duration {
     )
 }
 
+fn upload_saga_kv_ttl() -> Duration {
+    duration_from_env(
+        "UPLOAD_SAGA_KV_TTL_SECONDS",
+        DEFAULT_UPLOAD_SAGA_KV_TTL_SECONDS,
+    )
+}
+
+fn upload_saga_timeout() -> Duration {
+    duration_from_env(
+        "UPLOAD_SAGA_TIMEOUT_SECONDS",
+        DEFAULT_UPLOAD_SAGA_TIMEOUT_SECONDS,
+    )
+}
+
+fn upload_cleanup_retry_delay() -> Duration {
+    duration_from_env(
+        "UPLOAD_CLEANUP_RETRY_SECONDS",
+        DEFAULT_UPLOAD_CLEANUP_RETRY_SECONDS,
+    )
+}
+
 fn duration_from_env(name: &str, default_seconds: u64) -> Duration {
     let seconds = std::env::var(name)
         .ok()
@@ -1649,6 +2487,9 @@ async fn configure_jetstream(js: &Context) -> Result<(), ChatBusError> {
     js.create_or_update_stream(event_stream_config())
         .await
         .map_err(|error| ChatBusError::Payload(format!("create event stream: {error}")))?;
+    js.create_or_update_stream(ingest_stream_config())
+        .await
+        .map_err(|error| ChatBusError::Payload(format!("create ingest stream: {error}")))?;
     Ok(())
 }
 
@@ -1674,6 +2515,25 @@ fn command_stream_config() -> StreamConfig {
     }
 }
 
+fn ingest_stream_config() -> StreamConfig {
+    StreamConfig {
+        name: INGEST_STREAM.to_owned(),
+        subjects: vec![
+            "ingest.validate.requested".to_owned(),
+            "ingest.extract.requested".to_owned(),
+            "ingest.chunk.requested".to_owned(),
+            "ingest.embed.requested".to_owned(),
+            "ingest.publish.requested".to_owned(),
+            "ingest.reconcile.requested".to_owned(),
+            "ingest.failed".to_owned(),
+        ],
+        retention: RetentionPolicy::WorkQueue,
+        duplicate_window: Duration::from_secs(10 * 60),
+        storage: StorageType::File,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1689,6 +2549,29 @@ mod tests {
             None,
             "user-a".to_owned(),
         )
+    }
+
+    fn test_upload_saga() -> UploadSaga {
+        UploadSaga::uploading(
+            "tenant-a".to_owned(),
+            "user-a".to_owned(),
+            "upload-a".to_owned(),
+            "tenants/tenant-a/uploads/upload-a".to_owned(),
+            "multipart-a".to_owned(),
+            "paper.pdf".to_owned(),
+            Some("application/pdf".to_owned()),
+            42,
+            Some("Paper".to_owned()),
+            Some("https://example.test/paper".to_owned()),
+            serde_json::json!({ "authors": ["Ada"] }),
+        )
+    }
+
+    fn test_parts() -> Vec<CompletedUploadPart> {
+        vec![CompletedUploadPart {
+            part_number: 1,
+            etag: "\"etag-a\"".to_owned(),
+        }]
     }
 
     #[tokio::test]
@@ -1791,5 +2674,94 @@ mod tests {
             .unwrap();
         let loaded = bus.load_lock("tenant-a", "conv-a").await.unwrap().unwrap();
         assert!(loaded.terminal_event_published);
+    }
+
+    #[tokio::test]
+    async fn in_memory_upload_saga_completion_is_idempotent_for_same_parts() {
+        let bus = InMemoryChatBus::default();
+        bus.start_upload_saga(test_upload_saga()).await.unwrap();
+
+        let claimed = bus
+            .claim_upload_completion("tenant-a", "user-a", "upload-a", test_parts())
+            .await
+            .unwrap();
+        assert_eq!(claimed.state, UploadSagaState::Completing);
+        assert_eq!(claimed.parts, test_parts());
+
+        let duplicate = bus
+            .claim_upload_completion("tenant-a", "user-a", "upload-a", test_parts())
+            .await
+            .unwrap();
+        assert_eq!(duplicate.state, UploadSagaState::Completing);
+        assert_eq!(duplicate.parts, test_parts());
+    }
+
+    #[tokio::test]
+    async fn in_memory_upload_saga_rejects_conflicting_complete_parts() {
+        let bus = InMemoryChatBus::default();
+        bus.start_upload_saga(test_upload_saga()).await.unwrap();
+        bus.claim_upload_completion("tenant-a", "user-a", "upload-a", test_parts())
+            .await
+            .unwrap();
+
+        let conflicting = bus
+            .claim_upload_completion(
+                "tenant-a",
+                "user-a",
+                "upload-a",
+                vec![CompletedUploadPart {
+                    part_number: 1,
+                    etag: "\"etag-b\"".to_owned(),
+                }],
+            )
+            .await;
+        assert!(matches!(conflicting, Err(ChatBusError::InFlight)));
+    }
+
+    #[tokio::test]
+    async fn in_memory_upload_saga_accepted_state_is_replayable() {
+        let bus = InMemoryChatBus::default();
+        bus.start_upload_saga(test_upload_saga()).await.unwrap();
+        bus.claim_upload_completion("tenant-a", "user-a", "upload-a", test_parts())
+            .await
+            .unwrap();
+        bus.mark_upload_object_completed("tenant-a", "user-a", "upload-a")
+            .await
+            .unwrap();
+        bus.mark_upload_accepted("tenant-a", "user-a", "upload-a", "doc-a", "job-a")
+            .await
+            .unwrap();
+
+        let duplicate = bus
+            .claim_upload_completion("tenant-a", "user-a", "upload-a", test_parts())
+            .await
+            .unwrap();
+        assert_eq!(duplicate.state, UploadSagaState::Accepted);
+        assert_eq!(duplicate.document_id.as_deref(), Some("doc-a"));
+        assert_eq!(duplicate.job_id.as_deref(), Some("job-a"));
+    }
+
+    #[tokio::test]
+    async fn in_memory_upload_cleanup_claims_only_expired_active_sagas() {
+        let bus = InMemoryChatBus::default();
+        let mut saga = test_upload_saga();
+        saga.expires_at = Utc::now() - ChronoDuration::seconds(1);
+        bus.start_upload_saga(saga).await.unwrap();
+
+        let claimed = bus
+            .claim_upload_cleanup("tenant-a", "user-a", "upload-a", Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.state, UploadSagaState::Aborting);
+
+        bus.mark_upload_aborted("tenant-a", "user-a", "upload-a", "expired")
+            .await
+            .unwrap();
+        let terminal = bus
+            .claim_upload_cleanup("tenant-a", "user-a", "upload-a", Utc::now())
+            .await
+            .unwrap();
+        assert!(terminal.is_none());
     }
 }

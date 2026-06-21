@@ -10,7 +10,7 @@ use delphi_contracts::{ClientWsMessage, ConversationDetail, ServerWsMessage};
 use delphi_nats::{
     ChatBus, NatsChatBus, NatsChatBusOptions, ReplayIndex, ReplayTurn, SequencedChatEvent,
 };
-use delphi_storage::{ChatRepository, SurrealChatRepository};
+use delphi_storage::{ChatRepository, PgRepository};
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -27,7 +27,7 @@ struct AppState {
     auth: AuthVerifier,
     bus: NatsChatBus,
     events: ConversationEventRegistry,
-    repo: SurrealChatRepository,
+    repo: PgRepository,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -133,14 +133,7 @@ async fn main() -> anyhow::Result<()> {
         auth: AuthVerifier::from_env()?,
         bus: NatsChatBus::connect(&config.nats_url, NatsChatBusOptions::default()).await?,
         events: ConversationEventRegistry::default(),
-        repo: SurrealChatRepository::connect(
-            &config.surreal_url,
-            &config.surreal_namespace,
-            &config.surreal_database,
-            &config.surreal_user,
-            &config.surreal_password,
-        )
-        .await?,
+        repo: PgRepository::connect(&config.database_url, config.pg_max_connections).await?,
     };
 
     let app = Router::new()

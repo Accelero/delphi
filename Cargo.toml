@@ -8,6 +8,7 @@ members = [
     "crates/storage",
     "services/api-service",
     "services/chat-worker",
+    "services/document-worker",
     "services/realtime-service",
 ]
 resolver = "2"
@@ -20,6 +21,8 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "sigv4a"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 futures = "0.3"
@@ -27,6 +30,7 @@ http = "1"
 rig = { package = "rig-core", version = "0.37", features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
