@@ -1,11 +1,18 @@
 # PG Cutover and Upload Pipeline Implementation Plan
 
+> **Partly superseded.** Milestone 1 (SurrealDB → Postgres) was completed and is
+> accurate history. Milestones 2 and 3 — the upload pipeline, KV job state,
+> `upload_session` table, and `/sign-part` flow — were replaced by the
+> event-sourced design in
+> [Document Upload and Lifecycle](./document-upload). Read this page as a record
+> of the cutover, not as a plan to follow.
+
 ## Summary
 
 Implement this in three sequential milestones:
 
 1. Replace SurrealDB with Postgres and move existing chat persistence to PG.
-2. Add document upload v1: multipart S3 upload, event-driven complete flow, timeout worker, and PG document row creation.
+2. Add document upload v1: multipart S3 upload, event-driven complete flow, S3 incomplete-upload GC, and PG document row creation.
 3. Leave ingestion/vector work for the next milestone, but create the schema/event boundaries so ingestion can attach cleanly later.
 
 Chosen defaults:
@@ -258,13 +265,6 @@ title
 metadata
 ```
 
-- Write timeout index key:
-
-```text
-bucket: document_job_timeouts
-key: upload_timeouts.<epoch_minute>.<tenant_id>.<document_id>.<job_id>
-```
-
 - Return existing frontend-compatible response:
 
 ```json
@@ -272,7 +272,7 @@ key: upload_timeouts.<epoch_minute>.<tenant_id>.<document_id>.<job_id>
   "upload_id": "...",
   "key": "...",
   "multipart_upload_id": "...",
-  "part_size_bytes": 8388608,
+  "part_size_bytes": 20971520,
   "part_url_ttl_secs": 900
 }
 ```
@@ -287,7 +287,7 @@ key: upload_timeouts.<epoch_minute>.<tenant_id>.<document_id>.<job_id>
 `POST /complete`:
 
 - Validate `parts` is non-empty.
-- Load KV job and reject terminal/expired/missing jobs.
+- Load KV job and reject terminal/missing jobs.
 - Publish NATS command:
 
 ```text
@@ -315,9 +315,9 @@ Payload includes tenant/user/document/job IDs and uploaded parts.
 - Return:
   - `uploading` for `awaiting_upload` or `completing_upload`;
   - `accepted` when PG document exists or KV stage is `ready`;
-  - `failed` for `expired`, `aborted`, or `failed`.
+  - `failed` for `aborted` or `failed`.
 
-### Milestone 3: Document Worker and Timeout Service
+### Milestone 3: Document Worker and S3 GC
 
 Add `services/document-worker` or a dedicated worker module/binary.
 
@@ -326,11 +326,8 @@ Responsibilities:
 - Ensure NATS stream for `documents.uploads.v1.>`.
 - Ensure KV buckets:
   - `document_jobs`
-  - `document_job_timeouts`
 - Subscribe to:
   - `documents.uploads.v1.completed`
-  - `documents.uploads.v1.timeout_requested`
-- Run timeout scheduler loop.
 
 Complete worker flow:
 
@@ -338,7 +335,7 @@ Complete worker flow:
 receive completed command
 -> load KV job
 -> if already ready, ack
--> if expired/aborted/failed, ack without resurrecting
+-> if aborted/failed, ack without resurrecting
 -> CAS awaiting_upload -> completing_upload
 -> complete S3 multipart upload
 -> if S3 says already completed and object exists, continue
@@ -359,37 +356,12 @@ PG insert behavior:
 - If the same document already exists with the same object key/version, treat as idempotent success.
 - If a conflicting row exists with different object data, mark KV failed and ack.
 
-Timeout scheduler flow:
-
-```text
-every UPLOAD_TIMEOUT_SCHEDULER_INTERVAL_SECS:
-  for each due epoch_minute <= now:
-    list document_job_timeouts/upload_timeouts.<epoch_minute>.>
-    publish documents.uploads.v1.timeout_requested
-      Nats-Msg-Id = upload-timeout:<tenant>:<document>:<job>
-    delete timeout index key after PubAck, best effort
-```
-
-Timeout handler flow:
-
-```text
-receive timeout_requested
--> load KV job
--> if missing or stage advanced past awaiting_upload, ack
--> CAS awaiting_upload -> expiring_upload
--> abort S3 multipart upload
--> delete pending object if one exists
--> CAS expiring_upload -> expired
--> ack
-```
-
 Race rules:
 
 - Complete wins if it CASes `awaiting_upload -> completing_upload` first.
-- Timeout wins if it CASes `awaiting_upload -> expiring_upload` first.
-- Timeout must not delete objects tagged `upload_state=committed`.
-- Complete must not resurrect `expired`, `aborted`, or `failed` jobs.
+- Complete must not resurrect `aborted` or `failed` jobs.
 - Worker redelivery repeats deterministic work and uses KV/PG guards.
+- Abandoned browser uploads expire from KV and are cleaned from object storage by MinIO GC.
 
 ### S3/MinIO Cleanup
 
@@ -400,10 +372,9 @@ Race rules:
   - `get_object_tagging` if needed for safety
 - Add pending tag at multipart creation.
 - Mark committed after successful complete/HEAD.
-- Configure MinIO bucket lifecycle in `minio-init` as fallback:
+- Configure MinIO incomplete multipart GC as fallback cleanup:
   - abort incomplete multipart uploads after one day;
-  - expire/delete pending objects after one day if tag-based lifecycle is available.
-- Treat lifecycle as last-line cleanup only; product-visible timeout comes from the worker.
+  - let short-lived NATS KV upload state expire if the browser never completes.
 
 ## Tests
 
@@ -425,10 +396,9 @@ Race rules:
   - stale parent conflict.
 - Add upload E2E:
   - create upload, sign parts, upload to MinIO, complete, poll until accepted, assert PG `document` row exists.
-  - create upload and never complete; timeout worker expires it and aborts multipart upload.
-  - complete vs timeout race: only one KV terminal path wins.
+  - create upload and never complete; KV upload state expires and MinIO GC aborts incomplete multipart upload.
   - duplicate complete event: PG document row remains single and outbox event is not duplicated.
-  - complete after expired upload returns conflict or remains failed by status.
+  - complete after missing/terminal upload state returns conflict or not found.
 
 ### Manual Smoke
 

@@ -1,3 +1,20 @@
+# How long an upload exists.
+#
+# Declared once and referenced by the only two components that ENFORCE it:
+#
+#   api-service  -> declares the NATS KV bucket's max_age
+#   minio-gc     -> aborts incomplete multiparts older than this
+#
+# In k8s this is one key in a ConfigMap and two `configMapKeyRef`s; the anchor
+# is compose's version of the same thing. Nothing else may hold it —
+# document-worker binds to the topology and never declares it, which is what
+# stopped two services fighting over the bucket's TTL on every restart.
+#
+# The two are the same number because they are the same concept, not because
+# either depends on the other. Whichever expires first, the other side cleans up
+# after it, and neither order leaves an artefact behind.
+x-upload-ttl-secs: &upload-ttl-secs "86400"
+
 x-service-image: &service-image
   image: delphi-service:latest
   build:
@@ -83,11 +100,12 @@ services:
 
   nats:
     image: nats:2
-    command: ["-js", "-sd", "/data", "-m", "8222"]
+    command: ["-c", "/etc/nats/nats.conf"]
     ports:
       - "4222:4222"
       - "8222:8222"
     volumes:
+      - ./ops/nats/nats.conf:/etc/nats/nats.conf:ro
       - nats-data:/data
 
   postgres:
@@ -139,6 +157,30 @@ services:
         mc mb --ignore-existing local/delphi
         mc anonymous set none local/delphi
 
+  minio-gc:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Seconds, so it can be the same value the services take. `mc` parses a
+      # bare `<n>s` duration and rejects anything it does not understand, so a
+      # malformed value fails loudly rather than sweeping the wrong window.
+      DELPHI_DOCUMENT_UPLOAD_TTL_SECS: *upload-ttl-secs
+      MINIO_INCOMPLETE_UPLOAD_GC_INTERVAL_SECS: "3600"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://minio:9000 delphi delphi-secret
+        while true; do
+          mc rm --incomplete --recursive --force --older-than "$${DELPHI_DOCUMENT_UPLOAD_TTL_SECS}s" local/delphi || true
+          sleep "$${MINIO_INCOMPLETE_UPLOAD_GC_INTERVAL_SECS}"
+        done
+
   api-service:
     <<: *service-image
     command: ["/usr/local/bin/api-service"]
@@ -155,20 +197,24 @@ services:
       CHAT_EVENTS_MAX_AGE_SECONDS: "1800"
       CHAT_REPLAY_TTL_SECONDS: "1500"
       CHAT_COMMAND_ACK_WAIT_SECONDS: "120"
-      DELPHI_INGEST_S3_ENDPOINT_INTERNAL: http://minio:9000
-      DELPHI_INGEST_S3_ENDPOINT_PUBLIC: http://localhost:9000
-      DELPHI_INGEST_S3_REGION: us-east-1
-      DELPHI_INGEST_S3_BUCKET: delphi
-      DELPHI_INGEST_S3_ACCESS_KEY_ID: delphi
-      DELPHI_INGEST_S3_SECRET_ACCESS_KEY: delphi-secret
-      DELPHI_INGEST_S3_FORCE_PATH_STYLE: "true"
-      INGEST_UPLOAD_PART_SIZE_BYTES: "8388608"
-      INGEST_UPLOAD_PART_URL_TTL_SECS: "900"
-      INGEST_UPLOAD_CLEANUP_INTERVAL_SECS: "60"
-      INGEST_PIPELINE_VERSION: "1"
-      UPLOAD_SAGA_TIMEOUT_SECONDS: "86400"
-      UPLOAD_CLEANUP_RETRY_SECONDS: "900"
-      UPLOAD_SAGA_KV_TTL_SECONDS: "604800"
+      DELPHI_DOCUMENT_S3_ENDPOINT_INTERNAL: http://minio:9000
+      DELPHI_DOCUMENT_S3_ENDPOINT_PUBLIC: http://localhost:9000
+      DELPHI_DOCUMENT_S3_REGION: us-east-1
+      DELPHI_DOCUMENT_S3_BUCKET: delphi
+      DELPHI_DOCUMENT_S3_ACCESS_KEY_ID: delphi
+      DELPHI_DOCUMENT_S3_SECRET_ACCESS_KEY: delphi-secret
+      DELPHI_DOCUMENT_S3_FORCE_PATH_STYLE: "true"
+      DELPHI_DOCUMENT_UPLOAD_TTL_SECS: *upload-ttl-secs
+      DELPHI_DOCUMENT_PART_URL_TTL_SECS: "300"
+      # 32 GiB. Not a storage limit -- the worker streams every byte of this
+      # past a scanner inside the redelivery window, so the bound is what one
+      # worker can chew through, not what S3 can hold.
+      DELPHI_DOCUMENT_MAX_UPLOAD_BYTES: "34359738368"
+      # 20 MiB. Chosen so the typical document is a single part -- no ListParts,
+      # no resume bookkeeping, a plain ETag. Honoured up to part_size x 10 000
+      # (200 GiB here); past that the server grows parts to hold the count under
+      # S3's cap, and logs an error at startup if the upload cap exceeds it.
+      DELPHI_DOCUMENT_PART_SIZE_BYTES: "20971520"
     depends_on:
       nats:
         condition: service_started
@@ -263,16 +309,23 @@ services:
       NATS_URL: nats://nats:4222
       DATABASE_URL: postgres://delphi:delphi@postgres:5432/delphi
       PG_MAX_CONNECTIONS: "10"
-      DELPHI_INGEST_S3_ENDPOINT_INTERNAL: http://minio:9000
-      DELPHI_INGEST_S3_REGION: us-east-1
-      DELPHI_INGEST_S3_BUCKET: delphi
-      DELPHI_INGEST_S3_ACCESS_KEY_ID: delphi
-      DELPHI_INGEST_S3_SECRET_ACCESS_KEY: delphi-secret
-      DELPHI_INGEST_S3_FORCE_PATH_STYLE: "true"
-      INGEST_PIPELINE_VERSION: "1"
-      DOCUMENT_WORKER_POLL_INTERVAL_SECS: "2"
-      UPLOAD_SAGA_KV_TTL_SECONDS: "604800"
-      UPLOAD_CLEANUP_RETRY_SECONDS: "900"
+      DELPHI_DOCUMENT_S3_ENDPOINT_INTERNAL: http://minio:9000
+      DELPHI_DOCUMENT_S3_ENDPOINT_PUBLIC: http://localhost:9000
+      DELPHI_DOCUMENT_S3_REGION: us-east-1
+      DELPHI_DOCUMENT_S3_BUCKET: delphi
+      DELPHI_DOCUMENT_S3_ACCESS_KEY_ID: delphi
+      DELPHI_DOCUMENT_S3_SECRET_ACCESS_KEY: delphi-secret
+      DELPHI_DOCUMENT_S3_FORCE_PATH_STYLE: "true"
+      DELPHI_DOCUMENT_ACK_WAIT_SECS: "120"
+      DELPHI_DOCUMENT_MAX_DELIVER: "5"
+      DELPHI_DOCUMENT_MAX_ACK_PENDING: "64"
+      # How many uploads one worker finishes at once. Each one streams a whole
+      # object past the scanner, so this is a bandwidth decision, not a CPU one;
+      # scale past it by adding worker instances (they compete for the queue).
+      DELPHI_DOCUMENT_WORK_CONCURRENCY: "8"
+      DELPHI_DOCUMENT_PROJECTOR_LOCK_ID: "7243178541"
+      DELPHI_DOCUMENT_PROJECTOR_ELECTION_SECS: "15"
+      DELPHI_DOCUMENT_PROJECTION_BATCH: "500"
     depends_on:
       nats:
         condition: service_started
@@ -318,7 +371,13 @@ services:
       dockerfile: frontend/Dockerfile
       target: dev
     working_dir: /app
-    command: ["bun", "run", "dev"]
+    # `frontend-node-modules` is mounted over /app/node_modules, and a named
+    # volume seeds from the image only when it is first created — so the
+    # Dockerfile's `bun install` never reaches an existing volume, and a new
+    # dependency shows up as a vite "failed to resolve import" 500. Installing
+    # on boot keeps the volume in step with bun.lock; it is a no-op when it
+    # already is.
+    command: ["sh", "-c", "bun install && bun run dev"]
     environment:
       CHOKIDAR_USEPOLLING: "true"
       VITE_DEV_SERVER_PORT: "80"

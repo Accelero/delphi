@@ -6,15 +6,17 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-aws-credential-types.workspace = true
-aws-sdk-s3.workspace = true
 axum.workspace = true
 chrono.workspace = true
 delphi-auth.workspace = true
 delphi-config.workspace = true
 delphi-contracts.workspace = true
+delphi-document-adapters.workspace = true
+delphi-document-app.workspace = true
+delphi-document-domain.workspace = true
 delphi-nats.workspace = true
 delphi-storage.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tower-http.workspace = true

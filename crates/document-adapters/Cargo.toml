@@ -1,0 +1,32 @@
+[package]
+name = "delphi-document-adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-nats.workspace = true
+async-trait.workspace = true
+aws-credential-types.workspace = true
+aws-sdk-s3.workspace = true
+chrono.workspace = true
+crc32fast.workspace = true
+delphi-document-app.workspace = true
+delphi-document-domain.workspace = true
+futures.workspace = true
+hex.workspace = true
+include_dir.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+ulid.workspace = true

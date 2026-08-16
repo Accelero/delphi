@@ -80,6 +80,12 @@ const d2DarkPalette: D2ThemePalette = {
   AB4: '#45475A',
   AB5: '#313244',
 };
+const d2FontSizePx = 13;
+const d2RenderScale = 0.9;
+const d2SourcePrefix = [
+  `**.style.font-size: ${d2FontSizePx}`,
+  `(* -> **)[*].style.font-size: ${d2FontSizePx}`,
+].join('\n');
 
 type Frontmatter = {
   title?: string;
@@ -231,16 +237,21 @@ function semanticColor(
 function styleD2Text(
   text: Text | undefined,
   palette: D2ThemePalette,
-  options?: { upright?: boolean },
+  options?: { normalWeight?: boolean; upright?: boolean },
 ): void {
   if (!text) {
     return;
+  }
+
+  if (options?.normalWeight) {
+    text.bold = false;
   }
 
   if (options?.upright) {
     text.italic = false;
   }
 
+  text.fontSize = d2FontSizePx;
   text.color = semanticColor(d2SemanticTokens.textColor, text.color, palette);
 
   if (text.labelFill) {
@@ -287,13 +298,13 @@ function styleD2Shape(shape: Shape, palette: D2ThemePalette): void {
   }
 
   if ('label' in shape) {
-    styleD2Text(shape, palette);
+    styleD2Text(shape, palette, { normalWeight: true });
   }
 
   if ('columns' in shape && Array.isArray(shape.columns)) {
     for (const column of shape.columns) {
-      styleD2Text(column.name, palette);
-      styleD2Text(column.type, palette);
+      styleD2Text(column.name, palette, { normalWeight: true });
+      styleD2Text(column.type, palette, { normalWeight: true });
     }
   }
 }
@@ -357,6 +368,7 @@ function styleD2Diagram(
 async function renderD2(code: Code, salt: string): Promise<string> {
   try {
     const { lightSvg, darkSvg } = await enqueueD2Render(async () => {
+      const source = `${d2SourcePrefix}\n${code.value}`;
       // The D2 worker JSON-serializes compile requests; Go decodes []byte fields
       // from base64 strings, while Uint8Array serializes into an invalid shape.
       const fontOptions = (await getD2FontOptions()) as unknown as Pick<
@@ -365,7 +377,7 @@ async function renderD2(code: Code, salt: string): Promise<string> {
       >;
       const lightResult = await d2.compile({
         fs: {
-          index: code.value,
+          index: source,
         },
         inputPath: 'index',
         options: {
@@ -378,7 +390,7 @@ async function renderD2(code: Code, salt: string): Promise<string> {
       });
       const darkResult = await d2.compile({
         fs: {
-          index: code.value,
+          index: source,
         },
         inputPath: 'index',
         options: {
@@ -395,11 +407,13 @@ async function renderD2(code: Code, salt: string): Promise<string> {
       const lightSvg = await d2.render(lightResult.diagram, {
         ...lightResult.renderOptions,
         salt: `${salt}-light`,
+        scale: d2RenderScale,
         noXMLTag: true,
       });
       const darkSvg = await d2.render(darkResult.diagram, {
         ...darkResult.renderOptions,
         salt: `${salt}-dark`,
+        scale: d2RenderScale,
         noXMLTag: true,
       });
 

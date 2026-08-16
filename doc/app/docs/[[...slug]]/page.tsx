@@ -1,5 +1,7 @@
 import { source } from '@/lib/source';
 import { renderMarkdown } from '@/lib/markdown';
+import { D2DiagramZoom } from './D2DiagramZoom';
+import { connection } from 'next/server';
 import {
   DocsBody,
   DocsDescription,
@@ -11,6 +13,10 @@ import { notFound } from 'next/navigation';
 export default async function Page(props: {
   params: Promise<{ slug?: string[] }>;
 }) {
+  if (process.env.NODE_ENV === 'development') {
+    await connection();
+  }
+
   const params = await props.params;
   const page = source.getPage(params.slug);
 
@@ -26,7 +32,9 @@ export default async function Page(props: {
       <DocsDescription>
         {rendered.frontmatter.description ?? page.data.description}
       </DocsDescription>
-      <DocsBody dangerouslySetInnerHTML={{ __html: rendered.html }} />
+      <D2DiagramZoom>
+        <DocsBody dangerouslySetInnerHTML={{ __html: rendered.html }} />
+      </D2DiagramZoom>
     </DocsPage>
   );
 }

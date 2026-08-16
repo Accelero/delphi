@@ -9,6 +9,9 @@
 - When a fast tactical fix and a durable architecture differ, call out the
   tradeoff and default to doing it right the first time unless the user
   explicitly asks for a short-term workaround.
+- Do not implement temporary or intermediate solutions with the intent to clean
+  them up later. Default to production end-state designs and implement them
+  cleanly immediately.
 - Keep changes scoped and pragmatic, but avoid knowingly introducing patterns
   that will need to be replaced as soon as the system scales.
 

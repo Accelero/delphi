@@ -71,30 +71,6 @@ CREATE INDEX IF NOT EXISTS chat_message_owner_order_idx
 CREATE INDEX IF NOT EXISTS chat_turn_conversation_created_idx
   ON chat_turn (tenant_id, conversation_id, created_at);
 
-CREATE TABLE IF NOT EXISTS upload_session (
-  tenant_id text NOT NULL,
-  user_id text NOT NULL,
-  upload_id text NOT NULL,
-  storage_key text NOT NULL,
-  multipart_upload_id text NOT NULL,
-  filename text NOT NULL,
-  content_type text,
-  declared_size bigint NOT NULL CHECK (declared_size >= 0),
-  title text,
-  source_uri text,
-  metadata jsonb NOT NULL DEFAULT '{}',
-  state text NOT NULL CHECK (state IN ('uploading', 'accepted', 'failed')),
-  document_id text,
-  job_id text,
-  error text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (tenant_id, upload_id)
-);
-
-CREATE INDEX IF NOT EXISTS upload_session_owner_updated_idx
-  ON upload_session (tenant_id, user_id, updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS document (
   tenant_id text NOT NULL,
   document_id text NOT NULL,

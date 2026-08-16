@@ -3,6 +3,9 @@ members = [
     "crates/auth",
     "crates/config",
     "crates/contracts",
+    "crates/document-adapters",
+    "crates/document-app",
+    "crates/document-domain",
     "crates/llm",
     "crates/nats",
     "crates/storage",
@@ -20,19 +23,26 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+async-nats = "0.45"
 async-trait = "0.1"
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client", "sigv4a"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+crc32fast = "1"
 futures = "0.3"
+hex = "0.4"
 http = "1"
+include_dir = "0.7"
+proptest = "1"
 rig = { package = "rig-core", version = "0.37", features = ["rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -42,6 +52,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 delphi-auth = { path = "crates/auth" }
 delphi-config = { path = "crates/config" }
 delphi-contracts = { path = "crates/contracts" }
+delphi-document-adapters = { path = "crates/document-adapters" }
+delphi-document-app = { path = "crates/document-app" }
+delphi-document-domain = { path = "crates/document-domain" }
 delphi-llm = { path = "crates/llm" }
 delphi-nats = { path = "crates/nats" }
 delphi-storage = { path = "crates/storage" }

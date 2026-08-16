@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-async-nats = "0.45"
+async-nats.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 delphi-contracts.workspace = true

@@ -13,3 +13,6 @@ doc_old/
 
 Those files remain useful as source material and historical context while the
 MkDocs site tracks current architecture decisions.
+
+The old chat migration notes were consolidated into
+[Chat Migration](architecture/chat-migration) and removed from `doc_old`.

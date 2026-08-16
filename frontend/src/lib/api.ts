@@ -1,4 +1,14 @@
-import type { ConversationDetail, ConversationSummary } from "./types";
+import type {
+  CompleteUploadRequest,
+  ConversationDetail,
+  ConversationSummary,
+  CreateUploadResponse,
+  DocumentDto,
+  DocumentListResponse,
+  RenewUploadResponse,
+  UploadedPartsResponse,
+  UploadStatusResponse
+} from "./types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -61,5 +71,55 @@ export const api = {
       body: JSON.stringify(body)
     }),
   stopTurn: (conversationId: string) =>
-    request<void>(`/api/chat/conversations/${conversationId}/stop`, { method: "POST" })
+    request<void>(`/api/chat/conversations/${conversationId}/stop`, { method: "POST" }),
+  // --- documents -----------------------------------------------------------
+  //
+  // Preflight. Must be called BEFORE the uploader is constructed: part size is
+  // server-owned and Uppy fixes its chunk boundaries at construction time.
+  createUpload: (body: {
+    filename: string;
+    size: number;
+    content_type?: string | null;
+    /** Omit to create a new document, supply to replace an existing one. */
+    document_id?: string | null;
+  }) =>
+    request<CreateUploadResponse>("/api/uploads", {
+      method: "POST",
+      body: JSON.stringify(body)
+    }),
+  // What storage already holds. An uploader resumes by skipping these parts and
+  // taking their ETags from here — it never uploaded them, so it has no other
+  // source, and /complete needs every ETag.
+  listUploadedParts: (uploadId: string) =>
+    request<UploadedPartsResponse>(`/api/uploads/${uploadId}/parts`),
+  // Signs parts. Called once per part, immediately before that part is
+  // uploaded — omit `from_part` instead to ask where an upload should resume.
+  renewUploadParts: (
+    uploadId: string,
+    body: { from_part?: number; count?: number },
+    signal?: AbortSignal
+  ) =>
+    request<RenewUploadResponse>(`/api/uploads/${uploadId}/renew`, {
+      method: "POST",
+      body: JSON.stringify(body),
+      signal
+    }),
+  completeUpload: (uploadId: string, body: CompleteUploadRequest) =>
+    request<{ state: string }>(`/api/uploads/${uploadId}/complete`, {
+      method: "POST",
+      body: JSON.stringify(body)
+    }),
+  getUploadStatus: (uploadId: string) =>
+    request<UploadStatusResponse>(`/api/uploads/${uploadId}`),
+  getDocument: (documentId: string) => request<DocumentDto>(`/api/documents/${documentId}`),
+  // `cursor` is the previous page's `next`, passed back verbatim. It is opaque:
+  // it encodes the whole ordering key, because `updated_at` alone is not unique
+  // and paging on a bare timestamp drops rows that share one.
+  listDocuments: (params?: { limit?: number; cursor?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.limit != null) query.set("limit", String(params.limit));
+    if (params?.cursor) query.set("cursor", params.cursor);
+    const suffix = query.size > 0 ? `?${query.toString()}` : "";
+    return request<DocumentListResponse>(`/api/documents${suffix}`);
+  }
 };

@@ -8,12 +8,8 @@ reference, not as the target structure.
 
 - [Microservice migration plan](./microservice-migration-plan.md) — master
   plan for the incremental rewrite across chat, ingestion, and feed.
-- [Chat microservice migration](./chat-microservice-migration.md) — first
-  rebuild slice: API service, realtime WebSocket service, chat worker,
-  NATS/JetStream session state, frontend chat UI, and validation plan.
-- [Chat realtime replay plan](./chat-realtime-replay-plan.md) — backend plan
-  for JetStream replay, late joiners, reconnects, per-turn purge, and replay
-  KV retention.
+- Chat migration status is now tracked in
+  `doc/content/docs/architecture/chat-migration.md`.
 - [Ingestion microservice migration](./ingestion-microservice-migration.md) —
   second rebuild slice: upload API, object validation, saga work queues,
   extraction, chunking, embedding, publish, and reconciliation.

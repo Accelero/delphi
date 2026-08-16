@@ -1,0 +1,22 @@
+[package]
+name = "delphi-document-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Use cases and port traits. Depends inward on document-domain only.
+# Concrete infrastructure (NATS, sqlx, aws-sdk-s3, axum) belongs in document-adapters.
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+delphi-document-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util"] }

@@ -1,0 +1,26 @@
+-- Upload state moves to NATS KV. Postgres is the document projection, only.
+--
+-- `upload_attempt` was the last non-projection table in this schema, and it was
+-- the odd one out in a way that mattered: everything else here is rebuildable by
+-- folding the event log, and this was not — a rejected upload appends no event,
+-- so the row was the sole record of its own outcome. That made "drop the
+-- database and replay" untrue for exactly one table.
+--
+-- It also put two unordered writers on one row. `/complete` marked it
+-- `scanning` after publishing the work item, while the worker marked it
+-- `accepted` as soon as it finished; the later write won, and a fast upload
+-- could end up reporting `scanning` forever.
+--
+-- The KV record replaces both jobs. It is keyed by the caller, so the upload is
+-- private to whoever started it; it is compare-and-swapped, so a terminal answer
+-- cannot be overwritten; and the bucket's `max_age` retires it, which is why
+-- `AttemptSweeper` and its leader-elected task are gone too.
+--
+-- What is deliberately lost:
+--   * uploads older than the KV TTL. There is no archive of finished uploads.
+--   * `GET /api/documents/{id}.uploads_in_progress` — "who else is uploading to
+--     this document?" is a cross-user question, and a user-scoped keyspace
+--     cannot answer one. `upload_attempt_document_idx` existed for that query
+--     alone.
+
+DROP TABLE IF EXISTS upload_attempt CASCADE;

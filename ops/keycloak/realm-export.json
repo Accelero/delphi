@@ -7,7 +7,14 @@
   "roles": {
     "realm": [
       { "name": "member", "description": "Standard tenant member" },
-      { "name": "owner", "description": "Tenant owner" },
+      {
+        "name": "owner",
+        "description": "Tenant owner",
+        "composite": true,
+        "composites": {
+          "realm": ["member", "ingester"]
+        }
+      },
       { "name": "ingester", "description": "Permitted to ingest documents" }
     ]
   },

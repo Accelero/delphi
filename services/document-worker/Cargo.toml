@@ -6,14 +6,9 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-aws-credential-types.workspace = true
-aws-sdk-s3.workspace = true
 axum.workspace = true
-chrono.workspace = true
 delphi-config.workspace = true
-delphi-contracts.workspace = true
-delphi-nats.workspace = true
-delphi-storage.workspace = true
+delphi-document-adapters.workspace = true
+delphi-document-app.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-uuid.workspace = true

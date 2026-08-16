@@ -34,6 +34,10 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.iter().any(|candidate| candidate == role)
+    }
+
     pub fn public_user(&self) -> AuthUser {
         AuthUser {
             user_id: self.user_id.clone(),
@@ -98,19 +102,25 @@ impl AuthVerifier {
         let inbound = serde_json::from_value::<InboundClaims>(payload)
             .map_err(|error| AuthError::Invalid(format!("decode JWT payload: {error}")))?;
 
-        let sub = inbound
-            .sub
-            .ok_or_else(|| AuthError::Invalid("JWT missing required sub claim".to_owned()))?;
-        let email = inbound.email;
-        let tenant_id = inbound
-            .tenant_id
-            .unwrap_or_else(|| self.default_tenant.clone());
+        let InboundClaims {
+            sub,
+            email,
+            tenant_id,
+            roles,
+            realm_access,
+            resource_access,
+        } = inbound;
+
+        let sub =
+            sub.ok_or_else(|| AuthError::Invalid("JWT missing required sub claim".to_owned()))?;
+        let roles = normalize_roles(roles, realm_access, resource_access);
+        let tenant_id = tenant_id.unwrap_or_else(|| self.default_tenant.clone());
 
         Ok(AuthContext {
             user_id: sub.clone(),
             tenant_id,
             email,
-            roles: inbound.roles.unwrap_or_default(),
+            roles,
             bearer_subject: format!("Bearer {bearer}"),
         })
     }
@@ -128,6 +138,43 @@ struct InboundClaims {
     email: Option<String>,
     tenant_id: Option<String>,
     roles: Option<Vec<String>>,
+    realm_access: Option<RoleAccess>,
+    resource_access: Option<HashMap<String, RoleAccess>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RoleAccess {
+    roles: Option<Vec<String>>,
+}
+
+fn normalize_roles(
+    flat_roles: Option<Vec<String>>,
+    realm_access: Option<RoleAccess>,
+    resource_access: Option<HashMap<String, RoleAccess>>,
+) -> Vec<String> {
+    let mut roles = Vec::new();
+    extend_roles(&mut roles, flat_roles);
+    if let Some(realm_access) = realm_access {
+        extend_roles(&mut roles, realm_access.roles);
+    }
+    if let Some(resource_access) = resource_access {
+        for access in resource_access.into_values() {
+            extend_roles(&mut roles, access.roles);
+        }
+    }
+    roles
+}
+
+fn extend_roles(normalized: &mut Vec<String>, roles: Option<Vec<String>>) {
+    let Some(roles) = roles else {
+        return;
+    };
+    for role in roles {
+        let role = role.trim();
+        if !role.is_empty() && !normalized.iter().any(|candidate| candidate == role) {
+            normalized.push(role.to_owned());
+        }
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -309,5 +356,79 @@ fn infer_alg_from_params(parameters: &AlgorithmParameters) -> Option<Algorithm> 
         AlgorithmParameters::EllipticCurve(_) => Some(Algorithm::ES256),
         AlgorithmParameters::OctetKeyPair(_) => Some(Algorithm::EdDSA),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+    use serde_json::json;
+
+    struct StaticValidator(Value);
+
+    #[async_trait]
+    impl JwtValidator for StaticValidator {
+        async fn validate(&self, _jwt: &str) -> Result<Value, ValidationError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn verifier(payload: Value) -> AuthVerifier {
+        AuthVerifier {
+            validator: Arc::new(StaticValidator(payload)),
+            default_tenant: "tenant-a".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_headers_normalizes_roles_from_supported_claims() {
+        let verifier = verifier(json!({
+            "sub": "user-1",
+            "roles": ["member", " member ", ""],
+            "realm_access": {
+                "roles": ["owner", "ingester"]
+            },
+            "resource_access": {
+                "delphi": {
+                    "roles": ["ingester", "chat"]
+                }
+            }
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            H_AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-token"),
+        );
+
+        let auth = verifier.verify_headers(&headers).await.unwrap();
+
+        assert_eq!(
+            auth.roles,
+            vec![
+                "member".to_owned(),
+                "owner".to_owned(),
+                "ingester".to_owned(),
+                "chat".to_owned()
+            ]
+        );
+        assert!(auth.has_role("ingester"));
+    }
+
+    #[tokio::test]
+    async fn verify_headers_defaults_tenant_when_claim_is_absent() {
+        let verifier = verifier(json!({
+            "sub": "user-1"
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            H_AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-token"),
+        );
+
+        let auth = verifier.verify_headers(&headers).await.unwrap();
+
+        assert_eq!(auth.tenant_id, "tenant-a");
+        assert!(auth.roles.is_empty());
     }
 }

@@ -23,7 +23,12 @@ const chatConversationRoute = createRoute({
   path: "/chat/$conversationId"
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, chatRoute, chatConversationRoute]);
+const uploadRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/upload"
+});
+
+const routeTree = rootRoute.addChildren([indexRoute, chatRoute, chatConversationRoute, uploadRoute]);
 
 export const router = createRouter({ routeTree });
 

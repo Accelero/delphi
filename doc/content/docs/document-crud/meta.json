@@ -1,0 +1,11 @@
+{
+  "title": "Document CRUD",
+  "pages": [
+    "pg-outbox-document-crud",
+    "document-crud-pipeline",
+    "document-event-sourcing",
+    "document-crud-sync",
+    "nats-event-first-document-crud",
+    "nats-projection-flow"
+  ]
+}

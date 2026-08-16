@@ -5,7 +5,8 @@ implementation is preserved under `old/` as reference only.
 
 Detailed system plans:
 
-- [Chat microservice migration](./chat-microservice-migration.md)
+- Chat migration status is now tracked in
+  `doc/content/docs/architecture/chat-migration.md`.
 - [Ingestion microservice migration](./ingestion-microservice-migration.md)
 - [Feed microservice migration](./feed-microservice-migration.md)
 
@@ -98,7 +99,7 @@ Build chat as the first complete vertical slice. This proves full auth,
 frontend routing, WebSocket realtime, NATS live state, worker execution, and
 SurrealDB persistence.
 
-Detailed plan: [chat-microservice-migration.md](./chat-microservice-migration.md).
+Detailed current plan: `doc/content/docs/architecture/chat-migration.md`.
 
 Key outcomes:
 

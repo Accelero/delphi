@@ -1,10 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams, useRouterState } from "@tanstack/react-router";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useThemeMode } from "../../hooks/useThemeMode";
 import { api } from "../../lib/api";
 import { conversationListQueryKey, conversationQueryKey } from "../../lib/chatQueries";
 import type { ConversationDetail, ConversationSummary } from "../../lib/types";
+import { UploadPage } from "../upload/UploadPage";
+import { AppNavigation } from "./AppNavigation";
 import { ChatPane } from "./ChatPane";
 import { ConversationSidebar } from "./ConversationSidebar";
 
@@ -18,6 +20,13 @@ export function App() {
       typeof params.conversationId === "string" ? params.conversationId : null
   });
   const theme = useThemeMode();
+  const [navigationCollapsed, setNavigationCollapsed] = useState(readInitialNavigationCollapsed);
+  const chatActive = pathname.startsWith("/chat");
+  const uploadActive = pathname === "/upload";
+
+  useEffect(() => {
+    localStorage.setItem("delphi.navigationCollapsed", navigationCollapsed ? "true" : "false");
+  }, [navigationCollapsed]);
 
   const conversationsQuery = useQuery({
     queryKey: conversationListQueryKey,
@@ -175,22 +184,42 @@ export function App() {
 
   return (
     <div className="flex h-screen min-h-0 bg-[var(--color-background)] text-[var(--color-foreground)]">
-      <ConversationSidebar
-        conversations={conversations}
-        activeId={activeId}
-        onCreate={create}
-        onDelete={remove}
+      <AppNavigation
+        collapsed={navigationCollapsed}
+        chatActive={chatActive}
+        uploadActive={uploadActive}
         themeMode={theme.mode}
+        onToggleCollapsed={() => setNavigationCollapsed((collapsed) => !collapsed)}
         onThemeModeChange={theme.setMode}
       />
-      <ChatPane
-        conversation={active}
-        onRefresh={refreshConversation}
-        onResync={resyncConversation}
-        onTitleUpdated={applyTitleUpdate}
-      />
+      {chatActive && (
+        <ConversationSidebar
+          className="max-sm:hidden"
+          conversations={conversations}
+          activeId={activeId}
+          onCreate={create}
+          onDelete={remove}
+        />
+      )}
+      {uploadActive ? (
+        <UploadPage />
+      ) : (
+        <ChatPane
+          conversation={active}
+          onRefresh={refreshConversation}
+          onResync={resyncConversation}
+          onTitleUpdated={applyTitleUpdate}
+        />
+      )}
     </div>
   );
+}
+
+function readInitialNavigationCollapsed() {
+  const stored = localStorage.getItem("delphi.navigationCollapsed");
+  if (stored === "true") return true;
+  if (stored === "false") return false;
+  return window.matchMedia("(max-width: 640px)").matches;
 }
 
 function toConversationSummary(conversation: ConversationDetail): ConversationSummary {

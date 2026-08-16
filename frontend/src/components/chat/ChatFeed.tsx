@@ -29,9 +29,6 @@ export type ChatFeedProps = {
   messages: MessageDto[];
   busy?: boolean;
   showThinking?: boolean;
-  notice?: string | null;
-  noticeTone?: "muted" | "danger";
-  noticeAction?: ReactNode;
   className?: string;
   contentClassName?: string;
   renderMessage?: (message: MessageDto, context: ChatMessageRenderContext) => ReactNode;
@@ -45,9 +42,6 @@ export function ChatFeed({
   messages,
   busy = false,
   showThinking = false,
-  notice,
-  noticeTone = "muted",
-  noticeAction,
   className,
   contentClassName,
   renderMessage = defaultRenderMessage
@@ -163,19 +157,6 @@ export function ChatFeed({
           <div ref={sentinelRef} aria-hidden className="h-px" />
         </div>
       </div>
-      {notice ? (
-        <div
-          className={cn(
-            "absolute bottom-4 left-5 flex max-w-[min(42rem,calc(100%-2.5rem))] items-center gap-2 text-sm",
-            noticeTone === "danger"
-              ? "text-[var(--color-danger)]"
-              : "text-[var(--color-text-muted)]"
-          )}
-        >
-          <span>{notice}</span>
-          {noticeAction}
-        </div>
-      ) : null}
       {escaped ? (
         <Button
           size="icon"

@@ -86,6 +86,9 @@ a {
 }
 
 .d2-diagram {
+  position: relative;
+  width: 100%;
+  max-width: 100%;
   margin: 1.5rem 0;
   overflow: auto;
   border: 1px solid color-mix(in oklab, var(--color-fd-border) 72%, transparent);
@@ -95,6 +98,15 @@ a {
   box-shadow: none;
 }
 
+.d2-diagram:not(.d2-diagram-error) {
+  cursor: zoom-in;
+}
+
+.d2-diagram:focus-visible {
+  outline: 2px solid var(--color-fd-primary);
+  outline-offset: 3px;
+}
+
 .dark .d2-diagram {
   border-color: rgba(255, 255, 255, 0.14);
   background: transparent;
@@ -102,6 +114,7 @@ a {
 
 .d2-diagram-light,
 .d2-diagram-dark {
+  width: 100%;
   min-width: 42rem;
 }
 
@@ -127,6 +140,87 @@ a {
   fill: var(--d2-token-diagram-background) !important;
 }
 
+.d2-diagram-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(0 0 0 / 0.72);
+  padding: 1.25rem;
+}
+
+.d2-diagram-modal-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid color-mix(in oklab, var(--color-fd-border) 72%, transparent);
+  border-radius: 0.75rem;
+  background: var(--color-fd-background);
+  box-sizing: content-box;
+  box-shadow: 0 24px 80px rgb(0 0 0 / 0.38);
+}
+
+.d2-diagram-modal-close {
+  position: absolute;
+  top: 0.875rem;
+  right: 0.875rem;
+  z-index: 1;
+  display: grid;
+  width: 2rem;
+  height: 2rem;
+  place-items: center;
+  border: 1px solid color-mix(in oklab, var(--color-fd-border) 72%, transparent);
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--color-fd-background) 92%, transparent);
+  color: var(--color-fd-foreground);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity 140ms ease,
+    visibility 140ms ease;
+  visibility: hidden;
+}
+
+.d2-diagram-modal-close-visible {
+  opacity: 1;
+  pointer-events: auto;
+  visibility: visible;
+}
+
+.d2-diagram-modal-close:hover {
+  background: var(--color-fd-muted);
+}
+
+.d2-diagram.d2-diagram-expanded {
+  flex: none;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: auto;
+  cursor: zoom-out;
+  border: 0;
+  border-radius: 0.75rem;
+}
+
+.d2-diagram-expanded .d2-diagram-light,
+.d2-diagram-expanded .d2-diagram-dark {
+  width: var(--d2-zoom-intrinsic-width);
+  height: var(--d2-zoom-intrinsic-height);
+  min-width: 0;
+}
+
+.d2-diagram-expanded .d2-diagram-light > svg,
+.d2-diagram-expanded .d2-diagram-dark > svg {
+  width: 100%;
+  height: 100%;
+}
+
 .d2-diagram-error {
   border-color: #ef4444;
 }
@@ -147,5 +241,18 @@ a {
   .d2-diagram-light,
   .d2-diagram-dark {
     min-width: 42rem;
+  }
+
+  .d2-diagram-modal {
+    padding: 0.5rem;
+  }
+
+  .d2-diagram-expanded {
+    border-radius: 0.75rem;
+  }
+
+  .d2-diagram-expanded .d2-diagram-light,
+  .d2-diagram-expanded .d2-diagram-dark {
+    min-width: 0;
   }
 }

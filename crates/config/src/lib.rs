@@ -22,7 +22,10 @@ impl ServiceConfig {
             bind_addr,
             public_base_url: env_or("PUBLIC_BASE_URL", "http://localhost:8080"),
             nats_url: env_or("NATS_URL", "nats://127.0.0.1:4222"),
-            database_url: env_or("DATABASE_URL", "postgres://delphi:delphi@127.0.0.1:5432/delphi"),
+            database_url: env_or(
+                "DATABASE_URL",
+                "postgres://delphi:delphi@127.0.0.1:5432/delphi",
+            ),
             pg_max_connections: env_u32("PG_MAX_CONNECTIONS", 10),
         })
     }

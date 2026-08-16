@@ -19,3 +19,4 @@
 *.tsbuildinfo
 .env*
 **/.env*
+/test-results/

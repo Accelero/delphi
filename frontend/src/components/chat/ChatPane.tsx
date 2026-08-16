@@ -135,19 +135,6 @@ export function ChatPane({
         messages={messages}
         busy={busy}
         showThinking={showThinking}
-        notice={notice.message}
-        noticeTone={notice.tone}
-        noticeAction={
-          notice.action === "retry-recovery" ? (
-            <Button type="button" size="sm" variant="outline" onClick={retryRecovery}>
-              Retry now
-            </Button>
-          ) : notice.action === "reconnect" ? (
-            <Button type="button" size="sm" variant="outline" onClick={reconnectNow}>
-              Reconnect now
-            </Button>
-          ) : null
-        }
         className="absolute inset-x-0 top-0 bottom-[var(--chat-composer-center-offset)]"
       />
       <form
@@ -169,6 +156,11 @@ export function ChatPane({
               }
             }}
             className="min-h-20 rounded-none bg-transparent px-3 py-2 focus:ring-0"
+          />
+          <ComposerRealtimeNotice
+            notice={notice}
+            onReconnect={reconnectNow}
+            onRetryRecovery={retryRecovery}
           />
           {busy ? (
             <Button
@@ -203,6 +195,52 @@ export function ChatPane({
   );
 }
 
+function ComposerRealtimeNotice({
+  notice,
+  onReconnect,
+  onRetryRecovery
+}: {
+  notice: RealtimeNotice;
+  onReconnect: () => void;
+  onRetryRecovery: () => void;
+}) {
+  if (!notice.message) return null;
+
+  const action =
+    notice.action === "retry-recovery"
+      ? { label: "Retry", onClick: onRetryRecovery }
+      : notice.action === "reconnect"
+        ? { label: "Reconnect", onClick: onReconnect }
+        : null;
+
+  return (
+    <div
+      className={
+        notice.tone === "danger"
+          ? "mb-2 ml-2 flex min-w-0 max-w-[45%] items-center gap-1.5 whitespace-nowrap text-xs leading-none text-[var(--color-danger)]"
+          : "mb-2 ml-2 flex min-w-0 max-w-[45%] items-center gap-1.5 whitespace-nowrap text-xs leading-none text-[var(--color-text-muted)]"
+      }
+    >
+      <span className="truncate">{notice.message}</span>
+      {action ? (
+        <button
+          type="button"
+          onClick={action.onClick}
+          className="shrink-0 rounded-full border-0 bg-transparent px-1 py-0 text-xs font-medium text-[var(--color-text)] hover:text-[var(--color-primary-hover)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-focus)]"
+        >
+          {action.label}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+type RealtimeNotice = {
+  message: string | null;
+  tone: "muted" | "danger";
+  action: "retry-recovery" | "reconnect" | null;
+};
+
 function buildRealtimeNotice({
   connectionStatus,
   recoveryStatus,
@@ -215,37 +253,33 @@ function buildRealtimeNotice({
   recoveryAttempt: number;
   recoveryError: string | null;
   error: string | null;
-}): {
-  message: string | null;
-  tone: "muted" | "danger";
-  action: "retry-recovery" | "reconnect" | null;
-} {
+}): RealtimeNotice {
   if (recoveryStatus === "resyncing") {
     return {
-      message: "Syncing the latest messages...",
+      message: "Syncing...",
       tone: "muted",
       action: null
     };
   }
   if (recoveryStatus === "retrying" || recoveryStatus === "failed") {
     const retryText =
-      recoveryAttempt > 1 ? ` Retrying automatically (${recoveryAttempt}).` : " Retrying automatically.";
+      recoveryAttempt > 1 ? ` Retry ${recoveryAttempt}` : " Retrying";
     return {
-      message: `${recoveryError ?? "Unable to sync the latest messages."}${retryText}`,
+      message: recoveryError ? `${recoveryError}.${retryText}` : `Sync failed.${retryText}`,
       tone: "danger",
       action: "retry-recovery"
     };
   }
   if (connectionStatus === "connecting") {
     return {
-      message: "Connecting to realtime...",
+      message: "Connecting...",
       tone: "muted",
       action: null
     };
   }
   if (connectionStatus === "reconnecting" || connectionStatus === "disconnected") {
     return {
-      message: "Connection interrupted. Reconnecting automatically...",
+      message: "Reconnecting...",
       tone: "muted",
       action: "reconnect"
     };

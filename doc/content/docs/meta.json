@@ -1,4 +1,4 @@
 {
   "title": "Delphi Docs",
-  "pages": ["index", "architecture", "reference", "legacy"]
+  "pages": ["index", "architecture", "document-crud", "reference", "legacy"]
 }

@@ -29,10 +29,11 @@ so an API crash does not leave orphan `chat_turn(status=requested)` rows.
 | After command read, before claim | requested lock | JetStream redelivers | no visible change | command not ACKed |
 | After claim, before provider | running lock | lease expires, redelivery sees stale running | error/resync, user can reprompt | stale running must not silently regenerate |
 | During LLM stream | running lock, live events may be visible | lease expires, redelivery marks failed/resync | stream stops, error/resync | partial visible stream is not treated as committed truth |
-| After DB commit, before finish event | committed DB state + terminal KV marker | redelivery publishes missing terminal event, ACKs, and releases | reload shows committed answer | DB commit precedes terminal event |
+| After DB commit, before KV terminal marker | committed DB state, running KV lock | current stale-lease recovery can mark failed unless it reconciles DB by `turn_id` first | reload can show committed answer while live path may emit error/clear | known gap: DB commit must become discoverable before stale-running failure |
+| After KV terminal marker, before finish event | committed DB state + terminal KV marker | redelivery publishes missing terminal event, ACKs, and releases | reload shows committed answer; finish may arrive late | DB commit precedes terminal event |
 | After finish event, before DB commit | invalid ordering | avoid by design | not allowed | terminal event must never precede DB commit |
 | After DB commit + finish, before ACK | committed DB state, terminal KV marker, command unacked | redelivery ACKs without rerun | no duplicate answer | terminal state is idempotent |
-| After ACK, before lock release | committed/interrupted/failed outcome | release retry or KV TTL cleanup | no duplicate answer | release only after ACK is safe |
+| After ACK, before lock release | committed/interrupted/failed outcome, terminal KV lock may remain | no command redelivery remains; KV TTL eventually clears lock | no duplicate answer, but new turns can be temporarily blocked | ACK-before-release trades no rerun for possible lock TTL wait |
 
 ## Redelivery Decision Table
 
